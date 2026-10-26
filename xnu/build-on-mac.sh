@@ -26,18 +26,33 @@ OUT=$PWD/xnu/out-$BOARD
 
 [ "$(uname)" = Darwin ] || { echo "run this on macOS" >&2; exit 1; }
 
-# Xcode 15.x: the oldest installed Xcode_*.app, else the selected one (as CI does)
-XC=$(ls -d /Applications/Xcode_15*.app 2>/dev/null | sort -V | head -1 || true)
-[ -n "$XC" ] || XC=$(dirname "$(dirname "$(xcode-select -p)")")
+# Xcode 15.x, wherever it is in /Applications (any name). Newer Xcodes' iig
+# emits IORPC.kernelContent, which xnu-8796 lacks; XCODE_ANY=1 tries anyway.
+XC=
+for x in /Applications/Xcode*.app; do
+	[ -d "$x" ] || continue
+	if DEVELOPER_DIR="$x/Contents/Developer" xcodebuild -version 2>/dev/null | head -1 | grep -q '^Xcode 15\.'; then
+		XC=$x
+		break
+	fi
+done
+if [ -z "$XC" ]; then
+	if [ "${XCODE_ANY:-0}" = 1 ]; then
+		XC=$(dirname "$(dirname "$(xcode-select -p)")")
+	else
+		echo "No Xcode 15 found in /Applications." >&2
+		echo "Download Xcode 15.4 from https://developer.apple.com/download/all/ (search 'Xcode 15.4')," >&2
+		echo "double-click the .xip, move the Xcode app into /Applications (any name), run this again." >&2
+		exit 1
+	fi
+fi
 export DEVELOPER_DIR="$XC/Contents/Developer"
-xv=$(DEVELOPER_DIR=$DEVELOPER_DIR xcodebuild -version | head -1)
+xv=$(xcodebuild -version | head -1) || { echo "Xcode at $XC does not run on this macOS" >&2; exit 1; }
 echo "Using $xv ($XC)"
-case "$xv" in
-"Xcode 15."*) ;;
-*) echo "warning: $xv is not Xcode 15.x; xnu-8796's IORPC code may not build" >&2 ;;
-esac
+# the Xcode license must be accepted once (asks for your Mac password)
+xcodebuild -checkFirstLaunchStatus >/dev/null 2>&1 || sudo xcodebuild -runFirstLaunch
 
-command -v brew >/dev/null || { echo "install Homebrew first: https://brew.sh" >&2; exit 1; }
+command -v brew >/dev/null || { echo "Install Homebrew first: open https://brew.sh and paste its one-line installer into Terminal" >&2; exit 1; }
 brew list jq gum bash cmake ninja >/dev/null 2>&1 || brew install jq gum bash cmake ninja
 # build.sh only checks that xcodes exists (Xcode is already installed)
 command -v xcodes >/dev/null || { mkdir -p "$WORK/bin"; printf '#!/bin/sh\nexit 0\n' > "$WORK/bin/xcodes"; chmod +x "$WORK/bin/xcodes"; export PATH="$WORK/bin:$PATH"; }
