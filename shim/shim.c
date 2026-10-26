@@ -57,6 +57,7 @@ extern char secondary_entry[];
 
 static const char *stage;	/* set at runtime: no absolute pointers in data */
 static volatile uint64_t sec_mpidr[NR_CPUS];
+static volatile uint64_t sec_midr[NR_CPUS], sec_mmfr0[NR_CPUS], sec_isar0[NR_CPUS];
 static volatile uint64_t sec_probe[4];	/* CPU1 redistributor write test */
 static volatile uint32_t irq_count, irq_other, irq_last;
 static volatile int irq_src;
@@ -164,6 +165,9 @@ static uintptr_t find_gicr(void);
 
 void secondary_main(uint64_t idx)
 {
+	sec_midr[idx] = rsr("midr_el1");
+	sec_mmfr0[idx] = rsr("id_aa64mmfr0_el1");
+	sec_isar0[idx] = rsr("id_aa64isar0_el1");
 	sec_mpidr[idx] = rsr("mpidr_el1") | (1ULL << 63);
 	if (idx == 1) {
 		uintptr_t r = find_gicr();
@@ -368,9 +372,40 @@ static uint32_t to_us(uint64_t ticks)
 }
 
 #ifdef BOARD_DRG
+/* DRG cores: cluster 0 = 4x Silver (Aff0 0..3), cluster 1 = 4x Gold (Aff1 = 1). */
+static uint64_t drg_mpidr(int i)
+{
+	return i < 4 ? (uint64_t)i : 0x100 | (uint64_t)(i - 4);
+}
+
+/* One line per core: MIDR and MMFR0 low words (TGran16 is MMFR0[23:20]). */
+static void test_smp_drg(void)
+{
+	stage = "smp";
+	int64_t ret[NR_CPUS];
+
+	for (int i = 1; i < NR_CPUS; i++)
+		ret[i] = smc(PSCI_CPU_ON, drg_mpidr(i), (uintptr_t)secondary_entry, i);
+	delay_ms(500);
+	con_hex2("CPU0", "midr=", rsr("midr_el1"), "mmfr=", rsr("id_aa64mmfr0_el1"));
+	for (int i = 1; i < NR_CPUS; i++) {
+		char label[] = "CPU0";
+		label[3] = '0' + i;
+		if (sec_mpidr[i])
+			con_hex2(label, "midr=", sec_midr[i], "mmfr=", sec_mmfr0[i]);
+		else
+			con_hex2(label, "ret=", (uint32_t)ret[i], "mpidr=", 0xdead0000);
+	}
+	con_hex2("GOLD", "tg16=", (sec_mmfr0[4] >> 20) & 0xf, "atom=", (sec_isar0[4] >> 20) & 0xf);
+	con_hex2("SILVER", "tg16=", (rsr("id_aa64mmfr0_el1") >> 20) & 0xf,
+		 "atom=", (rsr("id_aa64isar0_el1") >> 20) & 0xf);
+	con_hex2("GICR1", "grp=", sec_probe[1], "ok=", sec_probe[3]);
+}
+
 /*
- * DRG milestone 2: text console on the splash buffer plus the CPU, firmware
- * and DTB facts the next steps need. MMU stays off; back to fastboot after 60 s.
+ * DRG milestone 3: start the 7 secondaries (reporting each core's ID
+ * registers) and run the GICv3 timer and SGI interrupt tests. MMU stays
+ * off; back to fastboot afterwards.
  */
 static void __attribute__((noreturn)) drg_main(uint64_t dtb)
 {
@@ -380,28 +415,15 @@ static void __attribute__((noreturn)) drg_main(uint64_t dtb)
 
 	stage = "drg console";
 	con_clear(0xff102040U);
-	con_str("SHIM", "DRG milestone 2: console");
-	con_str("BOARD", BOARD_NAME " / SDM636");
-	con_skip();
-
-	stage = "drg cpu";
-	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
+	con_str("SHIM", "DRG milestone 3: smp+gic");
 	con_hex2("EL", "cur=", rsr("currentel") >> 2, "cpu=", rsr("mpidr_el1"));
-	con_hex("MIDR", rsr("midr_el1"));
-	con_hex("MMFR0", mmfr0);
-	con_hex2("GRANULE", "tg16=", (mmfr0 >> 20) & 0xf, "tg4=", (mmfr0 >> 28) & 0xf);
-	con_hex("PFR0", rsr("id_aa64pfr0_el1"));
-	con_hex("ISAR0", rsr("id_aa64isar0_el1"));
-	con_hex2("CNTFRQ", "hz=", rsr("cntfrq_el0"), 0, 0);
-	con_hex2("IMAGE", "at=", (uintptr_t)drg_main, "hi=", (uintptr_t)drg_main >> 32);
 	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
-	con_hex2("WDT", "en=", rd32(WDT_BASE + WDT_EN), 0, 0);
+	con_hex2("PSCI", "ver=", smc(PSCI_VERSION, 0, 0, 0), "wdt=", rd32(WDT_BASE + WDT_EN));
 	con_skip();
 
-	stage = "drg psci";
-	con_hex2("PSCI", "ver=", smc(PSCI_VERSION, 0, 0, 0), "smccc=", smc(SMCCC_VERSION, 0, 0, 0));
-	psci_line("CPU_ON", PSCI_CPU_ON);
-	psci_line("SYSRST2", PSCI_SYSTEM_RESET2);
+	test_smp_drg();
+	con_skip();
+	test_gic();
 	con_skip();
 
 	stage = "drg done";
