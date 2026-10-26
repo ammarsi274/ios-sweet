@@ -163,8 +163,18 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 
 static uintptr_t find_gicr(void);
 
+#ifdef BOARD_DRG
+static void __attribute__((noreturn)) drg_gold_main(void);
+static volatile uint64_t handoff_dtb;
+static volatile uint32_t handoff_req, gold_alive, silver_done;
+#endif
+
 void secondary_main(uint64_t idx)
 {
+#ifdef BOARD_DRG
+	if (idx == 4 && handoff_req)
+		drg_gold_main();
+#endif
 	sec_midr[idx] = rsr("midr_el1");
 	sec_mmfr0[idx] = rsr("id_aa64mmfr0_el1");
 	sec_isar0[idx] = rsr("id_aa64isar0_el1");
@@ -379,7 +389,7 @@ static uint64_t drg_mpidr(int i)
 }
 
 /* One line per core: MIDR and MMFR0 low words (TGran16 is MMFR0[23:20]). */
-static void test_smp_drg(void)
+static void __attribute__((unused)) test_smp_drg(void)
 {
 	stage = "smp";
 	int64_t ret[NR_CPUS];
@@ -402,10 +412,51 @@ static void test_smp_drg(void)
 	con_hex2("GICR1", "grp=", sec_probe[1], "ok=", sec_probe[3]);
 }
 
+#define PSCI_AFFINITY_INFO	0xc4000004UL
+#define DRG_GOLD0		0x100UL
+
 /*
- * DRG milestone 3: start the 7 secondaries (reporting each core's ID
- * registers) and run the GICv3 timer and SGI interrupt tests. MMU stays
- * off; back to fastboot afterwards.
+ * Runs on Gold 0x100 after the handoff. XNU will boot from here, so report
+ * the ID registers that decide which ARMv8.1+ features the kernel may use.
+ */
+static void __attribute__((noreturn)) drg_gold_main(void)
+{
+	stage = "gold";
+	gold_alive = 1;
+	__asm__ volatile("dsb sy" ::: "memory");
+	while (!silver_done)
+		;
+	delay_ms(100);	/* let Silver CPU0 finish CPU_OFF */
+
+	uint64_t mmfr1 = rsr("id_aa64mmfr1_el1"), mmfr2 = rsr("id_aa64mmfr2_el1");
+	uint64_t isar1 = rsr("id_aa64isar1_el1"), pfr0 = rsr("id_aa64pfr0_el1");
+
+	con_skip();
+	con_str("GOLD", "now running on the Gold core");
+	con_hex2("EL", "cur=", rsr("currentel") >> 2, "cpu=", rsr("mpidr_el1"));
+	con_hex2("MIDR", "=", rsr("midr_el1"), "tg16=", (rsr("id_aa64mmfr0_el1") >> 20) & 0xf);
+	con_hex2("CPU0", "aff_info(1=off)=", smc(PSCI_AFFINITY_INFO, 0, 0, 0), 0, 0);
+	con_hex("MMFR1", mmfr1);
+	con_hex("MMFR2", mmfr2);
+	con_hex("ISAR1", isar1);
+	con_hex("PFR0", pfr0);
+	con_hex2("PAN", "=", (mmfr1 >> 20) & 0xf, "vhe=", (mmfr1 >> 8) & 0xf);
+	con_hex2("HAFDBS", "=", mmfr1 & 0xf, "lor=", (mmfr1 >> 16) & 0xf);
+	con_hex2("UAO", "=", (mmfr2 >> 4) & 0xf, "cnp=", mmfr2 & 0xf);
+	con_hex2("DPB", "=", isar1 & 0xf, "lrcpc=", (isar1 >> 20) & 0xf);
+	con_hex2("RAS", "=", (pfr0 >> 28) & 0xf, "gic=", (pfr0 >> 24) & 0xf);
+	con_hex2("DTB", "at=", handoff_dtb, "magic=", __builtin_bswap32(rd32(handoff_dtb)));
+	con_skip();
+
+	stage = "gold done";
+	con_str("DONE", "from Gold; fastboot in ~60s");
+	delay_ms(20000);
+	reset(40);
+}
+
+/*
+ * DRG XNU step 0: hand the boot over from Silver CPU0 (where ABL enters) to
+ * Gold 0x100, which will run XNU with 16K pages. Silver powers itself off.
  */
 static void __attribute__((noreturn)) drg_main(uint64_t dtb)
 {
@@ -415,21 +466,32 @@ static void __attribute__((noreturn)) drg_main(uint64_t dtb)
 
 	stage = "drg console";
 	con_clear(0xff102040U);
-	con_str("SHIM", "DRG milestone 3: smp+gic");
+	con_str("SHIM", "DRG xnu step 0: gold handoff");
 	con_hex2("EL", "cur=", rsr("currentel") >> 2, "cpu=", rsr("mpidr_el1"));
 	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
 	con_hex2("PSCI", "ver=", smc(PSCI_VERSION, 0, 0, 0), "wdt=", rd32(WDT_BASE + WDT_EN));
 	con_skip();
 
-	test_smp_drg();
-	con_skip();
-	test_gic();
-	con_skip();
-
-	stage = "drg done";
-	con_str("DONE", "back to fastboot in ~60s");
-	delay_ms(20000);
-	reset(40);
+	stage = "handoff";
+	handoff_dtb = dtb;
+	handoff_req = 1;
+	__asm__ volatile("dsb sy" ::: "memory");
+	int64_t ret = smc(PSCI_CPU_ON, DRG_GOLD0, (uintptr_t)secondary_entry, 4);
+	con_hex2("CPU_ON", "ret=", (uint32_t)ret, "mpidr=", DRG_GOLD0);
+	uint64_t deadline = now() + rsr("cntfrq_el0");	/* 1 s */
+	while (!gold_alive && now() < deadline)
+		;
+	if (!gold_alive) {
+		con_str("HANDOFF", "Gold did not answer");
+		reset(40);
+	}
+	con_str("HANDOFF", "Gold alive; Silver CPU_OFF");
+	silver_done = 1;
+	__asm__ volatile("dsb sy" ::: "memory");
+	smc(PSCI_CPU_OFF, 0, 0, 0);
+	/* Only reached if CPU_OFF failed: stay out of Gold's way. */
+	for (;;)
+		__asm__ volatile("wfe");
 }
 #endif
 
