@@ -1,47 +1,122 @@
 #!/usr/bin/env python3
-"""Turn the SWEET patch series into the DRG (Nokia 6.1 Plus) kernel.
+"""Turn the sweet kernel patch series into the DRG (Nokia 6.1 Plus) series.
 
 dxb runs patches/*.sh before it applies patches/*.patch, so a stage script
 cannot edit files the series creates. Instead this rewrites the copied
-.patch files in place. Every substitution swaps one added ("+") line for
-another, so hunk line counts stay valid, and each must match exactly once:
-if the series changes underneath, the build stops here instead of
-silently building a sweet kernel.
+series (our NNNN-*.patch and NNNN-*.sh; darwin-xnu-build's own patches are
+left alone) in three passes:
 
-Usage (CI, after copying the series): python3 xnu/drg-overlay.py dxb/patches
+  1. DRG changes: exact substrings, each with the number of times it must
+     occur across the whole series. A later patch often carries an earlier
+     patch's line as context, so both must change together or the later
+     patch stops applying, and dxb only warns and skips a patch that does
+     not apply. A count mismatch stops the build here instead.
+  2. Rename: sweet/Sweet/SWEET -> drg/Drg/DRG in contents and file names
+     (identifiers, file paths, the machine config, boot-args, log tags).
+  3. Check: no sweet/Xiaomi/Redmi/SM7150 text may be left.
+
+Line counts never change, so every hunk header stays valid. Prove the
+result with tools/test-apply-series.sh before spending a CI run.
+
+Usage: python3 xnu/drg-overlay.py DIR   (DIR = copy of xnu/patches; edited in place)
 """
+import re
 import sys
 from pathlib import Path
 
-# (patch file prefix, old added line, new added line)
-SUBSTITUTIONS = [
-    # --- Nokia identity: match the names tools/mkadt.py --board drg emits ---
-    ("0016-", "+    \"     'IONameMatch'     = 'xiaomi,sweet';\"",
-              "+    \"     'IONameMatch'     = 'nokia,drg';\""),
-    ("0018-", "+    \"     'IONameMatch'     = 'qcom,kryo470';\"",
-              "+    \"     'IONameMatch'     = 'qcom,kryo260';\""),
-    ("0046-", "+    \"     'IONameMatch'     = 'sweet,display';\"",
-              "+    \"     'IONameMatch'     = 'nokia,drg-display';\""),
-    ("0003-", "+\tif (SecureDTFindEntry(\"name\", \"sweet-fbcon\", &entry) != kSuccess ||",
-              "+\tif (SecureDTFindEntry(\"name\", \"drg-fbcon\", &entry) != kSuccess ||"),
+OURS = re.compile(r"^\d{4}-.*\.(patch|sh)$")
+
+# (old, new, occurrences in the whole series)
+CHANGES = [
+    # --- identity: the names tools/mkadt.py --board drg emits ---
+    ("'IONameMatch'     = 'xiaomi,sweet';", "'IONameMatch'     = 'nokia,drg';", 2),
+    ("'IONameMatch'     = 'qcom,kryo470';", "'IONameMatch'     = 'qcom,kryo260';", 2),       # 0018 +, 0038 context
+    ("'IONameMatch'     = 'sweet,display';", "'IONameMatch'     = 'nokia,drg-display';", 2),  # 0046 +, 0058 context
+    ('strlcpy(name, "Redmi Note 10 Pro", (size_t)maxLength);',
+     'strlcpy(name, "Nokia 6.1 Plus", (size_t)maxLength);', 2),
+
+    # --- CPU: Kryo 260 is ARMv8.0 (no LSE atomics, no PAN; measured on the phone) ---
+    ("-march=armv8.2-a+crypto", "-march=armv8-a+crypto", 1),
+    ("+#define __ARM_PAN_AVAILABLE__     1",
+     "+/* no __ARM_PAN_AVAILABLE__: Kryo 260 is ARMv8.0, ID_AA64MMFR1.PAN = 0 */", 1),
+    (' * Board config for the Redmi Note 10 Pro ("sweet", Qualcomm SM7150 /',
+     ' * Board config for the Nokia 6.1 Plus ("DRG", Qualcomm SDM636 /', 1),
+    (" * Snapdragon 732G): Kryo 470 = Cortex-A76 + Cortex-A55, ARMv8.2, no PAC.",
+     " * Snapdragon 636): Kryo 260 Gold/Silver (A73/A53 class), ARMv8.0, no PAC.", 1),
+
+    # --- SMP: XNU runs on the Gold cluster, MPIDR 0x100-0x103, boot CPU 0x100 ---
+    ("/* The supplied ADT has cpu0 as the boot CPU and ascending A55 nodes. */",
+     "/* The DRG ADT has cpu0 = Gold 0x100 as the boot CPU, then 0x101-0x103. */", 1),
+    ("topology->boot_cpu->phys_id != 0) {", "topology->boot_cpu->phys_id != 0x100) {", 1),
+    ('expected boot MPIDR 0 and logical CPU 0"', 'expected boot MPIDR 0x100 and logical CPU 0"', 1),
+    ("arg_paddr != 0 || cpu->phys_id == 0 ||", "arg_paddr != 0 || cpu->phys_id == 0x100 ||", 1),
+    ("/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */",
+     "/* SDM636 Gold cluster: MPIDR Aff1 = 1, Aff0 = core 0-3 */", 1),
+    ("if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||",
+     "if ((cpu->phys_id & ~0x3u) != 0x100 ||", 1),
+    ("#define SWEET_SMP_MAX_CPUS         8", "#define SWEET_SMP_MAX_CPUS         4", 1),
+    ("/* Aff1 encodes the core on SM7150, not an Apple cluster ID. */",
+     "/* SDM636: Aff1 = cluster, Aff0 = core; the ADT gives cluster-core-id. */", 1),
+
+    # --- framebuffer: splash at 0x9d400000, 1080x2280 ---
+    ("0x9c000000", "0x9d400000", 6),
+    ("2368 * 4320", "2248 * 4320", 1),          # early marks: 32 rows above the bottom
+    ("<< 16) / 2400);", "<< 16) / 2280);", 2),
+    ("fLogicalH = native ? 2400 : 2436;", "fLogicalH = native ? 2280 : 2436;", 1),
+    ("fOffY = (fLogicalH - 2400) / 2;", "fOffY = (fLogicalH - 2280) / 2;", 1),
+
+    # --- SM7150-only drivers (keys, touch + RPMh, USB): off unless asked for ---
+    ("\tint enabled = 1;", "\tint enabled = 0;\t/* DRG: not this board's hardware */", 3),
+
+    # --- comments that name the board ---
+    ("(Redmi Note 10 Pro, SM7150)", "(Nokia 6.1 Plus, SDM636)", 3),
+    ("Redmi Note 10 Pro bootstrap console", "Nokia 6.1 Plus bootstrap console", 2),
+    ("boards with no usable UART (the Redmi Note", "boards with no usable UART (the Nokia 6.1", 1),
+    ("10 Pro's debug UART engine runs in SPI mode)", "Plus has no reachable debug UART)", 1),
+    ("for Redmi Note 10 Pro (sweet).", "for Nokia 6.1 Plus (DRG).", 1),
+    ("None of that hardware exists on SM7150", "None of that hardware exists on SDM636", 1),
+    ("/* GT9896 is Yellowstone in Xiaomi sweet-r-oss, not the Berlin protocol. */",
+     "/* GT9896 (not on DRG, driver off): Yellowstone, not the Berlin protocol. */", 1),
 ]
+
+RENAME = [("SWEET", "DRG"), ("Sweet", "Drg"), ("sweet", "drg")]
+LEFTOVER = re.compile(rb"sweet|xiaomi|redmi|sm7150", re.IGNORECASE)
+
+
+def rename(s):
+    """Works on str (file names) and bytes (contents; not all patches are UTF-8)."""
+    for old, new in RENAME:
+        if isinstance(s, bytes):
+            old, new = old.encode(), new.encode()
+        s = s.replace(old, new)
+    return s
 
 
 def main(patch_dir):
-    patches = sorted(Path(patch_dir).glob("*.patch"))
-    for prefix, old, new in SUBSTITUTIONS:
-        matches = [p for p in patches if p.name.startswith(prefix)]
-        if len(matches) != 1:
-            sys.exit(f"drg-overlay: expected one {prefix}*.patch, found {len(matches)}")
-        path = matches[0]
-        # bytes in, bytes out: never let the platform translate line endings
-        lines = path.read_bytes().split(b"\n")
-        hits = [i for i, line in enumerate(lines) if line == old.encode()]
-        if len(hits) != 1:
-            sys.exit(f"drg-overlay: {path.name}: {len(hits)} matches for {old!r}")
-        lines[hits[0]] = new.encode()
-        path.write_bytes(b"\n".join(lines))
-        print(f"drg-overlay: {path.name}: {old.strip('+').strip()} -> {new.strip('+').strip()}")
+    files = sorted(p for p in Path(patch_dir).iterdir() if OURS.match(p.name))
+    if not files:
+        sys.exit(f"drg-overlay: no NNNN-* patches in {patch_dir}")
+    # bytes in, bytes out: never let the platform translate line endings
+    text = {p: p.read_bytes() for p in files}
+
+    for old, new, want in CHANGES:
+        o, n = old.encode(), new.encode()
+        if o.count(b"\n") != n.count(b"\n"):
+            sys.exit(f"drg-overlay: {old!r} would change the line count")
+        got = sum(t.count(o) for t in text.values())
+        if got != want:
+            sys.exit(f"drg-overlay: {old!r}: {got} occurrences, expected {want}")
+        text = {p: t.replace(o, n) for p, t in text.items()}
+
+    for p in files:
+        t = rename(text[p])
+        p.unlink()
+        out = p.with_name(rename(p.name))
+        out.write_bytes(t)
+        for m in LEFTOVER.finditer(t):
+            line = t[:m.start()].count(b"\n") + 1
+            sys.exit(f"drg-overlay: {out.name}:{line}: leftover {m.group().decode()!r}")
+    print(f"drg-overlay: {len(CHANGES)} DRG changes, {len(files)} files renamed sweet -> drg")
 
 
 if __name__ == "__main__":

@@ -9,9 +9,12 @@ on:
       kernel_config:
         description: RELEASE / DEVELOPMENT / DEBUG
         default: DEVELOPMENT
+      board:
+        description: sweet (Redmi Note 10 Pro) or drg (Nokia 6.1 Plus, via xnu/drg-overlay.py)
+        default: sweet
       machine_config:
-        description: xnu MACHINE_CONFIG
-        default: SWEET
+        description: xnu MACHINE_CONFIG (empty = SWEET for sweet, DRG for drg)
+        default: ""
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
@@ -22,7 +25,7 @@ on:
       - ".github/workflows/xnu.yml"
 
 concurrency:
-  group: xnu-${{ github.ref }}
+  group: xnu-${{ github.ref }}-${{ inputs.board || 'sweet' }}
   cancel-in-progress: true
 
 env:
@@ -30,7 +33,8 @@ env:
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
-  MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+  BOARD: ${{ inputs.board || 'sweet' }}
+  MACHINE_CONFIG: ${{ inputs.machine_config || (inputs.board == 'drg' && 'DRG' || 'SWEET') }}
 
 jobs:
   build:
@@ -48,7 +52,10 @@ jobs:
           git -C dxb checkout -q FETCH_HEAD
           # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
           cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
-          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
+          # drg: rewrite our copied series into the Nokia 6.1 Plus one (DRG names,
+          # ARMv8.0, Gold-cluster SMP, its framebuffer); dxb's own patches untouched
+          if [ "$BOARD" = drg ]; then python3 xnu/drg-overlay.py dxb/patches; fi
+          # libfirehose_kernel is built arm64e-only; our kernels are plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
           ls dxb/patches
@@ -72,7 +79,16 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        shell: bash
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee build.log
+          # dxb only warns when a patch does not apply; one of ours missing
+          # means a broken kernel, so stop here.
+          if grep -E 'Skipping patch .*/[0-9]{4}-' build.log; then
+            echo "::error::a patch of the series did not apply"
+            exit 1
+          fi
 
       - name: Package build tree for local compiles
         if: always()
@@ -119,6 +135,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu-kernel
+          name: ${{ env.BOARD == 'drg' && 'xnu-kernel-drg' || 'xnu-kernel' }}
           path: out/
           if-no-files-found: warn

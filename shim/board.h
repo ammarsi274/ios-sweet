@@ -14,8 +14,10 @@
 #define GICR_BASE		0x17b00000UL
 #define WDT_BASE		0x17817000UL	/* qcom,msm-watchdog */
 #define WDT_EN			0x8
+#define PAYLOAD_MAGIC		"NOKIAXNU"	/* tools/mkpayload.py --board drg */
 #else
 #define BOARD_NAME		"sweet"
+#define PAYLOAD_MAGIC		"SWEETXNU"
 #define FB_BASE			0x9c000000UL	/* reserved-memory cont_splash_region */
 #define FB_H			2400
 #define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
