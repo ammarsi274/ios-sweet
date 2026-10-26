@@ -12,12 +12,9 @@
 #include "loader.h"
 #include "ufs.h"
 
-#define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0x0c264000UL
 
 #define GICD_BASE		0x17a00000UL
-#define GICR_BASE		0x17a60000UL
 #define GICR_SIZE		0x100000UL
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
@@ -370,9 +367,57 @@ static uint32_t to_us(uint64_t ticks)
 	return ticks * 10 / 192;	/* 19.2 MHz */
 }
 
+#ifdef BOARD_DRG
+/*
+ * DRG milestone 2: text console on the splash buffer plus the CPU, firmware
+ * and DTB facts the next steps need. MMU stays off; back to fastboot after 60 s.
+ */
+static void __attribute__((noreturn)) drg_main(uint64_t dtb)
+{
+	stage = "drg wdt";
+	wr32(WDT_BASE + WDT_EN, 0);
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	stage = "drg console";
+	con_clear(0xff102040U);
+	con_str("SHIM", "DRG milestone 2: console");
+	con_str("BOARD", BOARD_NAME " / SDM636");
+	con_skip();
+
+	stage = "drg cpu";
+	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
+	con_hex2("EL", "cur=", rsr("currentel") >> 2, "cpu=", rsr("mpidr_el1"));
+	con_hex("MIDR", rsr("midr_el1"));
+	con_hex("MMFR0", mmfr0);
+	con_hex2("GRANULE", "tg16=", (mmfr0 >> 20) & 0xf, "tg4=", (mmfr0 >> 28) & 0xf);
+	con_hex("PFR0", rsr("id_aa64pfr0_el1"));
+	con_hex("ISAR0", rsr("id_aa64isar0_el1"));
+	con_hex2("CNTFRQ", "hz=", rsr("cntfrq_el0"), 0, 0);
+	con_hex2("IMAGE", "at=", (uintptr_t)drg_main, "hi=", (uintptr_t)drg_main >> 32);
+	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
+	con_hex2("WDT", "en=", rd32(WDT_BASE + WDT_EN), 0, 0);
+	con_skip();
+
+	stage = "drg psci";
+	con_hex2("PSCI", "ver=", smc(PSCI_VERSION, 0, 0, 0), "smccc=", smc(SMCCC_VERSION, 0, 0, 0));
+	psci_line("CPU_ON", PSCI_CPU_ON);
+	psci_line("SYSRST2", PSCI_SYSTEM_RESET2);
+	con_skip();
+
+	stage = "drg done";
+	con_str("DONE", "back to fastboot in ~60s");
+	delay_ms(20000);
+	reset(40);
+}
+#endif
+
 void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
+
+#ifdef BOARD_DRG
+	drg_main(dtb);
+#endif
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
