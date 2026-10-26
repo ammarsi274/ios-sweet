@@ -19,13 +19,15 @@ on:
         description: make -k (collect all compile errors in one run)
         default: "true"
   push:
-    branches: [main]
+    # drg-port builds the Nokia 6.1 Plus kernel (board drg, see env below)
+    branches: [main, drg-port]
     paths:
       - "xnu/patches/**"
+      - "xnu/drg-overlay.py"
       - ".github/workflows/xnu.yml"
 
 concurrency:
-  group: xnu-${{ github.ref }}-${{ inputs.board || 'sweet' }}
+  group: xnu-${{ github.ref }}-${{ inputs.board || (github.ref_name == 'drg-port' && 'drg' || 'sweet') }}
   cancel-in-progress: true
 
 env:
@@ -33,8 +35,9 @@ env:
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
-  BOARD: ${{ inputs.board || 'sweet' }}
-  MACHINE_CONFIG: ${{ inputs.machine_config || (inputs.board == 'drg' && 'DRG' || 'SWEET') }}
+  # dispatch: the board input; push: drg on the drg-port branch, sweet elsewhere
+  BOARD: ${{ inputs.board || (github.ref_name == 'drg-port' && 'drg' || 'sweet') }}
+  MACHINE_CONFIG: ${{ inputs.machine_config || ((inputs.board || (github.ref_name == 'drg-port' && 'drg' || 'sweet')) == 'drg' && 'DRG' || 'SWEET') }}
 
 jobs:
   build:
