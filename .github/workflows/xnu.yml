@@ -135,6 +135,15 @@ jobs:
           ls -la out
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
+      - name: Check DRG kernel is ARMv8.0-only and Nokia-named
+        if: env.BOARD == 'drg'
+        run: |
+          bash tools/check-armv80.sh out/kernel.development.drg
+          if LC_ALL=C grep -a -i -o -E 'sweet|xiaomi|redmi|sm7150' out/kernel.development.drg | sort | uniq -c | grep .; then
+            echo "::error::the DRG kernel still contains the names above"
+            exit 1
+          fi
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:

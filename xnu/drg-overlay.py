@@ -36,7 +36,10 @@ CHANGES = [
      'strlcpy(name, "Nokia 6.1 Plus", (size_t)maxLength);', 2),
 
     # --- CPU: Kryo 260 is ARMv8.0 (no LSE atomics, no PAN; measured on the phone) ---
-    ("-march=armv8.2-a+crypto", "-march=armv8-a+crypto", 1),
+    # -march alone is not enough: for macOS targets clang keeps -target-cpu
+    # apple-m1, whose features (LSE, RCPC) the backend still uses. Kryo 260
+    # Gold is Cortex-A73 class. tools/check-armv80.sh proves the result.
+    ("-march=armv8.2-a+crypto", "-march=armv8-a+crypto -mcpu=cortex-a73", 1),
     ("+#define __ARM_PAN_AVAILABLE__     1",
      "+/* no __ARM_PAN_AVAILABLE__: Kryo 260 is ARMv8.0, ID_AA64MMFR1.PAN = 0 */", 1),
     (' * Board config for the Redmi Note 10 Pro ("sweet", Qualcomm SM7150 /',
@@ -68,6 +71,10 @@ CHANGES = [
     # --- SM7150-only drivers (keys, touch + RPMh, USB): off unless asked for ---
     ("\tint enabled = 1;", "\tint enabled = 0;\t/* DRG: not this board's hardware */", 3),
 
+    # --- persistent log header: spelled out per character, so the rename misses it ---
+    ("{ 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' }", "{ 'N', 'O', 'K', 'I', 'A', 'L', 'O', 'G' }", 1),
+    ('"SWEETLOG" | u32 version 1', '"NOKIALOG" | u32 version 1', 2),    # 0047 +, 0069 context
+
     # --- comments that name the board ---
     ("(Redmi Note 10 Pro, SM7150)", "(Nokia 6.1 Plus, SDM636)", 3),
     ("Redmi Note 10 Pro bootstrap console", "Nokia 6.1 Plus bootstrap console", 2),
@@ -80,7 +87,8 @@ CHANGES = [
 ]
 
 RENAME = [("SWEET", "DRG"), ("Sweet", "Drg"), ("sweet", "drg")]
-LEFTOVER = re.compile(rb"sweet|xiaomi|redmi|sm7150", re.IGNORECASE)
+# also names spelled one character at a time: { 'S', 'W', 'E', 'E', 'T', ... }
+LEFTOVER = re.compile(rb"sweet|xiaomi|redmi|sm7150|'S', *'W', *'E', *'E', *'T'", re.IGNORECASE)
 
 
 def rename(s):

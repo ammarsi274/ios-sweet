@@ -22,7 +22,8 @@ esac
 DXB_REPO=https://github.com/blacktop/darwin-xnu-build
 DXB_SHA=663906528d1cd5ea8fde7de6f16de73db9511549   # same pin as xnu.yml
 WORK=${WORK:-$HOME/xnu-build-$BOARD}
-OUT=$PWD/xnu/out-$BOARD
+REPO=$PWD
+OUT=$REPO/xnu/out-$BOARD
 
 [ "$(uname)" = Darwin ] || { echo "run this on macOS" >&2; exit 1; }
 
@@ -79,5 +80,14 @@ fi
 
 mkdir -p "$OUT"
 cp -R fakeroot/System/Library/Kernels/. "$OUT/"
+K=$OUT/kernel.development.$BOARD
+if [ "$BOARD" = drg ]; then
+	# Kryo 260 is ARMv8.0: one LSE/RCPC/... instruction would crash the phone
+	bash "$REPO/tools/check-armv80.sh" "$K"
+	if LC_ALL=C grep -a -i -o -E 'sweet|xiaomi|redmi|sm7150' "$K" | sort | uniq -c | grep .; then
+		echo "error: the DRG kernel still contains the names above" >&2
+		exit 1
+	fi
+fi
 (cd "$OUT" && shasum -a 256 kernel.* > SHA256SUMS && ls -la && cat SHA256SUMS)
-echo "Done. Copy $OUT/kernel.development.$BOARD to the PC: ios-sweet/xnu/out-$BOARD/"
+echo "Done. Copy $K to the PC: ios-sweet/xnu/out-$BOARD/"
