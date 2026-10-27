@@ -44,7 +44,13 @@ QEMU_VTIMER_INTID = 27
 
 # Nokia 6.1 Plus (DRG, SDM636). RAM banks <0x80000000 2G>, <0x1_00000000 0x7e4c0000>;
 # every reserved-memory carve-out is in the low bank. GICD and the timer match sweet.
-DRG_PHYS_BASE, DRG_MEM_SIZE = 0x100000000, 0x7e4c0000
+# Kernel RAM: Linux on this phone has one contiguous System RAM range
+# acd00000-17e4bffff (device-info/iomem.txt; the last fixed carve-out, pstore,
+# ends at 0xacd00000). XNU's RAM must start on a 32 MiB boundary (16K-granule
+# L2 block, tools/mkpayload.py virt_base), so it starts at 0xae000000: 3.26 GB.
+# Below it stay the shim, the payload window, the eMMC DMA range and the panel.
+DRG_PHYS_BASE = 0xae000000
+DRG_MEM_SIZE = 0x17e4c0000 - DRG_PHYS_BASE
 DRG_GICR = 0x17b00000
 DRG_FB, DRG_FB_SIZE = 0x9d400000, 0x2400000   # splash_region, video-mode panel
 DRG_FB_H = 2280
