@@ -114,7 +114,7 @@ jobs:
             --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' --exclude='*.unstripped' \
             --exclude='kernel.development.*' --exclude='.git' \
             -C dxb build/xnu.obj fakeroot/usr/local/include xnu \
-            -C .. sdk-kernel-platform
+            -C "$GITHUB_WORKSPACE" sdk-kernel-platform
           ls -la buildtree.tgz
 
       - uses: actions/upload-artifact@v4
@@ -145,7 +145,8 @@ jobs:
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
       - name: Check DRG kernel is ARMv8.0-only and Nokia-named
-        if: env.BOARD == 'drg'
+        # also when only the debug build-tree packaging failed
+        if: ${{ !cancelled() && env.BOARD == 'drg' && hashFiles('out/kernel.development.drg') != '' }}
         run: |
           bash tools/check-armv80.sh out/kernel.development.drg
           if LC_ALL=C grep -a -i -o -E 'sweet|xiaomi|redmi|sm7150' out/kernel.development.drg | sort | uniq -c | grep .; then
