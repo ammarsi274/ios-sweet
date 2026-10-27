@@ -51,6 +51,9 @@ DRG_FB_H = 2280
 DRG_ECID = 0x4452470000000001  # 'DRG' + 1, synthetic
 # Gold cluster only: Silver lacks the 16K granule. MPIDR Aff1 = cluster, Aff0 = core.
 DRG_GOLD_MPIDRS = (0x100, 0x101, 0x102, 0x103)
+# eMMC host (sdhci@c0c4000 hc_mem / cmdq_mem) and the low-bank DMA range, see the drg-emmc node
+DRG_EMMC_HC, DRG_EMMC_CQ = 0x0c0c4000, 0x0c0c5000
+DRG_EMMC_DMA, DRG_EMMC_DMA_SIZE = 0x84800000, 0x200000
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
@@ -256,6 +259,18 @@ def build(seed=None, qemu=False, highmem=False, board='sweet'):
     # dram-size we expose, so XNU maps it but never allocates into it.
     pram = node('pram', [ph(), ('reg', u64(panic_base) + u64(PANIC_LOG_SIZE))])
 
+    # DRG: eMMC (bsd/dev/drg_emmc.c), not UFS. reg = hc_mem, cmdq_mem of
+    # sdhci@c0c4000 in the phone's FDT. dma = a low-bank range outside XNU's
+    # RAM: above where ABL puts the ramdisk (ends 0x8441e8c0, boot #8) and
+    # below the first reserved region (wlan_msa_guard@85600000); ADMA2 into
+    # the low bank is what the shim probe measured working (boot #12).
+    emmc = node('drg-emmc', [
+        ph(),
+        ('compatible', cstr('qcom,sdhci-msm-v5')),
+        ('reg', u64(DRG_EMMC_HC, 0x1000, DRG_EMMC_CQ, 0x1000)),
+        ('dma', u64(DRG_EMMC_DMA, DRG_EMMC_DMA_SIZE)),
+    ]) if drg else None
+
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). The board string ('xiaomi,sweet' / 'nokia,drg') is what
@@ -271,8 +286,7 @@ def build(seed=None, qemu=False, highmem=False, board='sweet'):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    # DRG has eMMC, not UFS: no sweet-ufs node until there is a storage driver.
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu or drg else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [emmc] if drg else [ufs]))
 
 
 if __name__ == '__main__':
