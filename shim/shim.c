@@ -436,7 +436,8 @@ static void __attribute__((noreturn)) drg_gold_main(void)
 	con_str("LOADER", loader_boot(handoff_dtb));
 
 	/*
-	 * No payload: read-only eMMC probe (R3a). The Gold core's ID registers
+	 * No payload: eMMC probe (R3a) and the R6 one-block write test, which
+	 * only writes past the iOS image in userdata. The Gold core's ID registers
 	 * shown here before are in drg/BOOTLOG.md (boot #4).
 	 */
 	stage = "gold emmc";

@@ -7,11 +7,12 @@
  * 0xc0c5000 (command queue engine). Register layout from the SD Host
  * Controller specification; commands from the JEDEC eMMC standard.
  *
- * Read-only by construction: no reset, clock, power or host-control
- * writes, no command that writes the card. It only clears/enables
- * interrupt status bits and issues CMD17 (READ_SINGLE_BLOCK), polled. If
+ * No reset, clock, power or host-control writes. It only clears/enables
+ * interrupt status bits and issues CMD17 (READ_SINGLE_BLOCK), polled; if
  * the command queue engine is enabled it sends nothing and just reports
- * that.
+ * that. R6 adds ONE card write: write_test() writes a single block in the
+ * unused part of userdata (past the 16 GiB iOS image), verifies it and
+ * writes the original contents back.
  *
  * Data path, from measurements (drg/BOOTLOG.md #10, #11): reading through
  * the buffer data port (PIO) returns zeros and never drains, and ABL
@@ -59,8 +60,21 @@
 
 /* CMD17: index 17, data present, index + CRC check, 48-bit response (R1) */
 #define CMD17			((17U << 8) | 0x20 | 0x10 | 0x08 | 0x02)
+/* CMD24 WRITE_BLOCK: data, index + CRC check, R1 (used only by the R6 write test) */
+#define CMD24			((24U << 8) | 0x20 | 0x10 | 0x08 | 0x02)
 /* transfer mode: read, block count enable, single block, DMA (ADMA2 per host ctrl) */
 #define XFER_READ_ONE_DMA	((1U << 4) | (1U << 1) | (1U << 0))
+/* transfer mode: write (direction bit clear), block count enable, single block, DMA */
+#define XFER_WRITE_ONE_DMA	((1U << 1) | (1U << 0))
+
+/*
+ * R6 write test target, from measurements: the iOS root image flashed to
+ * userdata is exactly 16 GiB (0x2000000 sectors); the test block lies
+ * 0x3000000 sectors (24 GiB) into userdata, 8 GiB past the image's end.
+ */
+#define IOS_IMAGE_SECTORS	0x2000000ULL
+#define WTEST_OFFSET		0x3000000ULL
+#define WTEST_MARGIN		0x100000ULL	/* 512 MiB that must stay between image and test block */
 
 /* ADMA2 descriptor attributes: valid, end, action = transfer */
 #define ADMA2_VALID		(1U << 0)
@@ -109,16 +123,21 @@ static int wait_int(uint32_t want, uint32_t *st)
 	return -2;
 }
 
-/* Returns 0, or a negative step code; *resp = R1 card status. */
-static int read_block(uint32_t lba, uint32_t *resp, uint32_t *st)
+/*
+ * One 512-byte block through ADMA2 between sector[] and the card. Reads fill
+ * sector[] with FILL first (to see what the DMA wrote); writes send sector[]
+ * as it is. Returns 0, or a negative step code; *resp = R1 card status.
+ */
+static int xfer_block(uint32_t lba, int write, uint32_t *resp, uint32_t *st)
 {
 	uint64_t end = now() + ticks_ms(200);
 	while (hc_rd(SDHCI_PRESENT) & (PRESENT_CMD_INHIBIT | PRESENT_DAT_INHIBIT))
 		if (now() > end)
 			return -1;
 
-	for (int i = 0; i < 128; i++)
-		sector[i] = FILL;
+	if (!write)
+		for (int i = 0; i < 128; i++)
+			sector[i] = FILL;
 	uint64_t buf = (uintptr_t)sector;	/* MMU off: VA = PA */
 	adma_desc[0] = (512U << 16) | ADMA2_TRAN | ADMA2_END | ADMA2_VALID;
 	adma_desc[1] = (uint32_t)buf;
@@ -132,7 +151,7 @@ static int read_block(uint32_t lba, uint32_t *resp, uint32_t *st)
 	hc_wr(SDHCI_BLOCK, (1U << 16) | 512);
 	last_block_reg = hc_rd(SDHCI_BLOCK);
 	hc_wr(SDHCI_ARGUMENT, lba);		/* high-capacity card: sector address */
-	hc_wr(SDHCI_XFER_CMD, (CMD17 << 16) | XFER_READ_ONE_DMA);
+	hc_wr(SDHCI_XFER_CMD, write ? (CMD24 << 16) | XFER_WRITE_ONE_DMA : (CMD17 << 16) | XFER_READ_ONE_DMA);
 
 	int rc = 0;
 	if (wait_int(INT_CMD_DONE, st)) {
@@ -149,6 +168,11 @@ static int read_block(uint32_t lba, uint32_t *resp, uint32_t *st)
 	last_int_after = hc_rd(SDHCI_INT_STATUS);
 	__asm__ volatile("dsb sy" ::: "memory");
 	return rc;
+}
+
+static int read_block(uint32_t lba, uint32_t *resp, uint32_t *st)
+{
+	return xfer_block(lba, 0, resp, st);
 }
 
 static uint8_t byte_at(unsigned off)
@@ -183,6 +207,63 @@ static int read_or_report(uint32_t lba, const char *what, int verbose)
 	return rc;
 }
 
+static uint32_t saved[128];
+
+static unsigned count_diff(const uint32_t *want)
+{
+	unsigned bad = 0;
+	for (int i = 0; i < 128; i++)
+		bad += sector[i] != want[i];
+	return bad;
+}
+
+/*
+ * R6: write ONE block in the unused part of userdata, read it back, then
+ * write the original contents back and read again. Refuses unless the block
+ * is inside userdata and past the iOS image plus a margin.
+ */
+static void write_test(uint64_t first, uint64_t last)
+{
+	static uint32_t pattern[128];
+	uint64_t lba = first + WTEST_OFFSET;
+	uint32_t resp = 0, st = 0;
+	int rc;
+
+	con_skip();
+	con_hex("WTEST lba", lba);
+	if (lba < first + IOS_IMAGE_SECTORS + WTEST_MARGIN || lba > last || lba > 0xffffffffULL) {
+		con_str("WTEST", "refused: block not in the safe range");
+		return;
+	}
+	if (read_or_report((uint32_t)lba, "WTEST original", 0))
+		return;
+	for (int i = 0; i < 128; i++) {
+		saved[i] = sector[i];
+		pattern[i] = 0x4e4f4b41u ^ (uint32_t)i * 0x01010101u;	/* "NOKA" ^ index */
+		sector[i] = pattern[i];
+	}
+	rc = xfer_block((uint32_t)lba, 1, &resp, &st);
+	con_hex2("WRITE", "rc=", (uint32_t)-rc, "r1=", resp);
+	if (rc) {
+		con_hex2(" fail", "int=", st, "adma=", last_adma_err);
+		return;
+	}
+	if (read_or_report((uint32_t)lba, "WTEST readback", 0))
+		return;
+	unsigned bad = count_diff(pattern);
+	con_hex2("VERIFY", "bad=", bad, "w0=", sector[0]);
+
+	for (int i = 0; i < 128; i++)
+		sector[i] = saved[i];
+	rc = xfer_block((uint32_t)lba, 1, &resp, &st);
+	con_hex2("RESTORE", "rc=", (uint32_t)-rc, "r1=", resp);
+	if (rc || read_or_report((uint32_t)lba, "WTEST restore", 0))
+		return;
+	unsigned bad2 = count_diff(saved);
+	con_hex2(" check", "bad=", bad2, 0, 0);
+	con_str("WTEST", bad == 0 && bad2 == 0 ? "PASS: write, readback, restore" : "FAIL");
+}
+
 /* GPT name: UTF-16LE at entry offset 56 */
 static int name_is(unsigned entry_off, const char *want)
 {
@@ -198,7 +279,7 @@ static int name_is(unsigned entry_off, const char *want)
 
 void drg_emmc_probe(void)
 {
-	con_str("EMMC", "read-only probe, hc 0xc0c4000");
+	con_str("EMMC", "probe + R6 1-block write test");
 	con_hex2("VERSION", "ver=", hc_rd(SDHCI_VERSION) >> 16, "cq=", *(volatile uint32_t *)CQ_BASE);
 	con_hex2("CAPS", "lo=", hc_rd(SDHCI_CAPS), "hi=", hc_rd(SDHCI_CAPS1));
 	con_hex2("PRESENT", "=", hc_rd(SDHCI_PRESENT), "int=", hc_rd(SDHCI_INT_STATUS));
@@ -245,6 +326,7 @@ void drg_emmc_probe(void)
 			con_hex("  last", last);
 			con_hex("  sectors", last - first + 1);
 			con_hex("  android", ANDROID_USERDATA_KB * 2);
+			write_test(first, last);
 			return;
 		}
 	}
