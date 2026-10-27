@@ -127,10 +127,10 @@ core_mhz(uint32_t *cpu, uint64_t *mpidr)
 	__builtin_arm_wsr64("PMCR_EL0", (__builtin_arm_rsr64("PMCR_EL0") | 1) & ~(1ULL << 3));
 	__builtin_arm_wsr64("PMCNTENSET_EL0", 1ULL << 31);
 	__builtin_arm_isb(0xf);         /* ISB SY */
-	t0 = ml_get_timebase();
+	t0 = mach_absolute_time();
 	c0 = __builtin_arm_rsr64("PMCCNTR_EL0");
 	do {
-		t1 = ml_get_timebase();
+		t1 = mach_absolute_time();
 	} while (t1 - t0 < span);
 	c1 = __builtin_arm_rsr64("PMCCNTR_EL0");
 	ml_set_interrupts_enabled(istate);
@@ -200,10 +200,10 @@ drg_perf_report(__unused thread_call_param_t p0, __unused thread_call_param_t p1
 	char name[20];
 
 	mhz = core_mhz(&cpu, &mpidr);
-	uint64_t total = os_atomic_xchg(&lse_total, 0, relaxed);
+	uint64_t lse_n = os_atomic_xchg(&lse_total, 0, relaxed);
 	uint64_t untracked = os_atomic_xchg(&lse_untracked, 0, relaxed);
 	printf("DRG PERF: --- %us: cpu%u mpidr 0x%llx %u MHz; lse %llu (%llu/s, %llu untracked)\n",
-	    drg_perf_period, cpu, mpidr, mhz, total, total / drg_perf_period, untracked);
+	    drg_perf_period, cpu, mpidr, mhz, lse_n, lse_n / drg_perf_period, untracked);
 
 	/* busiest emulated PCs this period */
 	for (int n = 0; n < DRG_PERF_TOP; n++) {
