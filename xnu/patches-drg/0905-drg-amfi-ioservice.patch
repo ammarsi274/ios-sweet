@@ -1,0 +1,154 @@
+drg: built-in AppleMobileFileIntegrity IOService (extension points)
+
+iOS 16.7 ExtensionFoundation registers extension points through
+IOServiceMatching("AppleMobileFileIntegrity") + IOServiceOpen type 0 +
+IOConnectCallMethod selector 6 (one scalar, the cdhash as structure),
+measured in the shared cache. With no such service it logs "Unable to
+find AMFI", no extension point is registered, the extension cache stays
+empty and PosterBoard asserts in
+-[PBFPosterExtensionDataStore _stateLock_setupSwitcherConfigurationForFirstTime]
+(drg/BOOTLOG.md boot #16).
+
+Own IOService under IOResources with Apple's class name; selector 6
+succeeds (the built-in code-signing policy already makes every root
+binary a platform binary), everything else is kIOReturnUnsupported, and
+every call is logged as "DRG AMFI: <proc> sel N ...".
+
+diff --git a/iokit/Kernel/arm/DrgMobileFileIntegrity.cpp b/iokit/Kernel/arm/DrgMobileFileIntegrity.cpp
+new file mode 100644
+index 0000000..0637b0b
+--- /dev/null
++++ b/iokit/Kernel/arm/DrgMobileFileIntegrity.cpp
+@@ -0,0 +1,104 @@
++/*
++ * Built-in AppleMobileFileIntegrity IOService for DRG.
++ *
++ * Apple's AMFI kext (closed) publishes an IOService of this class name.
++ * iOS 16.7 userland opens it with IOServiceMatching("AppleMobileFileIntegrity")
++ * and IOServiceOpen type 0:
++ *   - ExtensionFoundation (extension point registration, measured in the
++ *     shared cache): IOConnectCallMethod selector 6 with one scalar (1) and
++ *     a structure (the code directory hash to trust); on failure it logs
++ *     "Unable to find AMFI" and registers no extension points, so the
++ *     extension cache stays empty and PosterBoard asserts at first setup
++ *     (drg/BOOTLOG.md boot #16)
++ *   - launchd_cache_loader: the same selector 6 (skipped here with
++ *     launchd_unsecure_cache=1)
++ *
++ * Code signing on DRG is the built-in policy in bsd/kern/drg_amfi.c (every
++ * signed binary on the root volume is a platform binary), so "trust this
++ * cdhash" has nothing further to record: selector 6 succeeds. Every call
++ * is logged; other selectors fail with kIOReturnUnsupported.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(DRG)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <sys/proc.h>
++
++/* AppleMobileFileIntegrity user client selectors (iOS 16.7, measured). */
++enum {
++	kAMFITrustCDHash = 6,
++};
++
++class AppleMobileFileIntegrity : public IOService {
++	OSDeclareDefaultStructors(AppleMobileFileIntegrity);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleMobileFileIntegrity, IOService);
++
++bool
++AppleMobileFileIntegrity::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "AppleMobileFileIntegrityUserClient");
++	registerService();
++	IOLog("DRG AMFI: AppleMobileFileIntegrity registered\n");
++	return true;
++}
++
++class AppleMobileFileIntegrityUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleMobileFileIntegrityUserClient);
++
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleMobileFileIntegrityUserClient, IOUserClient);
++
++IOReturn
++AppleMobileFileIntegrityUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleMobileFileIntegrityUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
++    __unused void *reference)
++{
++	IOReturn ret;
++	uint32_t in_scalars = args->scalarInputCount;
++	uint32_t in_struct = args->structureInputDescriptor != NULL ?
++	    (uint32_t)args->structureInputDescriptor->getLength() : args->structureInputSize;
++	uint64_t arg0 = in_scalars > 0 ? args->scalarInput[0] : 0;
++
++	switch (selector) {
++	case kAMFITrustCDHash:
++		/* Every root-volume binary is already a platform binary. */
++		args->scalarOutputCount = 0;
++		ret = kIOReturnSuccess;
++		break;
++	default:
++		ret = kIOReturnUnsupported;
++		break;
++	}
++
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IOLog("DRG AMFI: %s sel %u arg0 %llu in %u/%u -> 0x%x\n", name, selector,
++	    arg0, in_scalars, in_struct, ret);
++	return ret;
++}
++#endif /* DRG */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index a309d22..c6109c4 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -53,6 +53,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = AppleKeyStore;"
+     "   },"
+     "   {"
++    "     'IOClass'         = AppleMobileFileIntegrity;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleMobileFileIntegrity;"
++    "   },"
++    "   {"
+     "     'IOClass'         = IOWatchdog;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOWatchdog;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 0ecba1c..cad501a 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -12,6 +12,7 @@ iokit/Kernel/arm/DrgPlatformExpert.cpp                         optional iokitcpp
+ iokit/Kernel/arm/DrgCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/DrgEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/DrgKeyStore.cpp                               optional iokitcpp
++iokit/Kernel/arm/DrgMobileFileIntegrity.cpp                    optional iokitcpp
+ iokit/Kernel/arm/DrgWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/DrgSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/DrgFramebuffer.cpp                            optional iokitcpp
