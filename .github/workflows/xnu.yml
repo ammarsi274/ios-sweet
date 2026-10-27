@@ -56,12 +56,13 @@ jobs:
           git -C dxb checkout -q FETCH_HEAD
           # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
           cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
-          # drg: rewrite our copied series into the Nokia 6.1 Plus one (DRG names,
-          # ARMv8.0, Gold-cluster SMP, its framebuffer); dxb's own patches untouched
-          if [ "$BOARD" = drg ]; then python3 xnu/drg-overlay.py dxb/patches; fi
           # libfirehose_kernel is built arm64e-only; our kernels are plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          # drg: rewrite our copied series into the Nokia 6.1 Plus one (DRG names,
+          # ARMv8.0, Gold-cluster SMP, its framebuffer; dxb's own patches untouched)
+          # and build libfirehose_kernel for ARMv8.0 too
+          if [ "$BOARD" = drg ]; then python3 xnu/drg-overlay.py dxb/patches --dxb dxb; fi
           ls dxb/patches
 
       - name: Deps

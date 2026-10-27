@@ -39,6 +39,15 @@ FORBIDDEN=(
 	"CFP/DVP/CPP RCTX|${T}(cfp|dvp|cpp)${T}"
 	"FP16 arithmetic|${T}(fadd|fmul|fsub|fmla|fmls|fdiv|fsqrt)${T}(h[0-9]|v[0-9]+\\.[48]h)"
 )
+# Constant tables that live in executable sections but are never executed;
+# their bytes can decode as anything. Each was checked by hand:
+#   K256  SHA-256 round constants (0x428a2f98 0x71374491 ...), crypto code loads them
+DATA_SYMBOLS="K256"
+awk -v skip=" $DATA_SYMBOLS " '
+	/^[0-9a-f]+ <.*>:$/ { s = $2; gsub(/[<>:]/, "", s); drop = index(skip, " " s " ") > 0 }
+	!drop' "$DIS" > "$DIS.code"
+mv "$DIS.code" "$DIS"
+
 bad=0
 for entry in "${FORBIDDEN[@]}"; do
 	name=${entry%%|*} re=${entry#*|}

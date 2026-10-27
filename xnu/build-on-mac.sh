@@ -64,10 +64,11 @@ git init -q "$WORK/dxb"
 git -C "$WORK/dxb" fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
 git -C "$WORK/dxb" checkout -q FETCH_HEAD
 cp xnu/patches/*.patch xnu/patches/*.sh "$WORK/dxb/patches/"
-if [ "$BOARD" = drg ]; then python3 xnu/drg-overlay.py "$WORK/dxb/patches"; fi
 # libfirehose_kernel is built arm64e-only; our kernels are plain arm64
 sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' "$WORK/dxb/build.sh"
 grep -q 'VALID_ARCHS="x86_64 arm64e arm64"' "$WORK/dxb/build.sh"
+# drg: Nokia series (DRG names, ARMv8.0, ...) and libfirehose_kernel for ARMv8.0
+if [ "$BOARD" = drg ]; then python3 xnu/drg-overlay.py "$WORK/dxb/patches" --dxb "$WORK/dxb"; fi
 
 cd "$WORK/dxb"
 MACOS_VERSION=13.5 KERNEL_CONFIG=DEVELOPMENT MACHINE_CONFIG=$MACHINE_CONFIG MAKEFLAGS=-k \

@@ -19,7 +19,13 @@ left alone) in three passes:
 Line counts never change, so every hunk header stays valid. Prove the
 result with tools/test-apply-series.sh before spending a CI run.
 
-Usage: python3 xnu/drg-overlay.py DIR   (DIR = copy of xnu/patches; edited in place)
+With --dxb DXB_DIR it also adjusts darwin-xnu-build's build.sh: the
+kernel links libfirehose_kernel.a, which build.sh compiles separately
+with xcodebuild and no CPU flag, i.e. for clang's apple-m1 default (LSE).
+DRG builds it for arm64 only with -mcpu=cortex-a73. Run this after the
+CI step that adds arm64 to that xcodebuild line.
+
+Usage: python3 xnu/drg-overlay.py DIR [--dxb DXB_DIR]   (DIR = copy of xnu/patches; edited in place)
 """
 import re
 import sys
@@ -87,6 +93,12 @@ CHANGES = [
      "/* GT9896 (not on DRG, driver off): Yellowstone, not the Berlin protocol. */", 1),
 ]
 
+# darwin-xnu-build build.sh (after CI added arm64): libfirehose_kernel for Kryo 260
+DXB_CHANGES = [
+    ('ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"',
+     'ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS=\'$(inherited) -mcpu=cortex-a73\'', 1),
+]
+
 RENAME = [("SWEET", "DRG"), ("Sweet", "Drg"), ("sweet", "drg")]
 # also names spelled one character at a time: { 'S', 'W', 'E', 'E', 'T', ... }
 LEFTOVER = re.compile(rb"sweet|xiaomi|redmi|sm7150|'S', *'W', *'E', *'E', *'T'", re.IGNORECASE)
@@ -138,5 +150,19 @@ def main(patch_dir):
           f"{len(extra)} DRG-only patches added")
 
 
+def patch_dxb(dxb_dir):
+    path = Path(dxb_dir) / "build.sh"
+    t = path.read_bytes()
+    for old, new, want in DXB_CHANGES:
+        got = t.count(old.encode())
+        if got != want:
+            sys.exit(f"drg-overlay: build.sh: {old!r}: {got} occurrences, expected {want}")
+        t = t.replace(old.encode(), new.encode())
+    path.write_bytes(t)
+    print(f"drg-overlay: build.sh: libfirehose_kernel for arm64 with -mcpu=cortex-a73")
+
+
 if __name__ == "__main__":
     main(sys.argv[1])
+    if "--dxb" in sys.argv:
+        patch_dxb(sys.argv[sys.argv.index("--dxb") + 1])
