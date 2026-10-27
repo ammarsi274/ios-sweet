@@ -11,6 +11,7 @@
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
+#include "emmc.h"
 
 #define RESTART_BOOTLOADER	0x77665500U
 
@@ -434,29 +435,18 @@ static void __attribute__((noreturn)) drg_gold_main(void)
 	con_str("GOLD", "loading xnu on the Gold core");
 	con_str("LOADER", loader_boot(handoff_dtb));
 
-	uint64_t mmfr1 = rsr("id_aa64mmfr1_el1"), mmfr2 = rsr("id_aa64mmfr2_el1");
-	uint64_t isar1 = rsr("id_aa64isar1_el1"), pfr0 = rsr("id_aa64pfr0_el1");
-
+	/*
+	 * No payload: read-only eMMC probe (R3a). The Gold core's ID registers
+	 * shown here before are in drg/BOOTLOG.md (boot #4).
+	 */
+	stage = "gold emmc";
 	con_skip();
-	con_str("GOLD", "no payload: ID registers instead");
-	con_hex2("EL", "cur=", rsr("currentel") >> 2, "cpu=", rsr("mpidr_el1"));
-	con_hex2("MIDR", "=", rsr("midr_el1"), "tg16=", (rsr("id_aa64mmfr0_el1") >> 20) & 0xf);
-	con_hex2("CPU0", "aff_info(1=off)=", smc(PSCI_AFFINITY_INFO, 0, 0, 0), 0, 0);
-	con_hex("MMFR1", mmfr1);
-	con_hex("MMFR2", mmfr2);
-	con_hex("ISAR1", isar1);
-	con_hex("PFR0", pfr0);
-	con_hex2("PAN", "=", (mmfr1 >> 20) & 0xf, "vhe=", (mmfr1 >> 8) & 0xf);
-	con_hex2("HAFDBS", "=", mmfr1 & 0xf, "lor=", (mmfr1 >> 16) & 0xf);
-	con_hex2("UAO", "=", (mmfr2 >> 4) & 0xf, "cnp=", mmfr2 & 0xf);
-	con_hex2("DPB", "=", isar1 & 0xf, "lrcpc=", (isar1 >> 20) & 0xf);
-	con_hex2("RAS", "=", (pfr0 >> 28) & 0xf, "gic=", (pfr0 >> 24) & 0xf);
-	con_hex2("DTB", "at=", handoff_dtb, "magic=", __builtin_bswap32(rd32(handoff_dtb)));
+	drg_emmc_probe();
 	con_skip();
 
 	stage = "gold done";
-	con_str("DONE", "from Gold; fastboot in ~60s");
-	delay_ms(20000);
+	con_str("DONE", "from Gold; fastboot in ~90s");
+	delay_ms(50000);
 	reset(40);
 }
 
