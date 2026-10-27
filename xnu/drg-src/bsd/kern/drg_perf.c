@@ -126,7 +126,7 @@ core_mhz(uint32_t *cpu, uint64_t *mpidr)
 	/* PMCR.E on, PMCR.D off (count every cycle), cycle counter enabled */
 	__builtin_arm_wsr64("PMCR_EL0", (__builtin_arm_rsr64("PMCR_EL0") | 1) & ~(1ULL << 3));
 	__builtin_arm_wsr64("PMCNTENSET_EL0", 1ULL << 31);
-	__builtin_arm_isb(ISB_SY);
+	__builtin_arm_isb(0xf);         /* ISB SY */
 	t0 = ml_get_timebase();
 	c0 = __builtin_arm_rsr64("PMCCNTR_EL0");
 	do {

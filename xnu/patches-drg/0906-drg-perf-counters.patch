@@ -54,7 +54,7 @@ index dc9c03a..e8f8c67 100755
  	if (error) {
 diff --git a/bsd/kern/drg_perf.c b/bsd/kern/drg_perf.c
 new file mode 100755
-index 0000000..002640e
+index 0000000..0c9608a
 --- /dev/null
 +++ b/bsd/kern/drg_perf.c
 @@ -0,0 +1,269 @@
@@ -186,7 +186,7 @@ index 0000000..002640e
 +	/* PMCR.E on, PMCR.D off (count every cycle), cycle counter enabled */
 +	__builtin_arm_wsr64("PMCR_EL0", (__builtin_arm_rsr64("PMCR_EL0") | 1) & ~(1ULL << 3));
 +	__builtin_arm_wsr64("PMCNTENSET_EL0", 1ULL << 31);
-+	__builtin_arm_isb(ISB_SY);
++	__builtin_arm_isb(0xf);         /* ISB SY */
 +	t0 = ml_get_timebase();
 +	c0 = __builtin_arm_rsr64("PMCCNTR_EL0");
 +	do {
