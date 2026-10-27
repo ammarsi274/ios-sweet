@@ -24,6 +24,7 @@ on:
     paths:
       - "xnu/patches/**"
       - "xnu/drg-overlay.py"
+      - "xnu/patches-drg/**"
       - ".github/workflows/xnu.yml"
 
 concurrency:

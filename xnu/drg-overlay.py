@@ -14,6 +14,7 @@ left alone) in three passes:
   2. Rename: sweet/Sweet/SWEET -> drg/Drg/DRG in contents and file names
      (identifiers, file paths, the machine config, boot-args, log tags).
   3. Check: no sweet/Xiaomi/Redmi/SM7150 text may be left.
+  4. Add xnu/patches-drg/*.patch (DRG-only changes to Apple's own code).
 
 Line counts never change, so every hunk header stays valid. Prove the
 result with tools/test-apply-series.sh before spending a CI run.
@@ -124,7 +125,17 @@ def main(patch_dir):
         for m in LEFTOVER.finditer(t):
             line = t[:m.start()].count(b"\n") + 1
             sys.exit(f"drg-overlay: {out.name}:{line}: leftover {m.group().decode()!r}")
-    print(f"drg-overlay: {len(CHANGES)} DRG changes, {len(files)} files renamed sweet -> drg")
+    # DRG-only patches (Apple code the sweet series never needed to touch,
+    # e.g. hand-written LSE). Numbered 09xx so they apply after the series.
+    extra = sorted((Path(__file__).parent / "patches-drg").glob("*.patch"))
+    for p in extra:
+        t = p.read_bytes()
+        m = LEFTOVER.search(t)
+        if m:
+            sys.exit(f"drg-overlay: {p.name}: leftover {m.group().decode()!r}")
+        (Path(patch_dir) / p.name).write_bytes(t)
+    print(f"drg-overlay: {len(CHANGES)} DRG changes, {len(files)} files renamed sweet -> drg, "
+          f"{len(extra)} DRG-only patches added")
 
 
 if __name__ == "__main__":

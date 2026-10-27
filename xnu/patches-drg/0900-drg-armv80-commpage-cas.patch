@@ -1,0 +1,46 @@
+drg: ARMv8.0 compare-and-swap in the commpage FIFO trylock
+
+Kryo 260 has no LSE: casa is an undefined instruction there. Keep it
+where __ARM_FEATURE_ATOMICS says the target has LSE, else use an
+ldaxr/stxr loop with the same result in w10 and acquire ordering.
+Only caller-save x9-x15 are used, as the functions promise.
+
+diff --git a/osfmk/arm/commpage/commpage_asm.s b/osfmk/arm/commpage/commpage_asm.s
+--- a/osfmk/arm/commpage/commpage_asm.s
++++ b/osfmk/arm/commpage/commpage_asm.s
+@@ -273,7 +273,17 @@
+ 	mov		w11, #1			 // locked value = w11 = 1
+ 
+ 	// Try to grab the lock
++#if __ARM_FEATURE_ATOMICS
+ 	casa	w10, w11, [x3]	 // Atomic CAS with acquire barrier
++#else
++	// ARMv8.0 (no LSE, e.g. Kryo 260): exclusive-pair CAS with acquire.
++	// Same result as casa: w10 = old lock value, lock = 1 only if it was 0.
++10:	ldaxr	w10, [x3]
++	cbnz	w10, 11f		 // held: give up, w10 != 0 means failure
++	stxr	w12, w11, [x3]
++	cbnz	w12, 10b		 // lost the exclusive monitor: retry
++11:	clrex
++#endif
+ 	cbz		w10, Ltrylock_enqueue_success
+ 
+ 	mov		x0, #-1			// Failed
+@@ -323,7 +333,17 @@
+ 	mov		w10, wzr		 // unlock value = w10 = 0
+ 	mov		w11, #1			 // locked value = w11 = 1
+ 
++#if __ARM_FEATURE_ATOMICS
+ 	casa	w10, w11, [x2]	 // Atomic CAS with acquire barrier
++#else
++	// ARMv8.0 (no LSE, e.g. Kryo 260): exclusive-pair CAS with acquire.
++	// Same result as casa: w10 = old lock value, lock = 1 only if it was 0.
++10:	ldaxr	w10, [x2]
++	cbnz	w10, 11f		 // held: give up, w10 != 0 means failure
++	stxr	w12, w11, [x2]
++	cbnz	w12, 10b		 // lost the exclusive monitor: retry
++11:	clrex
++#endif
+ 	cbz		w10, Ltrylock_dequeue_success
+ 
+ 	mov		x0, #-1			// Failed
