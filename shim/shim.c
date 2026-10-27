@@ -428,11 +428,17 @@ static void __attribute__((noreturn)) drg_gold_main(void)
 		;
 	delay_ms(100);	/* let Silver CPU0 finish CPU_OFF */
 
+	/* A NOKIAXNU payload in the ramdisk: boot XNU from here (returns only on error). */
+	stage = "gold loader";
+	con_skip();
+	con_str("GOLD", "loading xnu on the Gold core");
+	con_str("LOADER", loader_boot(handoff_dtb));
+
 	uint64_t mmfr1 = rsr("id_aa64mmfr1_el1"), mmfr2 = rsr("id_aa64mmfr2_el1");
 	uint64_t isar1 = rsr("id_aa64isar1_el1"), pfr0 = rsr("id_aa64pfr0_el1");
 
 	con_skip();
-	con_str("GOLD", "now running on the Gold core");
+	con_str("GOLD", "no payload: ID registers instead");
 	con_hex2("EL", "cur=", rsr("currentel") >> 2, "cpu=", rsr("mpidr_el1"));
 	con_hex2("MIDR", "=", rsr("midr_el1"), "tg16=", (rsr("id_aa64mmfr0_el1") >> 20) & 0xf);
 	con_hex2("CPU0", "aff_info(1=off)=", smc(PSCI_AFFINITY_INFO, 0, 0, 0), 0, 0);
@@ -455,8 +461,8 @@ static void __attribute__((noreturn)) drg_gold_main(void)
 }
 
 /*
- * DRG XNU step 0: hand the boot over from Silver CPU0 (where ABL enters) to
- * Gold 0x100, which will run XNU with 16K pages. Silver powers itself off.
+ * DRG: hand the boot over from Silver CPU0 (where ABL enters) to Gold
+ * 0x100, which loads and runs XNU with 16K pages. Silver powers itself off.
  */
 static void __attribute__((noreturn)) drg_main(uint64_t dtb)
 {
@@ -466,7 +472,7 @@ static void __attribute__((noreturn)) drg_main(uint64_t dtb)
 
 	stage = "drg console";
 	con_clear(0xff102040U);
-	con_str("SHIM", "DRG xnu step 0: gold handoff");
+	con_str("SHIM", "DRG: gold handoff + xnu loader");
 	con_hex2("EL", "cur=", rsr("currentel") >> 2, "cpu=", rsr("mpidr_el1"));
 	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
 	con_hex2("PSCI", "ver=", smc(PSCI_VERSION, 0, 0, 0), "wdt=", rd32(WDT_BASE + WDT_EN));
