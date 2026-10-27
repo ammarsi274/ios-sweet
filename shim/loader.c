@@ -138,6 +138,19 @@ const char *loader_boot(uintptr_t dtb)
 
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
 	con_hex("JUMP", entry_pa);
+#ifdef BOARD_DRG
+	/*
+	 * XNU's console wipes this screen at once. Hold it so the measured
+	 * INITRD / PHYS / SEGS / BOOTARG values can be photographed.
+	 */
+	con_str("PAUSE", "15 s, then xnu");
+	uint64_t frq, t0, t;
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frq));
+	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t0));
+	do {
+		__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t));
+	} while (t - t0 < 15 * frq);
+#endif
 	con_str("XNU", "jumping (fbcon clears screen)");
 
 	/* Everything was written with the MMU and caches off; drop any stale I-cache lines too. */
