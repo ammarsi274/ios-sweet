@@ -420,6 +420,43 @@ static void __attribute__((unused)) test_smp_drg(void)
  * Runs on Gold 0x100 after the handoff. XNU will boot from here, so report
  * the ID registers that decide which ARMv8.1+ features the kernel may use.
  */
+/*
+ * Read-only look at the CPU clock hardware ABL leaves (efficiency plan,
+ * Phase 3). The Gold cores measured 600 MHz under XNU (boot #18). Addresses
+ * from this phone's device tree (qcom,clk-cpu-osm @179c0000: osm, pwrcl_pll
+ * 0x17916000, perfcl_pll 0x17816000), register offsets from HMD's DRG kernel
+ * (drivers/clk/qcom/clk-cpu-osm.c): each cluster has a 0x2000 OSM block
+ * (pwrcl = Silver at +0, perfcl = Gold at +0x2000), ENABLE_REG 0x1004,
+ * DCVS_PERF_STATE_DESIRED_REG 0x1f10, and a 40-row table of 32-byte rows
+ * with FREQ_REG 0x1154 / VOLT_REG 0x1158. The PLL's L value (PLL + 4)
+ * times the 19.2 MHz XO is the PLL frequency. Nothing is written.
+ */
+#define DRG_OSM_BASE		0x179c0000UL
+#define DRG_OSM_CLUSTER		0x2000UL
+#define DRG_OSM_ENABLE		0x1004
+#define DRG_OSM_DESIRED		0x1f10
+#define DRG_OSM_FREQ		0x1154
+#define DRG_OSM_VOLT		0x1158
+#define DRG_OSM_ROW		32
+#define DRG_PLL_SILVER		0x17916000UL
+#define DRG_PLL_GOLD		0x17816000UL
+
+static void drg_osm_probe(void)
+{
+	static const char *const cl[2] = { "OSM SIL", "OSM GOLD" };
+
+	for (unsigned int c = 0; c < 2; c++) {
+		uintptr_t b = DRG_OSM_BASE + c * DRG_OSM_CLUSTER;
+		con_hex2(cl[c], "en=", rd32(b + DRG_OSM_ENABLE), "want=", rd32(b + DRG_OSM_DESIRED));
+	}
+	con_hex2("PLL L", "sil=", rd32(DRG_PLL_SILVER + 4), "gold=", rd32(DRG_PLL_GOLD + 4));
+	/* Gold table rows 0-7: frequency word and voltage word as programmed now */
+	for (unsigned int r = 0; r < 8; r++) {
+		uintptr_t b = DRG_OSM_BASE + DRG_OSM_CLUSTER + r * DRG_OSM_ROW;
+		con_hex2("GOLD LUT", "f=", rd32(b + DRG_OSM_FREQ), "v=", rd32(b + DRG_OSM_VOLT));
+	}
+}
+
 static void __attribute__((noreturn)) drg_gold_main(void)
 {
 	stage = "gold";
@@ -428,6 +465,9 @@ static void __attribute__((noreturn)) drg_gold_main(void)
 	while (!silver_done)
 		;
 	delay_ms(100);	/* let Silver CPU0 finish CPU_OFF */
+
+	stage = "gold osm";
+	drg_osm_probe();
 
 	/* A NOKIAXNU payload in the ramdisk: boot XNU from here (returns only on error). */
 	stage = "gold loader";
