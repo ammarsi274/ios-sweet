@@ -51,7 +51,13 @@ jobs:
 
       - name: Fetch build script
         run: |
-          git init -q dxb
+          # Build outside the checkout: source paths end up in the kernel
+          # (assert/panic strings) and the checkout path is named after the
+          # repo. dxb stays reachable through the symlink; the build step
+          # enters it with cd -P so dxb's WORK_DIR=$PWD is the neutral path.
+          mkdir -p "$RUNNER_TEMP/xnu-build"
+          git init -q "$RUNNER_TEMP/xnu-build/dxb"
+          ln -s "$RUNNER_TEMP/xnu-build/dxb" dxb
           git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
           git -C dxb checkout -q FETCH_HEAD
           # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
@@ -80,13 +86,14 @@ jobs:
           xcrun --find iig
 
       - name: Build
-        working-directory: dxb
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         shell: bash
         run: |
           set -o pipefail
+          cd -P dxb
+          echo "building in $PWD"
           bash build.sh 2>&1 | tee build.log
           # dxb only warns when a patch does not apply; one of ours missing
           # means a broken kernel, so stop here.
