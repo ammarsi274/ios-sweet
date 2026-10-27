@@ -1,0 +1,12 @@
+drg: performance counters, quieter AKS log (efficiency plan Phase 0/1)
+
+bsd/kern/drg_perf.c, own code, measures only: every 60 s (boot-arg
+drg_perf=N, 0 = off) one "DRG PERF:" report in the kernel log with the
+clock of the reporting core (PMU cycles against the generic timer), the
+user LSE/LDAPR emulation count and busiest PCs, the top processes by CPU
+time in the period, eMMC traffic and time in the driver, and frames
+copied to the panel with their cost. Hooks: sleh.c after an emulated
+instruction, drg_emmc.c strategy, AppleCLCD vsync present.
+
+DrgKeyStore.cpp: log each succeeding selector twice and every failure,
+instead of every call (triald alone printed hundreds on the console).
