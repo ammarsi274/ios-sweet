@@ -1,0 +1,14 @@
+drg: Nokia-only kernel: drop the other phone's drivers, Nokia battery (0908)
+
+An audit of every DRG source file for hard-coded hardware addresses found
+drivers for a different SoC still in the DRG build: UFS storage (with the
+console log and process sampler it started), a GENI-I2C touch driver, RPMh
+regulators, an SPMI v5 arbiter at 0x0c440000 and a USB controller at
+0x0a600000. None exists on the Nokia 6.1 Plus (eMMC, BLSP QUP I2C, RPM,
+SPMI v3 @800f000), and with rd=emmcroot0 none of them ran. They leave the
+build, with the console hook into the UFS log and the ufsroot0 root path.
+
+DrgBattery read that PMIC behind drgbattery=1 and published a 5020 mAh
+battery. It is now a static power source with this phone's battery profile
+from its device tree (DRG_alt_3000mah_100k, 3000 mAh, 4.4 V), flagged as
+not measured, and touches no PMIC.
