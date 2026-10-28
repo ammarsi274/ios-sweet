@@ -21,10 +21,15 @@ JOBS = {
                               'SDM636: 252 starts in boot #16, each exit(0)',
     'com.apple.nanotimekitcompaniond': 'Apple Watch faces; no Watch can pair without Bluetooth: '
                                        '89 starts in boot #17, each exit(0)',
+    'com.apple.voicemail.vmd': 'visual voicemail needs the modem (CommCenter, absent): 402,419 '
+                               'failed lookups of com.apple.commcenter.coretelephony.xpc in boot #18',
 }
 
-# app extensions renamed to <name>.appex.drg-off, so no registry lists them
+# bundles renamed to <name>.drg-off, so no registry or plug-in scan finds them
 EXTENSIONS = {
+    'System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver':
+        'Bluetooth audio HAL plug-in in mediaserverd; with no Bluetooth it retried its XPC '
+        'service in a loop: 404,055 failed lookups and 3,098,686 "Connection invalid" in boot #18',
     'System/Library/CoreServices/AegirProxyApp.app/PlugIns/AegirPoster.appex':
         'Astronomy wallpaper renders with Metal (NanoUniverse/ClockKitUI); no Metal device: '
         '84 starts in boot #17, each NSInvalidArgumentException (nil uniform buffer)',
