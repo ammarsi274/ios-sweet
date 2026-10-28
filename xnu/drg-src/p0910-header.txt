@@ -1,0 +1,8 @@
+drg: scale the presented iPhone X frame onto the Nokia panel (patch 0910)
+
+Boot #30 (touch working) showed the 1125x2436 frame cropped to the
+1080x2280 panel: 22 columns lost at each side and 78 lines at the top and
+bottom (status bar clock, home indicator). AppleCLCD now maps every panel
+pixel to the presented pixel at its centre (tables built once) and samples
+each layer through that map, blending and converting as before. DrgHID
+maps a panel position to the same fraction of the presented display.
