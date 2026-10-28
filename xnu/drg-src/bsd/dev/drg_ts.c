@@ -1,0 +1,302 @@
+/*
+ * DRG (Nokia 6.1 Plus) touch screen: Goodix GT915L on BLSP1 QUP4 I2C.
+ *
+ * The shim brings the touch hardware up before XNU starts (shim/drg_ts.c,
+ * shim/drg_rpm.c; boots #28, #29): pm660l_l6 on through the RPM, the QUP4
+ * I2C core clock on, gpio14/15 in blsp_i2c4, Goodix reset with address
+ * 0x5d. It read the chip ID "915L" at 0x8140. This driver only checks that
+ * the clock is still on and then polls the chip:
+ *   - every 10 ms read 10 bytes at 0x814E: status (bit 7 new data, bits 3:0
+ *     fingers), first finger {id, x lo, x hi, y lo, y hi, w lo, w hi, -},
+ *     key byte; more fingers 8 bytes each from 0x8158; then write 0 to
+ *     0x814E (HMD's DRG kernel, drivers/input/touchscreen/gt9xx/gt9xx.c)
+ *   - coordinates are panel pixels, 1080 x 2280 (touchscreen-size-x/y in this
+ *     phone's device tree, no axis swap), handed to DrgHID as they are
+ * QUP v2 FIFO transfers (i2c-msm-v2.c): 400 kHz (fs_div 28, ht_div 14), tags
+ * START 0x81, DATA_WRITE 0x82, DATA_WRITE_N_STOP 0x83, DATA_READ_N_STOP 0x87;
+ * read data arrives behind 2 tag bytes; done = OPERATIONAL bit 11 (input)
+ * or bit 10 (output only). Boot-arg drgts=0 turns the driver off.
+ */
+#include <pexpert/arm64/board_config.h>
+
+#if defined(ARM64_BOARD_CONFIG_DRG)
+
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <kern/clock.h>
+#include <kern/thread.h>
+#include <kern/sched_prim.h>
+#include <machine/machine_routines.h>
+#include <pexpert/pexpert.h>
+
+extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+extern void drg_hid_touch(int finger, int down, int x, int y);
+void drg_ts_init(void);
+
+#define TS_QUP_PA               0x0c178000u     /* i2c@c178000 */
+#define TS_GCC_QUP4_PA          0x0011f000u     /* GCC + 0x1f000 (CBCR at +8) */
+#define TS_ADDR                 0x5d
+#define TS_FINGERS              10              /* DrgHID DRG_TOUCH_FINGERS */
+#define TS_POLL_MS              10
+
+#define QUP_CONFIG              0x000
+#define QUP_STATE               0x004
+#define QUP_IO_MODES            0x008
+#define QUP_SW_RESET            0x00c
+#define QUP_OPERATIONAL         0x018
+#define QUP_ERROR_FLAGS         0x01c
+#define QUP_ERROR_FLAGS_EN      0x020
+#define QUP_OPERATIONAL_MASK    0x028
+#define QUP_MX_OUTPUT_COUNT     0x100
+#define QUP_OUT_FIFO_BASE       0x110
+#define QUP_MX_WRITE_COUNT      0x150
+#define QUP_MX_INPUT_COUNT      0x200
+#define QUP_MX_READ_COUNT       0x208
+#define QUP_IN_FIFO_BASE        0x218
+#define QUP_MASTER_CLK_CTL      0x400
+#define QUP_I2C_STATUS          0x404
+#define QUP_MASTER_CONFIG       0x408
+
+#define QUP_NO_INPUT            (1u << 7)
+#define QUP_OP_OUT_DONE         (1u << 10)
+#define QUP_OP_IN_DONE          (1u << 11)
+#define QUP_I2C_ERRORS          0x38000fcu
+#define QUP_ERR_FLAGS           0x3cu
+
+static vm_offset_t ts_qup;
+static bool ts_started;
+static int ts_sleep_chan;
+static uint32_t ts_errors;
+
+static inline uint32_t
+qr(uint32_t off)
+{
+	uint32_t v = *(volatile uint32_t *)(ts_qup + off);
+	__asm__ volatile("dmb oshld" ::: "memory");
+	return v;
+}
+
+static inline void
+qw(uint32_t off, uint32_t v)
+{
+	__asm__ volatile("dmb oshst" ::: "memory");
+	*(volatile uint32_t *)(ts_qup + off) = v;
+}
+
+static int
+qup_state(uint32_t state)
+{
+	for (int i = 0; i < 100000; i++) {
+		if (qr(QUP_STATE) & 4) {
+			break;
+		}
+	}
+	qw(QUP_STATE, state);
+	for (int i = 0; i < 100000; i++) {
+		uint32_t s = qr(QUP_STATE);
+		if ((s & 4) && (s & 3) == state) {
+			return 0;
+		}
+	}
+	return -1;
+}
+
+static int
+qup_init(void)
+{
+	qw(QUP_SW_RESET, 1);
+	if (qup_state(0)) {
+		return -1;
+	}
+	qw(QUP_CONFIG, 0x207);                  /* 8-bit words, I2C mini core */
+	qw(QUP_ERROR_FLAGS_EN, 0x3c);
+	qw(QUP_OPERATIONAL_MASK, 0x300);
+	qw(QUP_MASTER_CONFIG, 1);               /* version-two tags */
+	return 0;
+}
+
+/*
+ * One FIFO transfer: out[] (tags and data, out_len bytes) and, if in_len,
+ * in_len data bytes read back into in[]. 0 or -1.
+ */
+static int
+qup_xfer(const uint8_t *out, uint32_t out_len, uint8_t *in, uint32_t in_len)
+{
+	uint32_t words[4] = {0, 0, 0, 0};
+	uint64_t deadline;
+
+	if (out_len > sizeof(words) || in_len + 2 > 16) {
+		return -1;
+	}
+	for (uint32_t i = 0; i < out_len; i++) {
+		words[i / 4] |= (uint32_t)out[i] << (8 * (i % 4));
+	}
+	if (qup_state(0)) {
+		return -1;
+	}
+	qw(QUP_MX_INPUT_COUNT, 0);
+	qw(QUP_MX_OUTPUT_COUNT, 0);
+	qw(QUP_MX_READ_COUNT, in_len ? in_len + 2 : 0);
+	qw(QUP_MX_WRITE_COUNT, out_len);
+	qw(QUP_CONFIG, 0x207 | (in_len ? 0 : QUP_NO_INPUT));
+	qw(QUP_IO_MODES, (qr(QUP_IO_MODES) & ~0x1fc00u) | (1u << 14) | (1u << 15));
+	qw(QUP_OPERATIONAL_MASK, 0);
+	if (qup_state(1)) {
+		return -1;
+	}
+	qw(QUP_MASTER_CLK_CTL, (14u << 16) | 28u);
+	if (qup_state(3)) {
+		return -1;
+	}
+	for (uint32_t i = 0; i < (out_len + 3) / 4; i++) {
+		qw(QUP_OUT_FIFO_BASE, words[i]);
+	}
+	if (qup_state(1)) {
+		return -1;
+	}
+	uint32_t done = in_len ? QUP_OP_IN_DONE : QUP_OP_OUT_DONE, op = 0;
+	nanoseconds_to_deadline(5 * NSEC_PER_MSEC, &deadline);
+	while (!((op = qr(QUP_OPERATIONAL)) & done)) {
+		if ((qr(QUP_ERROR_FLAGS) & QUP_ERR_FLAGS) || (qr(QUP_I2C_STATUS) & QUP_I2C_ERRORS) ||
+		    mach_absolute_time() > deadline) {
+			if (ts_errors++ < 8) {
+				printf("DRG TS: transfer failed op %#x status %#x err %#x\n",
+				    op, qr(QUP_I2C_STATUS), qr(QUP_ERROR_FLAGS));
+			}
+			(void)qup_init();
+			return -1;
+		}
+	}
+	if (in_len) {
+		uint8_t buf[16];
+		for (uint32_t i = 0; i < (in_len + 2 + 3) / 4; i++) {
+			uint32_t w = qr(QUP_IN_FIFO_BASE);
+			for (int b = 0; b < 4; b++) {
+				buf[4 * i + b] = (uint8_t)(w >> (8 * b));
+			}
+		}
+		for (uint32_t i = 0; i < in_len; i++) {
+			in[i] = buf[2 + i];     /* behind the 2-byte input tag */
+		}
+	}
+	(void)qup_state(0);
+	return 0;
+}
+
+/* Read n (<= 12) bytes from 16-bit register reg. */
+static int
+ts_read(uint16_t reg, uint8_t *data, uint32_t n)
+{
+	const uint8_t out[10] = {
+		0x81, TS_ADDR << 1, 0x82, 2,            /* START, write, 2 bytes */
+		(uint8_t)(reg >> 8), (uint8_t)reg,
+		0x81, (TS_ADDR << 1) | 1, 0x87, (uint8_t)n,  /* repeated START, read + STOP */
+	};
+	return qup_xfer(out, sizeof(out), data, n);
+}
+
+/* Write one byte to 16-bit register reg. */
+static int
+ts_write1(uint16_t reg, uint8_t v)
+{
+	const uint8_t out[7] = {
+		0x81, TS_ADDR << 1, 0x83, 3,            /* START, write + STOP, 3 bytes */
+		(uint8_t)(reg >> 8), (uint8_t)reg, v,
+	};
+	return qup_xfer(out, sizeof(out), NULL, 0);
+}
+
+static void
+ts_wait(void)
+{
+	uint64_t deadline;
+	clock_interval_to_deadline(TS_POLL_MS, NSEC_PER_MSEC, &deadline);
+	(void)assert_wait_deadline(&ts_sleep_chan, THREAD_UNINT, deadline);
+	thread_block(THREAD_CONTINUE_NULL);
+}
+
+static void
+ts_thread(__unused void *arg, __unused wait_result_t result)
+{
+	bool down[TS_FINGERS] = {false};
+	int lx[TS_FINGERS] = {0}, ly[TS_FINGERS] = {0};
+
+	for (;;) {
+		uint8_t d[10];
+		ts_wait();
+		if (ts_read(0x814e, d, sizeof(d)) || !(d[0] & 0x80)) {
+			continue;
+		}
+		uint32_t n = d[0] & 0x0f;
+		bool seen[TS_FINGERS] = {false};
+		for (uint32_t i = 0; i < n && i < TS_FINGERS; i++) {
+			uint8_t p[8];
+			if (i == 0) {
+				for (int b = 0; b < 8; b++) {
+					p[b] = d[1 + b];
+				}
+			} else if (ts_read((uint16_t)(0x8158 + 8 * (i - 1)), p, 8)) {
+				break;
+			}
+			uint32_t id = p[0] & 0x0f;
+			if (id >= TS_FINGERS) {
+				continue;
+			}
+			int x = p[1] | (p[2] << 8), y = p[3] | (p[4] << 8);
+			seen[id] = true;
+			down[id] = true;
+			lx[id] = x;
+			ly[id] = y;
+			drg_hid_touch((int)id, 1, x, y);
+		}
+		for (uint32_t id = 0; id < TS_FINGERS; id++) {
+			if (down[id] && !seen[id]) {
+				down[id] = false;
+				drg_hid_touch((int)id, 0, lx[id], ly[id]);
+			}
+		}
+		(void)ts_write1(0x814e, 0);     /* consumed: the chip may report again */
+	}
+}
+
+void
+drg_ts_init(void)
+{
+	int enabled = 1;
+	thread_t thread;
+
+	if (ts_started) {
+		return;
+	}
+	ts_started = true;
+	(void)PE_parse_boot_argn("drgts", &enabled, sizeof(enabled));
+	if (!enabled) {
+		printf("DRG TS: disabled (drgts=0)\n");
+		return;
+	}
+	vm_offset_t gcc = ml_io_map(TS_GCC_QUP4_PA, 0x1000);
+	ts_qup = ml_io_map(TS_QUP_PA, 0x1000);
+	if (!gcc || !ts_qup) {
+		printf("DRG TS: cannot map QUP4 or GCC\n");
+		return;
+	}
+	uint32_t cbcr = *(volatile uint32_t *)(gcc + 0x008);
+	if (cbcr & 0x80000000u) {
+		printf("DRG TS: QUP4 I2C clock is off (CBCR %#x): the shim did not bring touch up\n", cbcr);
+		return;
+	}
+	uint8_t id[6] = {0};
+	int rc = qup_init() ? -1 : ts_read(0x8140, id, sizeof(id));
+	printf("DRG TS: Goodix at 0x%x: rc %d id \"%c%c%c%c\" fw %02x%02x\n", TS_ADDR, rc,
+	    id[0], id[1], id[2], id[3], id[5], id[4]);
+	if (rc) {
+		return;
+	}
+	kern_return_t kr = kernel_thread_start(ts_thread, NULL, &thread);
+	if (kr == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	} else {
+		printf("DRG TS: kernel_thread_start failed %d\n", kr);
+	}
+}
+#endif /* ARM64_BOARD_CONFIG_DRG */

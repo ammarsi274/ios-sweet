@@ -1,0 +1,12 @@
+drg: Nokia touch screen, Goodix GT915L on BLSP1 QUP4 (patch 0909)
+
+The shim brings touch up before XNU (boots #28, #29): pm660l_l6 on through
+its own RPM client, QUP4 I2C clock, gpio14/15 blsp_i2c4, Goodix reset at
+0x5d; it read the chip ID "915L". bsd/dev/drg_ts.c checks the clock and
+polls the chip every 10 ms over QUP v2 FIFO transfers: 10 bytes at 0x814E,
+more fingers from 0x8158, then 0 to 0x814E (layout from HMD's DRG kernel,
+gt9xx.c, i2c-msm-v2.c). Panel pixels go to DrgHID as they are. Started
+from drg_emmc after the buttons; boot-arg drgts=0 turns it off.
+
+DrgHID still carried the other phone's 2400-line panel and its size: now
+the Nokia OTM1911A panel, 1080 x 2280, 63 x 134 mm.
