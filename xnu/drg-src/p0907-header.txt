@@ -1,0 +1,13 @@
+drg: Nokia buttons; blend display layers, convert w30r (patch 0907)
+
+drg_keys.c rewritten for the Nokia's own hardware, measured with the shim
+key watch (boots #21, #22): SPMI PMIC arbiter v3 @800f000, power = PM660
+PON RT_STS 0x810 bit 0, volume up = bit 1 (resin), volume down = PM660L
+GPIO 7 RT_STS bit 0 (active low). Read only, polled, on by default; started
+from drg_emmc once the root disk is ready (the UFS driver that used
+to start it never runs here).
+
+AppleCLCD::present blended nothing: each layer was copied over the last, so
+the lock screen's transparent top layer turned the wallpaper black. Now
+the bottom layer is copied, later 'BGRA' layers are blended source-over
+(premultiplied), and 'w30r' 10-bit layers are converted to 8 bits.
