@@ -450,11 +450,9 @@ static void drg_osm_probe(void)
 		con_hex2(cl[c], "en=", rd32(b + DRG_OSM_ENABLE), "want=", rd32(b + DRG_OSM_DESIRED));
 	}
 	con_hex2("PLL L", "sil=", rd32(DRG_PLL_SILVER + 4), "gold=", rd32(DRG_PLL_GOLD + 4));
-	/* Gold table rows 0-7: frequency word and voltage word as programmed now */
-	for (unsigned int r = 0; r < 8; r++) {
-		uintptr_t b = DRG_OSM_BASE + DRG_OSM_CLUSTER + r * DRG_OSM_ROW;
-		con_hex2("GOLD LUT", "f=", rd32(b + DRG_OSM_FREQ), "v=", rd32(b + DRG_OSM_VOLT));
-	}
+	/* Gold table rows were all zero in boot #19; row 0 shows if that changes. */
+	con_hex2("GOLD LUT", "f=", rd32(DRG_OSM_BASE + DRG_OSM_CLUSTER + DRG_OSM_FREQ),
+	    "v=", rd32(DRG_OSM_BASE + DRG_OSM_CLUSTER + DRG_OSM_VOLT));
 }
 
 /*
@@ -523,7 +521,7 @@ static void drg_touch_probe(void)
 		con_str("TS QUP", "clocks off: QUP not read");
 }
 
-static void drg_keys_watch(void)
+static void __attribute__((unused)) drg_keys_watch(void)   /* boots #21, #22 */
 {
 	unsigned int apid = drg_spmi_apid(DRG_PON_PPID);
 	unsigned int vapid = drg_spmi_apid(DRG_VOLDN_PPID);
@@ -556,6 +554,32 @@ static void drg_keys_watch(void)
 	} while (t - t0 < 15 * frq);
 }
 
+/*
+ * Touch supplies (read-only): the device tree names them only as RPM
+ * resources, ldoa11 (pm660_l11, vcc_i2c) and ldob6 (pm660l_l6, vdd_ana).
+ * Their regulator peripherals sit on PM660 SID 1 and PM660L SID 3. Every
+ * PMIC peripheral reports TYPE at 0x04 and SUBTYPE at 0x05; an LDO is TYPE
+ * 0x21. For each LDO found: EN_CTL 0x46 (bit 7 enable) and STATUS1 0x08
+ * (bit 7 VREG_READY). Prints "LDO sid/periph" and en << 8 | status.
+ */
+static void drg_ldo_probe(void)
+{
+	static const uint8_t sids[2] = { 1, 3 };
+	for (unsigned int i = 0; i < 2; i++) {
+		for (unsigned int per = 0x40; per <= 0x5f; per++) {
+			unsigned int apid = drg_spmi_apid(((uint32_t)sids[i] << 8) | per);
+			uint8_t type = 0, sub = 0, en = 0, st = 0;
+			if (apid == 0xffff || drg_spmi_read(apid, 0x04, &type) || type != 0x21)
+				continue;
+			(void)drg_spmi_read(apid, 0x05, &sub);
+			(void)drg_spmi_read(apid, 0x46, &en);
+			(void)drg_spmi_read(apid, 0x08, &st);
+			con_hex2("LDO", "sid/per=", ((uint32_t)sids[i] << 8) | per,
+			    "en/st=", ((uint32_t)en << 8) | st);
+		}
+	}
+}
+
 static void __attribute__((noreturn)) drg_gold_main(void)
 {
 	stage = "gold";
@@ -569,8 +593,8 @@ static void __attribute__((noreturn)) drg_gold_main(void)
 	drg_osm_probe();
 	stage = "gold touch";
 	drg_touch_probe();
-	stage = "gold keys";
-	drg_keys_watch();
+	stage = "gold ldo";
+	drg_ldo_probe();
 
 	/* A NOKIAXNU payload in the ramdisk: boot XNU from here (returns only on error). */
 	stage = "gold loader";
