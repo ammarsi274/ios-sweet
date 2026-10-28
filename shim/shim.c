@@ -12,6 +12,7 @@
 #include "loader.h"
 #include "ufs.h"
 #include "emmc.h"
+#include "drg_rpm.h"
 
 #define RESTART_BOOTLOADER	0x77665500U
 
@@ -647,6 +648,16 @@ static void drg_ldo_probe(void)
 		    "v40/41=", (uint32_t)v0 << 8 | v1);
 	}
 	drg_l6_enable();
+	/* L6 belongs to the RPM (boot #27): ask it, then read L6 back over SPMI. */
+	int rc = drg_rpm_ldo_enable(RPM_RES_LDOB, 6, 3300000);
+	delay_ms(10);
+	unsigned int apid = drg_spmi_apid(0x345);
+	uint8_t en = 0xee, st = 0xee;
+	if (apid != 0xffff) {
+		(void)drg_spmi_read(apid, 0x46, &en);
+		(void)drg_spmi_read(apid, 0x08, &st);
+	}
+	con_hex2("RPM L6", "rc=", (uint32_t)rc, "en/st=", (uint32_t)en << 8 | st);
 }
 
 static void __attribute__((noreturn)) drg_gold_main(void)
