@@ -2,7 +2,7 @@
 # Flash a new iOS root image by writing only the 1 MiB chunks that differ from
 # what the phone holds now. Run in Git Bash with the phone in TWRP (RAM boot).
 #   drg-flash-diff.sh NEW_IMAGE_WSL
-# NEW_IMAGE_WSL.chunks must exist (tools/chunkhash NEW 16384). Steps:
+# NEW_IMAGE_WSL without .img plus .chunks must exist (tools/chunkhash NEW 16384). Steps:
 #   1. the phone hashes its userdata in 1 MiB chunks (tools/chunkhash, ~1 min)
 #   2. chunkdiff-simg.py builds a sparse image of NEW's differing chunks
 #   3. reboot to the bootloader, fastboot flash userdata (no boot afterwards)
@@ -20,7 +20,7 @@ MSYS_NO_PATHCONV=1 adb shell "/tmp/chunkhash $DEV $N" | tr -d '\r' > $WORK/phone
 [ "$(wc -l < $WORK/phone.chunks)" = $N ] || { echo "phone list incomplete"; exit 1; }
 SIMG=${NEW%.img}-diff.simg
 MSYS_NO_PATHCONV=1 wsl -d Ubuntu -u root -- python3 /mnt/f/Nokia-HackiOs/ios-sweet/tools/chunkdiff-simg.py \
-	$NEW $NEW.chunks /mnt/f/Nokia-HackiOs/logs/flash/phone.chunks /mnt/f/Nokia-HackiOs/logs/flash/new-diff.simg
+	$NEW ${NEW%.img}.chunks /mnt/f/Nokia-HackiOs/logs/flash/phone.chunks /mnt/f/Nokia-HackiOs/logs/flash/new-diff.simg
 echo "$(date +%T) flashing"
 MSYS_NO_PATHCONV=1 adb reboot bootloader
 for i in $(seq 1 60); do timeout 5 fastboot getvar unlocked 2>&1 | grep -q "unlocked: yes" && break; sleep 3; done
