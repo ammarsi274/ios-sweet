@@ -13,6 +13,7 @@
 #include "ufs.h"
 #include "emmc.h"
 #include "drg_rpm.h"
+#include "drg_ts.h"
 
 #define RESTART_BOOTLOADER	0x77665500U
 
@@ -658,6 +659,9 @@ static void drg_ldo_probe(void)
 		(void)drg_spmi_read(apid, 0x08, &st);
 	}
 	con_hex2("RPM L6", "rc=", (uint32_t)rc, "en/st=", (uint32_t)en << 8 | st);
+	/* Only with both touch supplies on: clock, pins, reset, one I2C read. */
+	if (en == 0x80 && (st & 0x80))
+		con_hex2("TS2", "rc=", (uint32_t)drg_ts_probe(), "", 0);
 }
 
 static void __attribute__((noreturn)) drg_gold_main(void)
