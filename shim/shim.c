@@ -562,6 +562,49 @@ static void __attribute__((unused)) drg_keys_watch(void)   /* boots #21, #22 */
  * 0x21. For each LDO found: EN_CTL 0x46 (bit 7 enable) and STATUS1 0x08
  * (bit 7 VREG_READY). Prints "LDO sid/periph" and en << 8 | status.
  */
+/*
+ * Switch on the touch analog supply pm660l_l6 (SID 3 peripheral 0x45), off
+ * as ABL leaves it (boot #26: EN_CTL 0x00, voltage set to 3312 mV), the
+ * user's go-ahead given for exactly this. Only if the arbiter's ownership
+ * table gives the channel to EE 0 (the application cores):
+ *   owner = cnfg 0x800a000 + 0x700 + 4 * apid, bits 2:0
+ *   write = chnls 0x8400000 + 0x8000 * apid: WDATA0 +0x10, CMD +0, STATUS +8
+ *   CMD = EXT_WRITEL (0) << 27 | (addr & 0xff) << 4 | (bytes - 1)
+ * (drivers/spmi/spmi-pmic-arb.c, v3: the hardware enforces ownership and
+ * answers a refused write with STATUS bit 2.) One byte: EN_CTL 0x46 = 0x80.
+ */
+#define DRG_SPMI_CNFG		0x0800a000UL
+#define DRG_SPMI_CHNLS		0x08400000UL
+
+static void drg_l6_enable(void)
+{
+	unsigned int apid = drg_spmi_apid(0x345);
+	if (apid == 0xffff) {
+		con_str("L6", "not mapped: nothing written");
+		return;
+	}
+	uint32_t owner = rd32(DRG_SPMI_CNFG + 0x700 + 4 * apid) & 7;
+	con_hex2("L6 OWNER", "apid=", apid, "owner-ee=", owner);
+	if (owner != 0) {
+		con_str("L6", "owned by another EE: nothing written");
+		return;
+	}
+	uintptr_t ch = DRG_SPMI_CHNLS + 0x8000UL * apid;
+	wr32(ch + 0x10, 0x80);
+	wr32(ch + 0x0, (0u << 27) | (0x46u << 4) | 0);
+	uint32_t st = 0;
+	for (int i = 0; i < 100000; i++) {
+		st = rd32(ch + 0x8);
+		if (st & 1)
+			break;
+	}
+	delay_ms(10);
+	uint8_t en = 0xee, ready = 0xee;
+	(void)drg_spmi_read(apid, 0x46, &en);
+	(void)drg_spmi_read(apid, 0x08, &ready);
+	con_hex2("L6 WRITE", "status=", st, "en/st=", (uint32_t)en << 8 | ready);
+}
+
 static void drg_ldo_probe(void)
 {
 	/*
@@ -603,6 +646,7 @@ static void drg_ldo_probe(void)
 		    (uint32_t)type << 24 | (uint32_t)sub << 16 | (uint32_t)en << 8 | st,
 		    "v40/41=", (uint32_t)v0 << 8 | v1);
 	}
+	drg_l6_enable();
 }
 
 static void __attribute__((noreturn)) drg_gold_main(void)
