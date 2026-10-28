@@ -45,11 +45,13 @@ EXTENSIONS = {
 # /var/mobile/Library/Preferences/<domain>.plist (mobile, 0600)
 PREFS = {
     'com.apple.Accessibility': {
-        # Reduce Motion and Reduce Transparency: no blur or motion passes for
-        # CoreAnimation to draw on the CPU (no GPU for iOS on the SDM636).
+        # Reduce Motion: no motion passes for CoreAnimation to draw on the CPU
+        # (no GPU for iOS on the SDM636). Reduce Transparency was on in r8/r9;
+        # boot #30 showed it turns every blurred material into a flat grey
+        # box, so r10 turns it off to see iOS's own blur at this CPU speed.
         # Keys as read by iOS 16.7 (CoreServices, libAccessibility).
         'ReduceMotionEnabled': 1,
-        'EnhancedBackgroundContrastEnabled': 1,
+        'EnhancedBackgroundContrastEnabled': 0,
     },
 }
 
