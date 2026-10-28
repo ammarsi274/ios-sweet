@@ -457,6 +457,75 @@ static void drg_osm_probe(void)
 	}
 }
 
+/*
+ * Nokia buttons, read-only, watched for 15 s so they can be pressed (boot #21).
+ * From this phone's device tree: PM660 (SPMI SID 0) qcom,power-on@800 with
+ * kpdpwr = power (code 0x74) and resin = volume up (code 0x73, pon_2);
+ * gpio-keys vol_down = TLMM GPIO 7, active low. SPMI arbiter @800f000:
+ * core 0x800f000, obsrvr 0x9400000. Layout from HMD's DRG kernel
+ * (drivers/spmi/spmi-pmic-arb.c v2/v3, drivers/pinctrl/qcom/pinctrl-sdm660.c):
+ * APID map at core + 0x800 + 4n (PPID in bits 19:8); observer channel of
+ * EE 0 at obsrvr + 0x8000 * apid with CMD +0, STATUS +8 (bit 0 done),
+ * RDATA0 +0x18; command = opcode << 27 | (addr & 0xff) << 4 | (bytes - 1),
+ * EXT_READL = 1. PON RT_STS is 0x810 (bit 0 kpdpwr, bit 1 resin).
+ * GPIO n: tile + 0x1000 * n, input bit 0 of io_reg (+4); GPIO 7 is SOUTH.
+ */
+#define DRG_SPMI_CORE		0x0800f000UL
+#define DRG_SPMI_OBS		0x09400000UL
+#define DRG_PON_PPID		0x008		/* SID 0, peripheral 0x08 */
+#define DRG_PON_RT_STS		0x10
+#define DRG_VOLDN_IO		(0x03000000UL + 0x00100000UL + 0x1000UL * 7 + 4)
+
+static int drg_spmi_read(unsigned int apid, uint8_t addr, uint8_t *val)
+{
+	uintptr_t ch = DRG_SPMI_OBS + 0x8000UL * apid;
+	wr32(ch + 0x0, (1u << 27) | ((uint32_t)addr << 4));
+	for (int i = 0; i < 100000; i++) {
+		uint32_t st = rd32(ch + 0x8);
+		if (st & 1) {
+			if (st & 0xe)
+				return -(int)st;
+			*val = (uint8_t)rd32(ch + 0x18);
+			return 0;
+		}
+	}
+	return -1;
+}
+
+static void drg_keys_watch(void)
+{
+	unsigned int apid = 0xffff;
+	for (unsigned int n = 0; n < 512; n++) {
+		if (((rd32(DRG_SPMI_CORE + 0x800 + 4 * n) >> 8) & 0xfff) == DRG_PON_PPID) {
+			apid = n;
+			break;
+		}
+	}
+	con_hex2("SPMI", "ver=", rd32(DRG_SPMI_CORE), "pon-apid=", apid);
+	if (apid == 0xffff)
+		return;
+	con_str("KEYS", "press power / vol+ / vol- now (15 s)");
+	uint8_t pon = 0, last_pon = 0xff;
+	uint32_t vd, last_vd = 0xffffffff;
+	uint64_t frq, t0, t;
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frq));
+	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t0));
+	do {
+		int rc = drg_spmi_read(apid, DRG_PON_RT_STS, &pon);
+		vd = rd32(DRG_VOLDN_IO) & 1;
+		if (rc || pon != last_pon || vd != last_vd) {
+			/* pon bit0 = power, bit1 = vol+; vd 0 = vol- pressed */
+			con_hex2("KEY", "pon=", rc ? (uint32_t)rc : pon, "voldn_in=", vd);
+			last_pon = pon;
+			last_vd = vd;
+			if (rc)
+				return;
+		}
+		delay_ms(20);
+		__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t));
+	} while (t - t0 < 15 * frq);
+}
+
 static void __attribute__((noreturn)) drg_gold_main(void)
 {
 	stage = "gold";
@@ -468,6 +537,8 @@ static void __attribute__((noreturn)) drg_gold_main(void)
 
 	stage = "gold osm";
 	drg_osm_probe();
+	stage = "gold keys";
+	drg_keys_watch();
 
 	/* A NOKIAXNU payload in the ramdisk: boot XNU from here (returns only on error). */
 	stage = "gold loader";
