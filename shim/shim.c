@@ -461,20 +461,31 @@ static void drg_osm_probe(void)
  * Nokia buttons, read-only, watched for 15 s so they can be pressed (boot #21).
  * From this phone's device tree: PM660 (SPMI SID 0) qcom,power-on@800 with
  * kpdpwr = power (code 0x74) and resin = volume up (code 0x73, pon_2);
- * gpio-keys vol_down = TLMM GPIO 7, active low. SPMI arbiter @800f000:
+ * gpio-keys vol_down = GPIO 7 of the PM660L (SID 2, qcom,qpnp-pin gpio@c600,
+ * active low; boot #21 showed TLMM GPIO 7 is not it). SPMI arbiter @800f000:
  * core 0x800f000, obsrvr 0x9400000. Layout from HMD's DRG kernel
  * (drivers/spmi/spmi-pmic-arb.c v2/v3, drivers/pinctrl/qcom/pinctrl-sdm660.c):
  * APID map at core + 0x800 + 4n (PPID in bits 19:8); observer channel of
  * EE 0 at obsrvr + 0x8000 * apid with CMD +0, STATUS +8 (bit 0 done),
  * RDATA0 +0x18; command = opcode << 27 | (addr & 0xff) << 4 | (bytes - 1),
  * EXT_READL = 1. PON RT_STS is 0x810 (bit 0 kpdpwr, bit 1 resin).
- * GPIO n: tile + 0x1000 * n, input bit 0 of io_reg (+4); GPIO 7 is SOUTH.
+ * PMIC GPIO input level: RT_STS 0x10 bit 0 (drivers/pinctrl/qcom/pinctrl-spmi-gpio.c).
+ *
+ * Touch (Goodix gt9xx @5d on i2c@c178000 = BLSP1 QUP4, irq TLMM GPIO 67, reset
+ * GPIO 66, both NORTH tile): read-only look at what ABL leaves. GCC @100000
+ * (drivers/clk/qcom/gcc-sdm660.c): blsp1_ahb_clk halt 0x17004, blsp1_qup4_i2c
+ * _apps_clk 0x1f008, bit 31 = CLK_OFF. TLMM pin n: tile + 0x1000 * n (ctl),
+ * +4 (io). The QUP itself is read only when both clocks are on.
  */
 #define DRG_SPMI_CORE		0x0800f000UL
 #define DRG_SPMI_OBS		0x09400000UL
 #define DRG_PON_PPID		0x008		/* SID 0, peripheral 0x08 */
 #define DRG_PON_RT_STS		0x10
-#define DRG_VOLDN_IO		(0x03000000UL + 0x00100000UL + 0x1000UL * 7 + 4)
+#define DRG_VOLDN_PPID		0x2c6		/* SID 2, peripheral 0xc6 */
+#define DRG_GPIO_RT_STS		0x10
+#define DRG_GCC			0x00100000UL
+#define DRG_TLMM_NORTH		(0x03000000UL + 0x00900000UL)
+#define DRG_QUP4		0x0c178000UL
 
 static int drg_spmi_read(unsigned int apid, uint8_t addr, uint8_t *val)
 {
@@ -492,17 +503,33 @@ static int drg_spmi_read(unsigned int apid, uint8_t addr, uint8_t *val)
 	return -1;
 }
 
+static unsigned int drg_spmi_apid(uint32_t ppid)
+{
+	for (unsigned int n = 0; n < 512; n++)
+		if (((rd32(DRG_SPMI_CORE + 0x800 + 4 * n) >> 8) & 0xfff) == ppid)
+			return n;
+	return 0xffff;
+}
+
+static void drg_touch_probe(void)
+{
+	uint32_t ahb = rd32(DRG_GCC + 0x17004), qup = rd32(DRG_GCC + 0x1f008);
+	con_hex2("TS CLK", "ahb=", ahb, "qup4=", qup);
+	con_hex2("TS RST", "ctl=", rd32(DRG_TLMM_NORTH + 0x1000UL * 66), "io=", rd32(DRG_TLMM_NORTH + 0x1000UL * 66 + 4));
+	con_hex2("TS IRQ", "ctl=", rd32(DRG_TLMM_NORTH + 0x1000UL * 67), "io=", rd32(DRG_TLMM_NORTH + 0x1000UL * 67 + 4));
+	if (!(ahb & 0x80000000u) && !(qup & 0x80000000u))
+		con_hex2("TS QUP", "cfg=", rd32(DRG_QUP4 + 0x0), "state=", rd32(DRG_QUP4 + 0x4));
+	else
+		con_str("TS QUP", "clocks off: QUP not read");
+}
+
 static void drg_keys_watch(void)
 {
-	unsigned int apid = 0xffff;
-	for (unsigned int n = 0; n < 512; n++) {
-		if (((rd32(DRG_SPMI_CORE + 0x800 + 4 * n) >> 8) & 0xfff) == DRG_PON_PPID) {
-			apid = n;
-			break;
-		}
-	}
+	unsigned int apid = drg_spmi_apid(DRG_PON_PPID);
+	unsigned int vapid = drg_spmi_apid(DRG_VOLDN_PPID);
 	con_hex2("SPMI", "ver=", rd32(DRG_SPMI_CORE), "pon-apid=", apid);
-	if (apid == 0xffff)
+	con_hex2("SPMI", "voldn-apid=", vapid, "", 0);
+	if (apid == 0xffff || vapid == 0xffff)
 		return;
 	con_str("KEYS", "press power / vol+ / vol- now (15 s)");
 	uint8_t pon = 0, last_pon = 0xff;
@@ -511,8 +538,11 @@ static void drg_keys_watch(void)
 	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frq));
 	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t0));
 	do {
+		uint8_t g = 0;
 		int rc = drg_spmi_read(apid, DRG_PON_RT_STS, &pon);
-		vd = rd32(DRG_VOLDN_IO) & 1;
+		if (!rc)
+			rc = drg_spmi_read(vapid, DRG_GPIO_RT_STS, &g);
+		vd = g & 1;
 		if (rc || pon != last_pon || vd != last_vd) {
 			/* pon bit0 = power, bit1 = vol+; vd 0 = vol- pressed */
 			con_hex2("KEY", "pon=", rc ? (uint32_t)rc : pon, "voldn_in=", vd);
@@ -537,6 +567,8 @@ static void __attribute__((noreturn)) drg_gold_main(void)
 
 	stage = "gold osm";
 	drg_osm_probe();
+	stage = "gold touch";
+	drg_touch_probe();
 	stage = "gold keys";
 	drg_keys_watch();
 
