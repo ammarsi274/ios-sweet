@@ -565,41 +565,43 @@ static void __attribute__((unused)) drg_keys_watch(void)   /* boots #21, #22 */
 static void drg_ldo_probe(void)
 {
 	/*
-	 * Boot #24 printed no LDO at all and did not say why. Now three bitmasks
-	 * per PMIC over peripherals 0x40-0x5f (bit n = peripheral 0x40 + n):
-	 * mapped in the arbiter's channel table, read answered, TYPE == 0x21.
-	 * Then the TYPE/SUBTYPE/EN_CTL/STATUS1 of 0x40 and 0x4a as raw samples.
+	 * PM660 (SID 1) and PM660L (SID 3) regulators are TYPE 0x04 (LDO,
+	 * drivers/regulator/qpnp-regulator.c), LDO n at peripheral 0x3f + n
+	 * (boot #25). Per PMIC over 0x40-0x5f: bitmasks of enabled (EN_CTL 0x46
+	 * bit 7) and ready (STATUS1 0x08 bit 7). Then the touch supplies raw:
+	 * pm660_l11 = SID 1 0x4a, pm660l_l6 = SID 3 0x45: TYPE/SUBTYPE/EN/STATUS
+	 * and the voltage registers 0x40/0x41.
 	 */
 	static const uint8_t sids[2] = { 1, 3 };
 	for (unsigned int i = 0; i < 2; i++) {
-		uint32_t mapped = 0, answered = 0, ldo = 0;
+		uint32_t on = 0, ready = 0;
 		for (unsigned int per = 0x40; per <= 0x5f; per++) {
 			unsigned int apid = drg_spmi_apid(((uint32_t)sids[i] << 8) | per);
-			uint8_t type = 0;
-			if (apid == 0xffff)
+			uint8_t type = 0, en = 0, st = 0;
+			if (apid == 0xffff || drg_spmi_read(apid, 0x04, &type) || type != 0x04)
 				continue;
-			mapped |= 1u << (per - 0x40);
-			if (drg_spmi_read(apid, 0x04, &type))
-				continue;
-			answered |= 1u << (per - 0x40);
-			if (type == 0x21)
-				ldo |= 1u << (per - 0x40);
+			if (!drg_spmi_read(apid, 0x46, &en) && (en & 0x80))
+				on |= 1u << (per - 0x40);
+			if (!drg_spmi_read(apid, 0x08, &st) && (st & 0x80))
+				ready |= 1u << (per - 0x40);
 		}
-		con_hex2(i ? "PMIC 3" : "PMIC 1", "mapped=", mapped, "answered=", answered);
-		con_hex2(i ? "PMIC 3" : "PMIC 1", "type21=", ldo, "", 0);
-		for (unsigned int k = 0; k < 2; k++) {
-			unsigned int per = k ? 0x4a : 0x40;
-			unsigned int apid = drg_spmi_apid(((uint32_t)sids[i] << 8) | per);
-			uint8_t type = 0xee, sub = 0xee, en = 0xee, st = 0xee;
-			if (apid != 0xffff) {
-				(void)drg_spmi_read(apid, 0x04, &type);
-				(void)drg_spmi_read(apid, 0x05, &sub);
-				(void)drg_spmi_read(apid, 0x46, &en);
-				(void)drg_spmi_read(apid, 0x08, &st);
-			}
-			con_hex2("PER", "sid/per=", ((uint32_t)sids[i] << 8) | per,
-			    "t/s/en/st=", (uint32_t)type << 24 | (uint32_t)sub << 16 | (uint32_t)en << 8 | st);
+		con_hex2(i ? "LDO PM660L" : "LDO PM660", "on=", on, "ready=", ready);
+	}
+	static const uint32_t ts[2] = { 0x14a, 0x345 };     /* l11 vcc_i2c, l6 vdd_ana */
+	for (unsigned int k = 0; k < 2; k++) {
+		unsigned int apid = drg_spmi_apid(ts[k]);
+		uint8_t type = 0xee, sub = 0xee, en = 0xee, st = 0xee, v0 = 0xee, v1 = 0xee;
+		if (apid != 0xffff) {
+			(void)drg_spmi_read(apid, 0x04, &type);
+			(void)drg_spmi_read(apid, 0x05, &sub);
+			(void)drg_spmi_read(apid, 0x46, &en);
+			(void)drg_spmi_read(apid, 0x08, &st);
+			(void)drg_spmi_read(apid, 0x40, &v0);
+			(void)drg_spmi_read(apid, 0x41, &v1);
 		}
+		con_hex2(k ? "TS L6" : "TS L11", "t/s/en/st=",
+		    (uint32_t)type << 24 | (uint32_t)sub << 16 | (uint32_t)en << 8 | st,
+		    "v40/41=", (uint32_t)v0 << 8 | v1);
 	}
 }
 
