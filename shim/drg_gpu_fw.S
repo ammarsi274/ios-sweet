@@ -17,3 +17,20 @@ drg_pfp_fw:
 	.incbin	"a530_pfp.fw", 4
 drg_pfp_fw_end:
 	.balign	4096
+
+/*
+ * Nokia's zap shader (a512_zap, PAS id 0xd): the .mdt (ELF header, program
+ * headers and hash segment, handed to TZ as metadata) and the one loadable
+ * segment, .b02. Laid out and loaded by drg_gpu.c as HMD's PIL does.
+ */
+	.balign	8
+	.global	drg_zap_mdt, drg_zap_mdt_end
+drg_zap_mdt:
+	.incbin	"a512_zap.mdt"
+drg_zap_mdt_end:
+	.balign	8
+	.global	drg_zap_b02, drg_zap_b02_end
+drg_zap_b02:
+	.incbin	"a512_zap.b02"
+drg_zap_b02_end:
+	.balign	8

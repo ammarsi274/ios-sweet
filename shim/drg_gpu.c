@@ -88,12 +88,14 @@
 #define A5XX_RBBM_STATUS	0x4f5
 #define A5XX_RBBM_STATUS3	0x530
 #define A5XX_VBIF_VERSION	0x3000
+#define A5XX_RBBM_SECVID_TRUST_CNTL	0xf400
 
 /* adreno_pm4types.h (HMD) */
 #define CP_TYPE7_PKT		(7U << 28)
 #define CP_NOP			0x10
 #define CP_MEM_WRITE		0x3d
 #define CP_ME_INIT		0x48
+#define CP_SET_SECURE_MODE	0x66
 /* a5xx_rb_start(): A5XX_CP_RB_CNTL_DEFAULT, measured 0x20c */
 #define A5XX_CP_RB_CNTL_DEFAULT	0x20c
 #define RB_DWORDS		8192	/* 2 * 2^(0x20c & 0x3f) */
@@ -435,6 +437,9 @@ static int rb_submit(uint32_t wptr, unsigned timeout_us)
 	return poll(GPU_REG(A5XX_CP_RB_RPTR), 0xffffffff, wptr, timeout_us);
 }
 
+static int pr(const char *name, uintptr_t a, uint32_t *v);
+static int zap_load(void);
+
 static void g2b_cp(void)
 {
 	step("G2b 2 a5xx start sequence");
@@ -474,14 +479,7 @@ static void g2b_cp(void)
 	ring[w++] = 0;
 	ring[w++] = 0;
 	unsigned me_init_end = w;		/* 9, the kernel's first WPTR */
-	ring[w++] = pkt7(CP_MEM_WRITE, 3);
-	ring[w++] = (uint32_t)sc;
-	ring[w++] = 0;
-	ring[w++] = 0xc0ffee01;
-	ring[w++] = pkt7(CP_NOP, 0);
-	unsigned test_end = w;
 	lv("me_init header", ring[0]);
-	lv("mem_write header", ring[me_init_end]);
 	__asm__ volatile("dsb sy" ::: "memory");
 	wr(GPU_REG(A5XX_CP_RB_RPTR_ADDR_LO), (uint32_t)sh);
 	wr(GPU_REG(A5XX_CP_RB_RPTR_ADDR_HI), 0);
@@ -493,6 +491,23 @@ static void g2b_cp(void)
 	wr(GPU_REG(A5XX_CP_PFP_INSTR_BASE_LO), (uint32_t)pfp);
 	wr(GPU_REG(A5XX_CP_PFP_INSTR_BASE_HI), 0);
 	cp_state("before start");
+
+	/* kernel order: zap through TZ after the INSTR_BASE writes, before ME_CNTL */
+	int zap = zap_load();
+	unsigned secure_end = me_init_end;
+	if (zap == 0) {
+		ring[w++] = pkt7(CP_SET_SECURE_MODE, 1);	/* cp_secure_mode(), a5xx */
+		ring[w++] = 0;
+		secure_end = w;				/* 0xb, the kernel's second WPTR */
+	}
+	ring[w++] = pkt7(CP_MEM_WRITE, 3);
+	ring[w++] = (uint32_t)sc;
+	ring[w++] = 0;
+	ring[w++] = 0xc0ffee01;
+	ring[w++] = pkt7(CP_NOP, 0);
+	unsigned test_end = w;
+	lv("mem_write header", ring[secure_end]);
+	__asm__ volatile("dsb sy" ::: "memory");
 
 	step("G2b 4 cp start + me_init");
 	wr(GPU_REG(A5XX_CP_ME_CNTL), 0);	/* clear the ME/PFP halt */
@@ -508,6 +523,22 @@ static void g2b_cp(void)
 		return;
 	}
 
+	int unsecure = 0;
+	if (zap == 0) {
+		step("G2c 2 leave secure mode");
+		us = rb_submit(secure_end, 2000000);	/* kernel: 2000 ms spin */
+		lv("set_secure_mode rptr us", (uint32_t)us);
+		/* adreno_spin_idle: RBBM_STATUS & busy_mask (a512 0xfffffffe) == 0 */
+		int ius = us < 0 ? -1 : poll(GPU_REG(A5XX_RBBM_STATUS), 0xfffffffe, 0, 2000000);
+		lv("idle us", (uint32_t)ius);
+		cp_state("after set_secure_mode 0");
+		uint32_t t = 0xffffffff;
+		int trc = pr("rbbm secvid trust cntl", GPU_REG(A5XX_RBBM_SECVID_TRUST_CNTL), &t);
+		unsecure = us >= 0 && ius >= 0 && trc == 0 && t == 0;
+		put(unsecure ? "G2c: GPU out of secure mode\n" : "G2c: secure mode exit NOT confirmed\n");
+		flush();
+	}
+
 	step("G2b 5 cp mem_write");
 	us = rb_submit(test_end, 2000000);
 	lv("mem_write rptr us", (uint32_t)us);
@@ -518,6 +549,10 @@ static void g2b_cp(void)
 	if (mus >= 0) {
 		put("G2b RESULT: PASS (CP runs Nokia microcode, ME_INIT done, GPU wrote memory)\n");
 		con_str("G2b", "PASS");
+		put(zap ? "G2c RESULT: FAIL (zap shader not loaded)\n"
+			: unsecure ? "G2c RESULT: PASS (zap loaded by TZ, GPU out of secure mode, GPU wrote memory after)\n"
+				   : "G2c RESULT: PARTIAL (zap loaded, secure mode exit not confirmed)\n");
+		con_str("G2c", zap ? "FAIL" : unsecure ? "PASS" : "PARTIAL");
 	} else {
 		put(us >= 0 ? "G2b RESULT: PARTIAL (CP runs, GPU memory write not seen)\n"
 			    : "G2b RESULT: FAIL (CP stopped after ME_INIT)\n");
@@ -851,12 +886,237 @@ static int g2b_smmu_attach(void)
 	return bad ? -1 : 0;
 }
 
+/*
+ * ---- G2c: zap shader ----
+ * HMD's kernel loads Nokia's a512_zap through TZ between the microcode base
+ * writes and the CP start (adreno_a5xx.c a5xx_microcode_load, measured in
+ * the ftrace as PAS 0x42000201/0x202/0x205 for pas 0xd), and then leaves the
+ * GPU's secure mode with CP_SET_SECURE_MODE 0 (a5xx_switch_to_unsecure_mode).
+ * The load follows HMD's PIL (peripheral-loader.c pil_boot, subsys-pil-tz.c):
+ *   - region: loadable segments (PT_LOAD, not hash, memsz) -> lowest
+ *     relocatable start .. highest end rounded to 4 KiB; the region itself
+ *     is 1 MiB aligned (pil_alloc_region, p_align <= 4 MiB);
+ *   - PAS_INIT_IMAGE(pas, metadata = the whole .mdt, physically contiguous)
+ *   - PAS_MEM_SETUP(pas, region start, region size)
+ *   - copy each segment's .bNN, zero to memsz
+ *   - PAS_AUTH_AND_RESET(pas)
+ * qcom,kgsl-hyp has no mem-protect-id (no hyp assign), no clocks or supplies.
+ * Not done: the scm_pas bus vote around INIT_IMAGE and AUTH_AND_RESET (its
+ * RPM values are not measured). Each SMC runs on a spare core, so a TZ call
+ * that does not return costs that core only.
+ * SMC as HMD's scm.c __scm_call_armv8_64: x0 = function, x1 = arginfo,
+ * x2.. = args, x6 = 0; re-entered with its own results while it returns
+ * SCM_INTERRUPTED; SCM_V2_EBUSY retried after 30 ms, up to 67 times.
+ */
+#define SCM_SIP_PIL(cmd)	(0x42000200u | (cmd))	/* SMC64 SIP, SCM_SVC_PIL; as the trace */
+#define PAS_INIT_IMAGE		1
+#define PAS_MEM_SETUP		2
+#define PAS_AUTH_AND_RESET	5
+#define PAS_ID_GPU		0xd	/* qcom,kgsl-hyp qcom,pas-id */
+#define SCM_INTERRUPTED		1
+#define SCM_V2_EBUSY		(-12)
+
+extern const uint8_t drg_zap_mdt[], drg_zap_mdt_end[], drg_zap_b02[], drg_zap_b02_end[];
+
+static uint8_t zap_mdata[8192] __attribute__((aligned(4096)));
+static uint8_t zap_pool[0x100000 + 0x4000] __attribute__((aligned(4096)));
+
+static volatile uint64_t scm_x[7];
+static volatile uint32_t scm_rounds;
+
+/* runs on a spare core */
+static void scm_fn(void)
+{
+	register uint64_t r0 __asm__("x0") = scm_x[0];
+	register uint64_t r1 __asm__("x1") = scm_x[1];
+	register uint64_t r2 __asm__("x2") = scm_x[2];
+	register uint64_t r3 __asm__("x3") = scm_x[3];
+	register uint64_t r4 __asm__("x4") = scm_x[4];
+	register uint64_t r5 __asm__("x5") = scm_x[5];
+	register uint64_t r6 __asm__("x6") = 0;
+	uint32_t n = 0;
+
+	do {
+		__asm__ volatile("smc #0"
+				 : "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3), "+r"(r4), "+r"(r5), "+r"(r6)
+				 :
+				 : "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17",
+				   "memory");
+		scm_rounds = ++n;
+	} while (r0 == SCM_INTERRUPTED && n < 100000);
+	scm_x[0] = r0, scm_x[1] = r1, scm_x[2] = r2, scm_x[3] = r3;
+}
+
+/* one SCM call; returns x0 (0 = ok) and *res = x1 (the TZ result), or -100 if the core did not return */
+static int scm(const char *name, uint32_t cmd, uint64_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2,
+	       uint64_t *res)
+{
+	for (unsigned tries = 0;; tries++) {
+		scm_x[0] = SCM_SIP_PIL(cmd), scm_x[1] = arginfo;
+		scm_x[2] = a0, scm_x[3] = a1, scm_x[4] = a2, scm_x[5] = 0;
+		scm_rounds = 0;
+		put("scm ");
+		put(name);
+		put(" fn ");
+		puthex(SCM_SIP_PIL(cmd));
+		put(": ");
+		if (!probe_left) {
+			put("no spare core left\n");
+			flush();
+			return -100;
+		}
+		int core = next_core();
+		uint64_t esr = 0;
+		uint64_t t0 = ticks();
+		int rc = drg_probe_call(core, scm_fn, &esr, 2000000);
+		uint32_t us = (uint32_t)((ticks() - t0) * 1000000 / freq());
+		if (rc) {
+			probe_result(rc, core, esr);
+			put(" rounds ");
+			puthex(scm_rounds);
+			put("\n");
+			flush();
+			return -100;
+		}
+		put("x0 ");
+		puthex((uint32_t)scm_x[0]);
+		put(" x1 ");
+		puthex((uint32_t)scm_x[1]);
+		put(" x2 ");
+		puthex((uint32_t)scm_x[2]);
+		put(" x3 ");
+		puthex((uint32_t)scm_x[3]);
+		put(" rounds ");
+		puthex(scm_rounds);
+		put(" us ");
+		puthex(us);
+		put("\n");
+		flush();
+		if ((int64_t)scm_x[0] == SCM_V2_EBUSY && tries < 67) {
+			udelay(30000);
+			continue;
+		}
+		*res = scm_x[1];
+		return (int)(int64_t)scm_x[0];
+	}
+}
+
+static uint32_t le32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
+static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
+
+/* 0 when TZ accepted and started the zap shader */
+static int zap_load(void)
+{
+	const uint8_t *m = drg_zap_mdt;
+	uint32_t msz = (uint32_t)(drg_zap_mdt_end - drg_zap_mdt);
+	uint32_t bsz = (uint32_t)(drg_zap_b02_end - drg_zap_b02);
+	uint64_t res = 0;
+
+	step("G2c 1 zap shader load (a512_zap, pas 0xd)");
+	lv("mdt bytes", msz);
+	lv("b02 bytes", bsz);
+	if (msz < 0x34 || le32(m) != 0x464c457f || m[4] != 1) {
+		put("zap: mdt is not ELF32: stop\n");
+		return -1;
+	}
+	uint32_t phoff = le32(m + 0x1c), entry = le32(m + 0x18);
+	unsigned phent = le16(m + 0x2a), phnum = le16(m + 0x2c);
+	if (phent != 32 || phoff + phnum * 32u > msz) {
+		put("zap: program headers not within mdt: stop\n");
+		return -1;
+	}
+	uint32_t min_r = 0xffffffff, max_r = 0, align = 0, seg_pa = 0, seg_f = 0, seg_m = 0;
+	int nload = 0, seg_num = -1, nonreloc = 0;
+	for (unsigned i = 0; i < phnum; i++) {
+		const uint8_t *ph = m + phoff + 32 * i;
+		uint32_t type = le32(ph), pa = le32(ph + 12), fsz = le32(ph + 16), mem = le32(ph + 20);
+		uint32_t flags = le32(ph + 24), al = le32(ph + 28);
+		put("phdr ");
+		puthex(i);
+		put(" type ");
+		puthex(type);
+		put(" pa ");
+		puthex(pa);
+		put(" filesz ");
+		puthex(fsz);
+		put(" memsz ");
+		puthex(mem);
+		put(" flags ");
+		puthex(flags);
+		put(" align ");
+		puthex(al);
+		put("\n");
+		if (!(type == 1 && ((flags >> 24) & 7) != 2 && mem))	/* segment_is_loadable */
+			continue;
+		nload++;
+		seg_num = (int)i, seg_pa = pa, seg_f = fsz, seg_m = mem;
+		if (!(flags & (1u << 27))) {	/* segment_is_relocatable */
+			nonreloc++;
+			continue;
+		}
+		if (pa < min_r)
+			min_r = pa, align = al;
+		if (pa + mem > max_r)
+			max_r = pa + mem;
+	}
+	max_r = (max_r + 0xfff) & ~0xfffu;
+	/* what is embedded: exactly one relocatable loadable segment, number 2 (.b02) */
+	if (nload != 1 || nonreloc || seg_num != 2 || seg_f != bsz || seg_m < seg_f || align > 0x400000) {
+		put("zap: segment layout is not the embedded one (.b02): stop\n");
+		flush();
+		return -1;
+	}
+	uint32_t size = max_r - min_r;
+	uintptr_t region = ((uintptr_t)zap_pool + 0xfffff) & ~(uintptr_t)0xfffff;	/* 1 MiB */
+	if (region + size > (uintptr_t)zap_pool + sizeof(zap_pool) || msz > sizeof(zap_mdata) ||
+	    (region >> 32)) {
+		put("zap: buffers do not fit: stop\n");
+		flush();
+		return -1;
+	}
+	for (uint32_t i = 0; i < msz; i++)
+		zap_mdata[i] = m[i];
+	lv("metadata pa", (uint32_t)(uintptr_t)zap_mdata);
+	lv("region pa", (uint32_t)region);
+	lv("region size", size);
+	lv("entry (relocated)", entry - min_r + (uint32_t)region);
+	__asm__ volatile("dsb sy" ::: "memory");
+	flush();
+
+	int rc = scm("init_image", PAS_INIT_IMAGE, 0x82, PAS_ID_GPU, (uintptr_t)zap_mdata, 0, &res);
+	if (rc || res) {
+		put("zap: PAS_INIT_IMAGE failed\n");
+		flush();
+		return -1;
+	}
+	rc = scm("mem_setup", PAS_MEM_SETUP, 0x3, PAS_ID_GPU, region, size, &res);
+	if (rc || res) {
+		put("zap: PAS_MEM_SETUP failed\n");
+		flush();
+		return -1;
+	}
+	volatile uint8_t *dst = (volatile uint8_t *)(region + (seg_pa - min_r));
+	for (uint32_t i = 0; i < seg_m; i++)
+		dst[i] = i < seg_f ? drg_zap_b02[i] : 0;
+	__asm__ volatile("dsb sy" ::: "memory");
+	lv("segment 2 at", (uint32_t)(uintptr_t)dst);
+	rc = scm("auth_and_reset", PAS_AUTH_AND_RESET, 0x1, PAS_ID_GPU, 0, 0, &res);
+	if (rc || res) {
+		put("zap: PAS_AUTH_AND_RESET failed\n");
+		flush();
+		return -1;
+	}
+	put("zap: loaded and started by TZ\n");
+	flush();
+	return 0;
+}
+
 void drg_gpu_bringup(void)
 {
 	con_skip();
 	int rc = drg_emmc_log_open();
 	con_hex2("GPU LOG", "rc=", (uint32_t)rc, "lba=", (uint32_t)drg_emmc_log_lba());
-	put("DRGGPULOG v8 G1+G2a+G2b SMMU attach (numbered) + CP test\n");
+	put("DRGGPULOG v9 G1+G2a+G2b+G2c SMMU, zap, CP\n");
 	lv("log open rc", (uint32_t)rc);
 	g1_snapshot("G1 as ABL left it");
 	if (g2a_power()) {

@@ -10,10 +10,12 @@ OBJCOPY=aarch64-linux-gnu-objcopy
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -DBOARD_DRG"
 OUT=out-drg
 mkdir -p $OUT
-# Nokia's CP microcode (vendor_b, kept out of git), checked against the hashes taken from the phone
+# Nokia's CP microcode and zap shader (vendor_b, kept out of git), checked
+# against the hashes taken from the phone: all four files must be listed and match
 FW=${DRG_GPU_FW:-../../research/vendor-adreno/files/firmware}
-(cd "$FW" && grep -E ' \./firmware/a530_(pm4|pfp)\.fw$' ../../SHA256SUMS | sed 's# \./firmware/# #' | sha256sum -c --quiet -) ||
-	{ echo "error: GPU microcode missing or changed in $FW" >&2; exit 1; }
+sums=$(grep -E ' \./firmware/(a530_(pm4|pfp)\.fw|a512_zap\.(mdt|b02))$' "$FW/../../SHA256SUMS" | sed 's# \./firmware/# #')
+[ "$(printf '%s\n' "$sums" | grep -c .)" = 4 ] && (cd "$FW" && printf '%s\n' "$sums" | sha256sum -c --quiet -) ||
+	{ echo "error: GPU firmware missing or changed in $FW" >&2; exit 1; }
 $CC $CFLAGS -I "$FW" -c drg_gpu_fw.S -o $OUT/drg_gpu_fw.o
 for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c emmc.c drg_rpm.c drg_ts.c drg_gpu.c; do
 	$CC $CFLAGS -c $f -o $OUT/${f%.*}.o
