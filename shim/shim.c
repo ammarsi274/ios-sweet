@@ -61,6 +61,7 @@ extern char secondary_entry[];
 
 static const char *stage;	/* set at runtime: no absolute pointers in data */
 static volatile uint64_t sec_mpidr[NR_CPUS];
+volatile uint32_t sec_entered[NR_CPUS];	/* start.S secondary_entry's first store */
 static volatile uint64_t sec_midr[NR_CPUS], sec_mmfr0[NR_CPUS], sec_isar0[NR_CPUS];
 static volatile uint64_t sec_probe[4];	/* CPU1 redistributor write test */
 static volatile uint32_t irq_count, irq_other, irq_last;
@@ -512,6 +513,17 @@ static void __attribute__((unused)) test_smp_drg(void)
 
 #define PSCI_AFFINITY_INFO	0xc4000004UL
 #define DRG_GOLD0		0x100UL
+
+/* PSCI AFFINITY_INFO of core idx (level 0): 0 on, 1 off, 2 on pending */
+int64_t drg_psci_affinity(int idx)
+{
+	return (int64_t)smc(PSCI_AFFINITY_INFO, drg_mpidr(idx), 0, 0);
+}
+
+uint32_t drg_sec_entered(int idx)
+{
+	return sec_entered[idx & 7];
+}
 
 /*
  * Runs on Gold 0x100 after the handoff. XNU will boot from here, so report

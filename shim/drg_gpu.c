@@ -1600,6 +1600,33 @@ static void g2e_levels(void)
 	flush();
 }
 
+/*
+ * Core power states (not GPU), read only. Measured (run s1-run1, 2026-10-30):
+ * after the handoff only Gold 0 is on, every Silver core and Gold 1-3 are off
+ * (AFFINITY_INFO 1). A CPU_ON of Silver 1 at that point is accepted (rc 0)
+ * but the core stays ON_PENDING (2) and never executes its first
+ * instruction (start.S marker), so the shim never powers Silver on: the
+ * cluster stays off, and it could not run XNU anyway (no 16 KB granule,
+ * MMFR0 TGran16 0, boot #3). XNU uses the four Gold cores.
+ */
+static void core_states(void)
+{
+	step("S1 core power states (psci affinity_info: 0 on, 1 off, 2 on pending)");
+	int silver_off = 1;
+	for (int i = 0; i < 8; i++) {
+		int64_t a = drg_psci_affinity(i);
+		put("core ");
+		puthex((uint32_t)i);
+		put(" aff ");
+		puthex((uint32_t)a);
+		put("\n");
+		if (i < 4 && a != 1)
+			silver_off = 0;
+	}
+	put(silver_off ? "silver cluster: all off\n" : "silver cluster: NOT all off\n");
+	flush();
+}
+
 void drg_gpu_bringup(void)
 {
 	con_skip();
@@ -1607,6 +1634,7 @@ void drg_gpu_bringup(void)
 	con_hex2("GPU LOG", "rc=", (uint32_t)rc, "lba=", (uint32_t)drg_emmc_log_lba());
 	put("DRGGPULOG v12 G1+G2a+G2b+G2c+G2d+G2e SMMU, zap, CP, all GPU levels\n");
 	lv("log open rc", (uint32_t)rc);
+	core_states();
 	g1_snapshot("G1 as ABL left it");
 	if (g2a_power()) {
 		put("G2a RESULT: FAIL (power-up step, see above)\n");

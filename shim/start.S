@@ -50,6 +50,13 @@ _start:
 	.globl secondary_entry
 secondary_entry:
 	msr	daifset, #0xf
+	/* first sign of life: sec_entered[x0] = 1 (x0 < 8), MMU off so this is RAM */
+	and	x2, x0, #7
+	adrp	x1, sec_entered
+	add	x1, x1, :lo12:sec_entered
+	mov	w3, #1
+	str	w3, [x1, x2, lsl #2]
+	dsb	sy
 	msr	spsel, #1
 	adrp	x1, _sec_stacks
 	add	x1, x1, :lo12:_sec_stacks

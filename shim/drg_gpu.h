@@ -5,6 +5,9 @@ void drg_gpu_bringup(void);
 /* shim.c: read one address on spare core idx; 0 ok, -1 read never completed,
  * -2 CPU_ON refused, -3 fault (esr), -4 core never started */
 int drg_probe_read(int idx, uintptr_t addr, uint32_t *val, uint64_t *esr, unsigned timeout_us);
+/* shim.c: PSCI AFFINITY_INFO of core idx (0 on, 1 off, 2 on pending); start.S entry marker */
+int64_t drg_psci_affinity(int idx);
+uint32_t drg_sec_entered(int idx);
 /* shim.c: one PMIC register (ppid = SID << 8 | peripheral), read only */
 int drg_pmic_read(uint32_t ppid, uint8_t addr, uint8_t *val);
 /* shim.c: run fn on spare core idx, same return codes */
