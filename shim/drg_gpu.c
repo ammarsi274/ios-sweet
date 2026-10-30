@@ -38,6 +38,7 @@
 #include "console.h"
 #include "emmc.h"
 #include "drg_gpu.h"
+#include "drg_rpm.h"
 
 #define GCC			0x100000UL
 #define GCC_GPU_CFG_AHB_CBCR	(GCC + 0x71004)
@@ -439,6 +440,8 @@ static int rb_submit(uint32_t wptr, unsigned timeout_us)
 
 static int pr(const char *name, uintptr_t a, uint32_t *v);
 static int zap_load(void);
+static unsigned ring_w;
+static int cp_ok;
 
 static void g2b_cp(void)
 {
@@ -526,6 +529,8 @@ static void g2b_cp(void)
 	int unsecure = 0;
 	if (zap == 0) {
 		step("G2c 2 leave secure mode");
+		uint32_t t0 = 0xffffffff;
+		int t0rc = pr("rbbm secvid trust cntl before", GPU_REG(A5XX_RBBM_SECVID_TRUST_CNTL), &t0);
 		us = rb_submit(secure_end, 2000000);	/* kernel: 2000 ms spin */
 		lv("set_secure_mode rptr us", (uint32_t)us);
 		/* adreno_spin_idle: RBBM_STATUS & busy_mask (a512 0xfffffffe) == 0 */
@@ -535,6 +540,7 @@ static void g2b_cp(void)
 		uint32_t t = 0xffffffff;
 		int trc = pr("rbbm secvid trust cntl", GPU_REG(A5XX_RBBM_SECVID_TRUST_CNTL), &t);
 		unsecure = us >= 0 && ius >= 0 && trc == 0 && t == 0;
+		lv("trust cntl changed", t0rc == 0 && trc == 0 && t0 != t);
 		put(unsecure ? "G2c: GPU out of secure mode\n" : "G2c: secure mode exit NOT confirmed\n");
 		flush();
 	}
@@ -546,6 +552,8 @@ static void g2b_cp(void)
 	lv("mem_write seen us", (uint32_t)mus);
 	lv("scratch[0]", scratch[0]);
 	cp_state("after mem_write");
+	ring_w = test_end;
+	cp_ok = mus >= 0;
 	if (mus >= 0) {
 		put("G2b RESULT: PASS (CP runs Nokia microcode, ME_INIT done, GPU wrote memory)\n");
 		con_str("G2b", "PASS");
@@ -1111,12 +1119,256 @@ static int zap_load(void)
 	return 0;
 }
 
+/*
+ * ---- G2d: GPU clock 19.2 MHz (XO) -> 266 MHz (PLL0 532 MHz / 2) ----
+ * Measured on this phone:
+ *   - ftrace (kgsl power-up): PLL0 L 0x1b, ALPHA 0x55555600, ALPHA_U 0xb5;
+ *     MODE 2 -> 6 -> (lock) -> 7; gfx3d RCG CFG 0x103 (source 1 = PLL0, div 2)
+ *     with UPDATE; MX (pm660l_s5_level, RPM rwmx) level 192 voted, CX
+ *     (pm660l_s3_level) >= 128 already met (no RPM message).
+ *   - TWRP, kgsl forced to 266 MHz (pwrlevel 2): PLL0 USER_CTL 0x01200001
+ *     (VCO 2 = 500-1000 MHz, ALPHA_EN, main out), USER_CTL_U 4, CONFIG_CTL
+ *     0x4001055b; PM660L S3 (CX) 764 mV, S5 (MX) 852 mV, the same as with
+ *     the GPU off (VOLTAGE_CTL 0x40/0x41, mV, SID 3 peripherals 0x1a/0x20).
+ * HMD sources: gpucc-sdm660.c (gpu_pll0_config, gfx3d ping-pong: from XO the
+ * first PLL is PLL0, CFG = source << 8 | (2 * div - 1)), clk-alpha-pll.c
+ * (clk_alpha_pll_configure, _enable: BYPASSNL, 5 us, RESET_N, LOCK_DET,
+ * OUTCTRL), clk-rcg2.c (update_config).
+ * Rails: the shim only votes a rail that reads below the measured level, so
+ * a vote can only raise it (an RPM vote replaces the APPS vote; a blind lower
+ * value could drop what ABL set for the display).
+ * GPU clock is measured, not assumed: RBBM perf counter 1, countable 0
+ * (every GPU cycle), against the 19.2 MHz CPU timer.
+ */
+#define PLL0_MODE		(GPUCC_PLL0 + 0x00)
+#define PLL0_L			(GPUCC_PLL0 + 0x04)
+#define PLL0_ALPHA		(GPUCC_PLL0 + 0x08)
+#define PLL0_ALPHA_U		(GPUCC_PLL0 + 0x0c)
+#define PLL0_USER_CTL		(GPUCC_PLL0 + 0x10)
+#define PLL0_USER_CTL_U		(GPUCC_PLL0 + 0x14)
+#define PLL0_CONFIG_CTL		(GPUCC_PLL0 + 0x18)
+#define PLL_OUTCTRL		(1U << 0)
+#define PLL_BYPASSNL		(1U << 1)
+#define PLL_RESET_N		(1U << 2)
+#define PLL_VOTE_FSM_ENA	(1U << 20)
+#define PLL_LOCK_DET		(1U << 31)
+#define PLL_VCO_MASK		(3U << 20)
+#define PLL_VCO_500_1000	(2U << 20)
+#define GFX3D_CFG_PLL0_DIV2	0x103
+#define A5XX_RBBM_PERFCTR_RBBM_1_LO	0x3b2
+#define A5XX_RBBM_PERFCTR_RBBM_1_HI	0x3b3
+#define A5XX_RBBM_PERFCTR_RBBM_SEL_1	0x46c
+#define PM660L_S3_CTRL		0x31a	/* SID 3, peripheral 0x1a (type 0x1c sub 0x0a) */
+#define PM660L_S5_CTRL		0x320
+#define CX_MV_AT_266		764	/* TWRP, GPU at 266 MHz */
+#define MX_MV_AT_266		852
+
+static uint64_t gpu_cycles(void)
+{
+	uint32_t hi, lo;
+	do {
+		hi = rd(GPU_REG(A5XX_RBBM_PERFCTR_RBBM_1_HI));
+		lo = rd(GPU_REG(A5XX_RBBM_PERFCTR_RBBM_1_LO));
+	} while (hi != rd(GPU_REG(A5XX_RBBM_PERFCTR_RBBM_1_HI)));
+	return (uint64_t)hi << 32 | lo;
+}
+
+/*
+ * Hardware clock gating, as HMD's a5xx_hwcg_set(): off = 0 to every HWCG
+ * register, RBBM_CLOCK_CNTL 0, ISDB_CNT 0x180; on = the values the kernel
+ * wrote on this phone (the hwcg block that opens a5xx_start_seq, up to its
+ * final RBBM_CLOCK_CNTL 0xaaa82a00). Run 10: with gating on, an idle GPU
+ * counted 90 cycles in 2 ms, so the clock is measured with gating off.
+ */
+#define A5XX_RBBM_CLOCK_CNTL	0x67
+#define A5XX_RBBM_ISDB_CNT	0x533
+
+static unsigned hwcg_end(void)	/* index after the final RBBM_CLOCK_CNTL of the hwcg block */
+{
+	for (unsigned i = 1; i < sizeof(a5xx_start_seq) / sizeof(a5xx_start_seq[0]); i++)
+		if (a5xx_start_seq[i][0] == A5XX_RBBM_CLOCK_CNTL && a5xx_start_seq[i][1] == 0xaaa82a00)
+			return i + 1;
+	return 0;
+}
+
+static void hwcg_set(int on)
+{
+	unsigned end = hwcg_end();
+	for (unsigned i = 1; i < end; i++) {
+		uint32_t r = a5xx_start_seq[i][0];
+		if (on)
+			wr(GPU_REG(r), a5xx_start_seq[i][1]);
+		else if (r != A5XX_RBBM_CLOCK_CNTL && r != A5XX_RBBM_ISDB_CNT)
+			wr(GPU_REG(r), 0);
+	}
+	if (!on) {
+		wr(GPU_REG(A5XX_RBBM_CLOCK_CNTL), 0);
+		wr(GPU_REG(A5XX_RBBM_ISDB_CNT), 0x180);
+	}
+}
+
+/* GPU clock in kHz over 2 ms of CPU time, clock gating off while counting */
+static uint32_t gpu_khz(const char *when)
+{
+	if (!hwcg_end()) {
+		put("hwcg block not found in the start sequence\n");
+		return 0;
+	}
+	hwcg_set(0);
+	wr(GPU_REG(A5XX_RBBM_PERFCTR_RBBM_SEL_1), 0);	/* countable 0: every cycle */
+	udelay(10);
+	uint64_t t0 = ticks(), c0 = gpu_cycles();
+	udelay(2000);
+	uint64_t t1 = ticks(), c1 = gpu_cycles();
+	hwcg_set(1);
+	uint64_t us = (t1 - t0) * 1000000 / freq();
+	uint32_t khz = us ? (uint32_t)((c1 - c0) * 1000 / us) : 0;
+	put("gpu clock ");
+	put(when);
+	put(": cycles ");
+	puthex((uint32_t)(c1 - c0));
+	put(" in us ");
+	puthex((uint32_t)us);
+	put(" = kHz ");
+	puthex(khz);
+	put("\n");
+	flush();
+	return khz;
+}
+
+/* millivolts of a PM660L buck (VOLTAGE_CTL1/2), or 0 */
+static uint32_t rail_mv(const char *name, uint32_t ppid)
+{
+	uint8_t lo = 0, hi = 0, en = 0;
+	int rc = drg_pmic_read(ppid, 0x40, &lo) | drg_pmic_read(ppid, 0x41, &hi) | drg_pmic_read(ppid, 0x46, &en);
+	uint32_t mv = rc ? 0 : (uint32_t)hi << 8 | lo;
+	put(name);
+	put(": rc ");
+	puthex((uint32_t)rc);
+	put(" mV ");
+	puthex(mv);
+	put(" en ");
+	puthex(en);
+	put("\n");
+	flush();
+	return mv;
+}
+
+/* ring_w: next free ring dword after g2b_cp; cp_ok: its memory write landed */
+
+static void g2d_clocks(void)
+{
+	step("G2d 1 gpu clock at xo");
+	uint32_t k0 = gpu_khz("at xo");
+	if (k0 < 18000 || k0 > 20500) {
+		put("G2d RESULT: STOP (cycle counter does not read 19.2 MHz at xo)\n");
+		con_str("G2d", "STOP counter");
+		flush();
+		return;
+	}
+
+	step("G2d 2 rails (cx, mx)");
+	uint32_t cx = rail_mv("cx pm660l s3", PM660L_S3_CTRL), mx = rail_mv("mx pm660l s5", PM660L_S5_CTRL);
+	if (cx && cx < CX_MV_AT_266) {
+		put("cx below the level measured at 266 MHz: vote rwcx vlvl 128\n");
+		lv("rpm rc", (uint32_t)drg_rpm_request2(RPM_RES_RWCX, 0, RPM_KEY_SWEN, 1, RPM_KEY_VLVL, 128));
+		udelay(1000);
+		cx = rail_mv("cx after vote", PM660L_S3_CTRL);
+	}
+	if (mx && mx < MX_MV_AT_266) {
+		put("mx below the level measured at 266 MHz: vote rwmx vlvl 192\n");
+		lv("rpm rc", (uint32_t)drg_rpm_request2(RPM_RES_RWMX, 0, RPM_KEY_SWEN, 1, RPM_KEY_VLVL, 192));
+		udelay(1000);
+		mx = rail_mv("mx after vote", PM660L_S5_CTRL);
+	}
+	if (cx < CX_MV_AT_266 || mx < MX_MV_AT_266) {
+		put("G2d RESULT: STOP (rails below the levels measured at 266 MHz)\n");
+		con_str("G2d", "STOP rails");
+		flush();
+		return;
+	}
+
+	step("G2d 3 pll0 532 MHz");
+	uint32_t mode = rd(PLL0_MODE);
+	lv("pll0 mode", mode);
+	lv("pll0 user_ctl", rd(PLL0_USER_CTL));
+	lv("pll0 user_ctl_u", rd(PLL0_USER_CTL_U));
+	lv("pll0 config_ctl", rd(PLL0_CONFIG_CTL));
+	if (mode & (PLL_VOTE_FSM_ENA | PLL_OUTCTRL | PLL_RESET_N | PLL_BYPASSNL)) {
+		put("pll0 not off / in fsm mode: stop\n");
+		flush();
+		return;
+	}
+	/* clk_alpha_pll_configure (gpu_pll0_config): only the VCO field differs from what ABL left */
+	wr(PLL0_USER_CTL, (rd(PLL0_USER_CTL) & ~PLL_VCO_MASK) | PLL_VCO_500_1000);
+	wr(PLL0_L, 0x1b);
+	wr(PLL0_ALPHA, 0x55555600);
+	wr(PLL0_ALPHA_U, 0xb5);
+	wr(PLL0_MODE, rd(PLL0_MODE) | PLL_BYPASSNL);
+	udelay(5);
+	wr(PLL0_MODE, rd(PLL0_MODE) | PLL_RESET_N);
+	int us = poll(PLL0_MODE, PLL_LOCK_DET, PLL_LOCK_DET, 1000);
+	lv("pll0 lock us", (uint32_t)us);
+	if (us < 0) {
+		wr(PLL0_MODE, rd(PLL0_MODE) & ~(PLL_RESET_N | PLL_BYPASSNL));
+		lv("pll0 mode (off again)", rd(PLL0_MODE));
+		put("G2d RESULT: FAIL (pll0 did not lock; gpu stays on xo)\n");
+		con_str("G2d", "FAIL pll lock");
+		flush();
+		return;
+	}
+	wr(PLL0_MODE, rd(PLL0_MODE) | PLL_OUTCTRL);
+	lv("pll0 mode", rd(PLL0_MODE));
+	lv("pll0 user_ctl", rd(PLL0_USER_CTL));
+	lv("pll0 l", rd(PLL0_L));
+	flush();
+
+	step("G2d 4 gfx3d to pll0 / 2");
+	lv("gfx3d cfg before", rd(GPUCC_GFX3D_CFG));
+	wr(GPUCC_GFX3D_CFG, GFX3D_CFG_PLL0_DIV2);
+	wr(GPUCC_GFX3D_CMD, rd(GPUCC_GFX3D_CMD) | RCG_UPDATE);
+	us = poll(GPUCC_GFX3D_CMD, RCG_UPDATE, 0, 2000);
+	lv("gfx3d update us", (uint32_t)us);
+	lv("gfx3d cfg", rd(GPUCC_GFX3D_CFG));
+	lv("gfx3d cmd", rd(GPUCC_GFX3D_CMD));
+	lv("gfx3d cbcr", rd(GPUCC_GFX3D_CBCR));
+	flush();
+	uint32_t k1 = gpu_khz("after switch");
+	int clk_ok = us >= 0 && k1 > 260000 && k1 < 272000;
+
+	step("G2d 5 cp at the new clock");
+	int wrote = 0;
+	if (cp_ok && ring_w + 5 < RB_DWORDS) {
+		unsigned w = ring_w;
+		scratch[1] = 0;
+		ring[w++] = pkt7(CP_MEM_WRITE, 3);
+		ring[w++] = (uint32_t)(uintptr_t)&scratch[1];
+		ring[w++] = 0;
+		ring[w++] = 0xc0ffee02;
+		ring[w++] = pkt7(CP_NOP, 0);
+		__asm__ volatile("dsb sy" ::: "memory");
+		int rus = rb_submit(w, 2000000);
+		int mus = poll((uintptr_t)&scratch[1], 0xffffffff, 0xc0ffee02, 100000);
+		lv("rptr us", (uint32_t)rus);
+		lv("mem_write seen us", (uint32_t)mus);
+		lv("scratch[1]", scratch[1]);
+		cp_state("at 266 MHz");
+		wrote = rus >= 0 && mus >= 0;
+		ring_w = w;
+	}
+	put(clk_ok && wrote ? "G2d RESULT: PASS (gpu at 266 MHz measured, CP wrote memory at it)\n"
+		: clk_ok ? "G2d RESULT: PARTIAL (266 MHz measured, CP write not seen)\n"
+			 : "G2d RESULT: FAIL (clock not measured at 266 MHz)\n");
+	con_str("G2d", clk_ok && wrote ? "PASS" : clk_ok ? "PARTIAL" : "FAIL");
+	flush();
+}
+
 void drg_gpu_bringup(void)
 {
 	con_skip();
 	int rc = drg_emmc_log_open();
 	con_hex2("GPU LOG", "rc=", (uint32_t)rc, "lba=", (uint32_t)drg_emmc_log_lba());
-	put("DRGGPULOG v9 G1+G2a+G2b+G2c SMMU, zap, CP\n");
+	put("DRGGPULOG v11 G1+G2a+G2b+G2c+G2d SMMU, zap, CP, 266 MHz (hwcg off to count)\n");
 	lv("log open rc", (uint32_t)rc);
 	g1_snapshot("G1 as ABL left it");
 	if (g2a_power()) {
@@ -1139,6 +1391,9 @@ void drg_gpu_bringup(void)
 	if (g2b_smmu_attach() == 0) {
 		g2b_cp();
 		smmu_state("after cp test");
+		if (cp_ok)
+			g2d_clocks();
+		smmu_state("after g2d");
 	} else {
 		put("G2b RESULT: STOP (SMMU attach not verified; CP not started)\n");
 		con_str("G2b", "STOP smmu attach");

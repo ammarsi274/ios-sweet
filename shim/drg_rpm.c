@@ -172,8 +172,14 @@ static int wait_for(uint32_t *flag, unsigned int ms)
 	return -1;
 }
 
-int drg_rpm_ldo_enable(uint32_t type, uint32_t id, uint32_t uv)
+static int link_up;
+static uint32_t next_msg_id = 1;
+
+/* VERSION and OPEN of "rpm_requests", once per boot; 0 when the channel is open */
+static int link_open(void)
 {
+	if (link_up)
+		return 0;
 	int rc = fifo_find(TOC_TX, &tx_desc, &tx_fifo, &tx_size);
 	int rc2 = fifo_find(TOC_RX, &rx_desc, &rx_fifo, &rx_size);
 	con_hex2("RPM TOC", "tx=", (uint32_t)(tx_desc - RPM_MSGRAM) | tx_size << 16,
@@ -205,29 +211,46 @@ int drg_rpm_ldo_enable(uint32_t type, uint32_t id, uint32_t uv)
 	    "rx r/w=", r32(rx_desc) << 16 | r32(rx_desc + 4));
 	if (o)
 		return -4;
+	link_up = 1;
+	return 0;
+}
 
-	/* v0 request: header 28 bytes + two KVPs of 12 bytes = 52, padded to 56 */
+/*
+ * One v0 request in the active set with two 4-byte KVPs: header 28 bytes +
+ * two KVPs of 12 bytes = 52, padded to 56. Waits for the RPM's answer.
+ */
+int drg_rpm_request2(uint32_t type, uint32_t id, uint32_t k1, uint32_t v1, uint32_t k2, uint32_t v2)
+{
+	int rc = link_open();
+	if (rc)
+		return rc;
 	uint32_t pkt[4 + 14] = {
 		CMD_TX_DATA | (LCID << 16), 0, 52, 0,
 		0x716572,               /* service 'req' */
 		20 + 24,                /* request_len: after the first two words */
-		1,                      /* msg_id */
+		next_msg_id++,          /* msg_id */
 		0,                      /* active set */
 		type, id,
 		24,                     /* data_len */
-		0x6e657773, 4, 1,       /* "swen" = 1 */
-		0x00007675, 4, uv,      /* "uv" */
+		k1, 4, v1,
+		k2, 4, v2,
 		0,
 	};
+	uint32_t before = st_data_seen;
 	if (fifo_write(pkt, sizeof(pkt)))
 		return -5;
 	uint32_t seen = 0;
 	for (int i = 0; i < 500 && !seen; i++) {
 		rx_poll();
-		seen = st_data_seen;
+		seen = st_data_seen != before;
 		delay_ms(1);
 	}
 	con_hex2("RPM ACK", "n=", st_data_seen, "w0..1=", st_data_words[0]);
 	con_hex2("RPM ACK", "w2=", st_data_words[2], "w4=", st_data_words[3]);
 	return seen ? 0 : -6;
+}
+
+int drg_rpm_ldo_enable(uint32_t type, uint32_t id, uint32_t uv)
+{
+	return drg_rpm_request2(type, id, RPM_KEY_SWEN, 1, RPM_KEY_UV, uv);
 }

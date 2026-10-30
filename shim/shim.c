@@ -606,6 +606,15 @@ static unsigned int drg_spmi_apid(uint32_t ppid)
 	return 0xffff;
 }
 
+/* One PMIC register through the observer channel (read only), for drg_gpu.c. */
+int drg_pmic_read(uint32_t ppid, uint8_t addr, uint8_t *val)
+{
+	unsigned int apid = drg_spmi_apid(ppid);
+	if (apid == 0xffff)
+		return -2;
+	return drg_spmi_read(apid, addr, val);
+}
+
 static void drg_touch_probe(void)
 {
 	uint32_t ahb = rd32(DRG_GCC + 0x17004), qup = rd32(DRG_GCC + 0x1f008);
