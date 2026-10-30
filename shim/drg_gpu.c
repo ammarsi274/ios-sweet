@@ -41,6 +41,7 @@
 #include "drg_rpm.h"
 #include "drgpu_pt.h"
 #include "drgpu.h"
+#include "drgpu_fwblob.h"
 
 #define GCC			0x100000UL
 #define GCC_GPU_CFG_AHB_CBCR	(GCC + 0x71004)
@@ -1944,7 +1945,7 @@ static int c_alloc(void *ctx, uint64_t size, uint64_t align, struct drgpu_mem *o
 {
 	(void)ctx;
 	uint64_t base = (uintptr_t)core_pool, at = (base + core_pool_used + align - 1) & ~(align - 1);
-	if (at + size > base + sizeof(core_pool))
+	if (at - base + size > sizeof(core_pool))	/* offsets: no end-address literal (absolute relocation) */
 		return -1;
 	core_pool_used = at + size - base;
 	volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)at;
@@ -1983,6 +1984,7 @@ static void c_sleep(void *ctx, uint32_t us)
 }
 
 static struct drgpu core_gpu;
+uint64_t drg_fwblob_write(uintptr_t pa);	/* loader.c */
 /* the replay's last draw and its render target, for the power-cycle test */
 static struct drgpu_ib last_ibs[8];
 static unsigned last_n;
@@ -2014,11 +2016,48 @@ static void g4_core(void)
 	os.ptov = c_ptov;
 	os.log = c_log;
 	os.sleep_us = c_sleep;
-	struct drgpu_fw fw = {
-		drg_pm4_file, (uint32_t)(drg_pm4_file_end - drg_pm4_file),
-		drg_pfp_file, (uint32_t)(drg_pfp_file_end - drg_pfp_file),
-		drg_zap_mdt, (uint32_t)(drg_zap_mdt_end - drg_zap_mdt), drg_zap_b02, (uint32_t)(drg_zap_b02_end - drg_zap_b02),
-	};
+	/*
+	 * Firmware the way XNU gets it: the loader's blob writer (loader.c),
+	 * then the shared parser (drgpu_fwblob.h); every file must come back
+	 * byte for byte.
+	 */
+	step("G4 0 firmware blob: loader writer -> shared parser");
+	struct drgpu_fw fw;
+	struct drgpu_mem blobm = { 0, 0, 0 };
+	int prc = -9;
+	uint64_t blen = 0;
+	if (!c_alloc(0, 0x10000, 0x4000, &blobm)) {
+		blen = drg_fwblob_write((uintptr_t)blobm.pa);
+		prc = drgpu_fwblob_parse((const uint8_t *)blobm.va, blobm.size, &fw);
+	}
+	lv("blob bytes", (uint32_t)blen);
+	lv("parse rc", (uint32_t)prc);
+	int same_fw = !prc && fw.pm4_len == (uint32_t)(drg_pm4_file_end - drg_pm4_file) &&
+		      fw.pfp_len == (uint32_t)(drg_pfp_file_end - drg_pfp_file) &&
+		      fw.zap_mdt_len == (uint32_t)(drg_zap_mdt_end - drg_zap_mdt) &&
+		      fw.zap_b02_len == (uint32_t)(drg_zap_b02_end - drg_zap_b02);
+	for (uint32_t i = 0; same_fw && i < fw.pm4_len; i++)
+		same_fw = fw.pm4[i] == drg_pm4_file[i];
+	for (uint32_t i = 0; same_fw && i < fw.pfp_len; i++)
+		same_fw = fw.pfp[i] == drg_pfp_file[i];
+	for (uint32_t i = 0; same_fw && i < fw.zap_mdt_len; i++)
+		same_fw = fw.zap_mdt[i] == drg_zap_mdt[i];
+	for (uint32_t i = 0; same_fw && i < fw.zap_b02_len; i++)
+		same_fw = fw.zap_b02[i] == drg_zap_b02[i];
+	lv("files identical", (uint32_t)same_fw);
+	if (same_fw) {	/* a flipped byte must be caught by the FNV check */
+		((volatile uint8_t *)blobm.va)[blen - 1] ^= 0x40;
+		struct drgpu_fw fw_bad;
+		lv("parse of a damaged blob (want -3)", (uint32_t)drgpu_fwblob_parse((const uint8_t *)blobm.va, blobm.size, &fw_bad));
+		((volatile uint8_t *)blobm.va)[blen - 1] ^= 0x40;
+	}
+	flush();
+	if (!same_fw) {
+		put("G4 RESULT: FAIL (firmware blob)\n");
+		con_str("G4", "FAIL blob");
+		flush();
+		return;
+	}
 	struct drgpu *g = &core_gpu;
 	int pass = 1;
 

@@ -11,6 +11,41 @@
 #include "console.h"
 #include "fdt.h"
 #include "loader.h"
+#ifdef BOARD_DRG
+#include "drgpu_fwblob.h"
+
+extern const uint8_t drg_pm4_file[], drg_pm4_file_end[], drg_pfp_file[], drg_pfp_file_end[];
+extern const uint8_t drg_zap_mdt[], drg_zap_mdt_end[], drg_zap_b02[], drg_zap_b02_end[];
+
+/* Write the firmware blob at pa (MMU off: physical = CPU address); returns its size. */
+uint64_t drg_fwblob_write(uintptr_t pa)
+{
+	const uint8_t *src[4] = { drg_pm4_file, drg_pfp_file, drg_zap_mdt, drg_zap_b02 };
+	const uint8_t *end[4] = { drg_pm4_file_end, drg_pfp_file_end, drg_zap_mdt_end, drg_zap_b02_end };
+	volatile struct drgpu_fwblob *b = (volatile struct drgpu_fwblob *)pa;
+	volatile uint8_t *base = (volatile uint8_t *)pa;
+	uint32_t off = (sizeof(struct drgpu_fwblob) + 63) & ~63U;
+	for (int i = 0; i < 4; i++) {
+		uint32_t len = (uint32_t)(end[i] - src[i]);
+		b->e[i].type = (uint32_t)(i + 1);	/* DRGPU_FWBLOB_PM4 .. ZAP_B02 */
+		b->e[i].off = off;
+		b->e[i].len = len;
+		b->e[i].pad = 0;
+		for (uint32_t k = 0; k < len; k++)
+			base[off + k] = src[i][k];
+		off = (off + len + 63) & ~63U;
+	}
+	uint32_t hdr = sizeof(struct drgpu_fwblob);
+	for (uint32_t k = (uint32_t)(b->e[0].off); k > hdr; k--)
+		base[k - 1] = 0;	/* padding between header and first file */
+	b->magic = DRGPU_FWBLOB_MAGIC;
+	b->version = 1;
+	b->count = 4;
+	b->total = off - hdr;
+	b->fnv = drgpu_fnv(base + hdr, off - hdr);
+	return off;
+}
+#endif
 
 #define BOOT_LINE_LENGTH	608
 #define PAGE_16K		0x4000UL
@@ -114,6 +149,12 @@ const char *loader_boot(uintptr_t dtb)
 	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
+#ifdef BOARD_DRG
+	/* Nokia's GPU firmware for XNU's DrgGPU, below topOfKernelData (gpu/drgpu/drgpu_fwblob.h) */
+	uintptr_t fw_pa = top;
+	top = (fw_pa + drg_fwblob_write(fw_pa) + PAGE_16K - 1) & ~(PAGE_16K - 1);
+	con_hex2("GPU FW", "pa=", fw_pa, "top=", top);
+#endif
 
 	zero64(ba_pa, PAGE_16K);
 	volatile struct boot_args *ba = (volatile struct boot_args *)ba_pa;
@@ -133,6 +174,30 @@ const char *loader_boot(uintptr_t dtb)
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
 		ba->CommandLine[i] = p->cmdline[i];
+#ifdef BOARD_DRG
+	{
+		/* append " drgpufw=0x<fw_pa>" (hex, 16 digits max) */
+		int n = 0;
+		while (n < BOOT_LINE_LENGTH && ba->CommandLine[n])
+			n++;
+		const char *k = " drgpufw=0x";
+		if (n + 11 + 16 + 1 <= BOOT_LINE_LENGTH) {
+			for (int i = 0; k[i]; i++)
+				ba->CommandLine[n++] = k[i];
+			int started = 0;
+			for (int s = 60; s >= 0; s -= 4) {
+				unsigned d = (unsigned)(fw_pa >> s) & 15;
+				if (d || started || s == 0) {
+					ba->CommandLine[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+					started = 1;
+				}
+			}
+			ba->CommandLine[n] = 0;
+		} else {
+			con_str("GPU FW", "boot-args full: drgpufw not passed");
+		}
+	}
+#endif
 	ba->memSizeActual = p->mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 
