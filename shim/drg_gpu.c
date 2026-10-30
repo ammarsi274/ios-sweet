@@ -39,6 +39,7 @@
 #include "emmc.h"
 #include "drg_gpu.h"
 #include "drg_rpm.h"
+#include "drgpu_pt.h"
 
 #define GCC			0x100000UL
 #define GCC_GPU_CFG_AHB_CBCR	(GCC + 0x71004)
@@ -849,16 +850,19 @@ static int g2b_smmu_attach(void)
 	uintptr_t lo = (uintptr_t)_head & ~0x1fffffUL;
 	lv("image pa", (uint32_t)(uintptr_t)_head);
 	lv("image end", (uint32_t)(uintptr_t)_end);
-	if (((uintptr_t)_end - 1) >> 21 != lo >> 21 || lo >> 30 >= 512) {
-		put("image not inside one 2 MiB block: stop\n");
+	/* the whole image, in 2 MiB blocks inside one 1 GiB L1 entry */
+	if (((uintptr_t)_end - 1) >> 30 != lo >> 30 || lo >> 30 >= 512) {
+		put("image not inside one 1 GiB region: stop\n");
 		return -1;
 	}
 	smmu_l1[lo >> 30] = (uintptr_t)smmu_l2 | PTE_TABLE;
-	smmu_l2[(lo >> 21) & 511] = lo | PTE_BLOCK_RW_NC;
+	for (uintptr_t b = lo; b < (uintptr_t)_end; b += 0x200000)
+		smmu_l2[(b >> 21) & 511] = b | PTE_BLOCK_RW_NC;
 	__asm__ volatile("dsb sy" ::: "memory");
 	lv("l1 pa", (uint32_t)(uintptr_t)smmu_l1);
 	lv("l1 entry", (uint32_t)smmu_l1[lo >> 30]);
 	lv("l2 entry", (uint32_t)smmu_l2[(lo >> 21) & 511]);
+	lv("identity blocks", (uint32_t)(((uintptr_t)_end - lo + 0x1fffff) >> 21));
 	flush();
 
 	if (!probe_left) {
@@ -1537,6 +1541,8 @@ static int gpu_set_level(int lvl)
 	return 0;
 }
 
+static int g2e_ok;
+
 static void g2e_levels(void)
 {
 	static const int order[] = { 3, 2, 1, 0, 2 };	/* the TWRP trace's order */
@@ -1597,6 +1603,7 @@ static void g2e_levels(void)
 	put(pass ? "G2e RESULT: PASS (160/266/370/430 MHz measured, CP works at each, back at 266)\n"
 		 : "G2e RESULT: FAIL (see the level above)\n");
 	con_str("G2e", pass ? "PASS" : "FAIL");
+	g2e_ok = pass;
 	flush();
 }
 
@@ -1627,12 +1634,299 @@ static void core_states(void)
 	flush();
 }
 
+/*
+ * ---- G3r: replay Nokia-driver GPU work on our own driver path ----
+ * drg/GPU-IOS-DESIGN.md gate I2. The capture (drgles bench -capture in
+ * TWRP, kgsl_bench.c) holds every GPU object the Nokia driver had (id, GPU
+ * address, size, bytes before each GPU_COMMAND), each GPU_COMMAND, and every
+ * object after it completed on Linux's KGSL. Here each object gets pages of
+ * its own, mapped at the same GPU address through drgpu_pt (the portable
+ * page-table code the XNU driver will use); the IBs run with the framing
+ * HMD's adreno_ringbuffer.c gives them (CP_INDIRECT_BUFFER_PFE per IB, then
+ * a CP_EVENT_WRITE CACHE_FLUSH_TS end-of-pipe fence; MARKER commands carry
+ * no work and are not run, as in KGSL); after each command every object is
+ * compared with Linux's result (FNV-1a hash; differing bytes where the
+ * capture kept the data). Record format: kgsl_bench.c.
+ */
+extern const uint8_t drg_cap[], drg_cap_end[];
+
+#define CP_INDIRECT_BUFFER_PFE	0x3f	/* adreno_pm4types.h */
+#define CP_EVENT_WRITE		0x46
+#define CACHE_FLUSH_TS		4	/* a3xx_reg.h, all Adreno generations */
+#define KGSL_CMDBATCH_MARKER	0x2	/* msm_kgsl.h */
+#define KGSL_CMDLIST_IB		0x1
+
+static uint8_t gpu_heap[0x200000] __attribute__((aligned(4096)));
+static uint64_t pt_pool[32][512] __attribute__((aligned(4096)));
+static unsigned heap_used, pt_used;
+
+static int os_alloc_table(void *os, struct drgpu_page *p)
+{
+	(void)os;
+	if (pt_used >= 32)
+		return -1;
+	uint64_t *t = pt_pool[pt_used++];
+	for (int i = 0; i < 512; i++)
+		t[i] = 0;
+	p->va = t;
+	p->pa = (uintptr_t)t;	/* MMU off: physical = CPU address */
+	return 0;
+}
+
+static uint64_t *os_table_va(void *os, uint64_t pa)
+{
+	(void)os;
+	return (uint64_t *)(uintptr_t)pa;
+}
+
+static void os_publish(void *os)
+{
+	(void)os;
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+static struct drgpu_pt gpu_pt;
+
+static volatile uint32_t tlb_ok;
+
+static void tlb_fn(void)	/* spare core: CB0 TLBIALL + sync, as the attach does */
+{
+	wr(SMMU_CB0 + SMMU_CB_TLBIALL, 0);
+	wr(SMMU_CB0 + SMMU_CB_TLBSYNC, 0);
+	tlb_ok = poll(SMMU_CB0 + SMMU_CB_TLBSTATUS, 1, 0, 30000) >= 0;
+}
+
+static int tlb_flush(void)
+{
+	if (!probe_left)
+		return -1;
+	int core = next_core();
+	uint64_t esr = 0;
+	tlb_ok = 0;
+	int rc = drg_probe_call(core, tlb_fn, &esr, 100000);
+	if (rc) {
+		put("tlb flush: ");
+		probe_result(rc, core, esr);
+		put("\n");
+	}
+	return rc || !tlb_ok ? -1 : 0;
+}
+
+static uint32_t cle32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
+static uint64_t cle64(const uint8_t *p) { return cle32(p) | (uint64_t)cle32(p + 4) << 32; }
+
+static uint64_t fnv_mem(uintptr_t a, uint64_t n)
+{
+	const volatile uint8_t *p = (const volatile uint8_t *)a;
+	uint64_t h = 0xcbf29ce484222325ULL;
+	for (uint64_t i = 0; i < n; i++)
+		h = (h ^ p[i]) * 0x100000001b3ULL;
+	return h;
+}
+
+static struct robj { uint32_t id, live; uint64_t size, va, len, pa, h0; } robjs[64];
+
+static struct robj *robj_of(uint32_t id)
+{
+	for (int i = 0; i < 64; i++)
+		if (robjs[i].live && robjs[i].id == id)
+			return &robjs[i];
+	return 0;
+}
+
+static void g3_replay(void)
+{
+	step("G3r 1 replay of the Nokia driver's GPU work (cap1)");
+	gpu_pt = (struct drgpu_pt){ { (uintptr_t)smmu_l1, smmu_l1 }, os_alloc_table, os_table_va, os_publish, 0 };
+	lv("capture bytes", (uint32_t)(drg_cap_end - drg_cap));
+	const uint8_t *p = drg_cap, *end = drg_cap_end;
+	int tlb_dirty = 0, bad = 0, executed = 0, markers = 0;
+	uint32_t compared = 0, matched = 0, gpu_changed = 0, gpu_changed_ok = 0, seq = 0;
+
+	while (p + 16 <= end && !bad) {
+		uint32_t magic = cle32(p), type = cle32(p + 4), len = cle32(p + 8);
+		const uint8_t *d = p + 16;
+		if (magic != 0x43475244 || d + len > end) {
+			put("capture: bad record\n");
+			bad = 1;
+			break;
+		}
+		p = d + len;
+		if (type == 1) {			/* ALLOC: size, flags, va_len, mmapsize, id */
+			for (int i = 0; i < 64; i++)
+				if (!robjs[i].live) {
+					robjs[i] = (struct robj){ cle32(d + 32), 1, cle64(d + 24), 0, 0, 0, 0 };
+					break;
+				}
+		} else if (type == 2) {			/* MAP: off, va, len, prot */
+			struct robj *o = robj_of((uint32_t)(cle64(d) >> 12));
+			uint64_t va = cle64(d + 8), n = (cle64(d + 16) + 0xfff) & ~0xfffULL;
+			if (o && (cle32(d + 24) & 1) && !o->pa) {
+				if (heap_used + n > sizeof(gpu_heap)) {
+					put("gpu heap full\n");
+					bad = 1;
+					break;
+				}
+				o->pa = (uintptr_t)gpu_heap + heap_used;
+				heap_used += (unsigned)n;
+				o->va = va;
+				o->len = cle64(d + 16);
+				if (drgpu_pt_map(&gpu_pt, va, o->pa, n, DRGPU_PT_RW)) {
+					put("gpu map failed\n");
+					bad = 1;
+					break;
+				}
+				tlb_dirty = 1;
+			}
+		} else if (type == 3) {			/* FREE: id */
+			struct robj *o = robj_of(cle32(d));
+			if (o) {
+				if (o->pa)
+					drgpu_pt_unmap(&gpu_pt, o->va, (o->len + 0xfff) & ~0xfffULL);
+				o->live = 0;
+				tlb_dirty = 1;
+			}
+		} else if (type == 5) {			/* OBJ: id, phase, submit, has_data, gpuaddr, len, hash, data */
+			struct robj *o = robj_of(cle32(d));
+			uint32_t phase = cle32(d + 4), has = cle32(d + 12);
+			uint64_t n = cle64(d + 24), h = cle64(d + 32);
+			if (!o || !o->pa || n > o->len) {
+				put("object record without our mapping\n");
+				continue;
+			}
+			if (phase == 0) {
+				if (has) {
+					volatile uint8_t *dst = (volatile uint8_t *)o->pa;
+					for (uint64_t i = 0; i < n; i++)
+						dst[i] = d[40 + i];
+				}
+				o->h0 = h;
+			} else {
+				uint64_t mine = fnv_mem(o->pa, n);
+				compared++;
+				int gpu = h != o->h0;
+				gpu_changed += gpu;
+				if (mine == h) {
+					matched++;
+					gpu_changed_ok += gpu;
+				} else {
+					put("MISMATCH obj ");
+					puthex(o->id);
+					put(" gpuaddr ");
+					puthex((uint32_t)(o->va >> 32));
+					puthex((uint32_t)o->va);
+					put(gpu ? " (gpu-written)" : " (not gpu-written in capture)");
+					if (has) {
+						uint32_t diff = 0;
+						const volatile uint8_t *m = (const volatile uint8_t *)o->pa;
+						for (uint64_t i = 0; i < n; i++)
+							diff += m[i] != d[40 + i];
+						put(" bytes differing ");
+						puthex(diff);
+						put(" of ");
+						puthex((uint32_t)n);
+					}
+					put("\n");
+				}
+				if (gpu && mine == h) {
+					put("gpu-written obj ");
+					puthex(o->id);
+					put(" matches Linux\n");
+				}
+			}
+		} else if (type == 4) {			/* SUBMIT: n, kgsl_gpu_command, cmdlist, objlist, synclist */
+			uint32_t sub = cle32(d);
+			const uint8_t *c = d + 4;
+			uint64_t flags = cle64(c);
+			uint32_t cmdsize = cle32(c + 16), numcmds = cle32(c + 20);
+			put("submit ");
+			puthex(sub);
+			put(" flags ");
+			puthex((uint32_t)flags);
+			put(" cmds ");
+			puthex(numcmds);
+			if (flags & KGSL_CMDBATCH_MARKER) {
+				put(": marker, no work\n");
+				markers++;
+				flush();
+				continue;
+			}
+			put("\n");
+			if (tlb_dirty) {
+				if (tlb_flush()) {
+					put("tlb flush failed\n");
+					bad = 1;
+					break;
+				}
+				tlb_dirty = 0;
+			}
+			unsigned w = ring_w;
+			if (w + 4 * numcmds + 8 > RB_DWORDS) {
+				put("ring full\n");
+				bad = 1;
+				break;
+			}
+			for (uint32_t i = 0; i < numcmds; i++) {
+				const uint8_t *co = c + 64 + i * cmdsize;
+				uint64_t ga = cle64(co + 8), sz = cle64(co + 16);
+				if (!(cle32(co + 24) & KGSL_CMDLIST_IB))
+					continue;
+				ring[w++] = pkt7(CP_INDIRECT_BUFFER_PFE, 3);
+				ring[w++] = (uint32_t)ga;
+				ring[w++] = (uint32_t)(ga >> 32);
+				ring[w++] = (uint32_t)(sz >> 2);
+			}
+			seq++;
+			scratch[8] = 0;
+			ring[w++] = pkt7(CP_EVENT_WRITE, 4);
+			ring[w++] = CACHE_FLUSH_TS;
+			ring[w++] = (uint32_t)(uintptr_t)&scratch[8];
+			ring[w++] = 0;
+			ring[w++] = seq;
+			__asm__ volatile("dsb sy" ::: "memory");
+			int rus = rb_submit(w, 2000000);
+			int fus = poll((uintptr_t)&scratch[8], 0xffffffff, seq, 2000000);
+			ring_w = w;
+			lv("rptr us", (uint32_t)rus);
+			lv("fence us", (uint32_t)fus);
+			uint32_t hw = rd(GPU_REG(A5XX_CP_HW_FAULT)), irq = rd(GPU_REG(A5XX_RBBM_INT_0_STATUS));
+			lv("cp hw fault", hw);
+			lv("rbbm int0", irq);
+			flush();
+			executed++;
+			if (rus < 0 || fus < 0 || hw) {
+				uint32_t v;
+				cp_state("replay stopped");
+				pr("cb0 fsr", SMMU_CB0 + SMMU_CB_FSR, &v);
+				pr("cb0 farlo", SMMU_CB0 + SMMU_CB_FAR, &v);
+				pr("cb0 farhi", SMMU_CB0 + SMMU_CB_FAR + 4, &v);
+				pr("cb0 fsynr0", SMMU_CB0 + SMMU_CB_FSYNR0, &v);
+				bad = 1;
+				break;
+			}
+		}
+	}
+	lv("submits run", (uint32_t)executed);
+	lv("markers", (uint32_t)markers);
+	lv("objects compared", compared);
+	lv("objects matching Linux", matched);
+	lv("gpu-written objects", gpu_changed);
+	lv("gpu-written matching", gpu_changed_ok);
+	lv("heap used", heap_used);
+	lv("page-table pages", pt_used);
+	int pass = !bad && executed && compared && matched == compared && gpu_changed && gpu_changed_ok == gpu_changed;
+	put(pass ? "G3r RESULT: PASS (Nokia GPU work replayed on our driver path, every object identical to Linux)\n"
+		 : "G3r RESULT: FAIL (see above)\n");
+	con_str("G3r", pass ? "PASS" : "FAIL");
+	flush();
+}
+
 void drg_gpu_bringup(void)
 {
 	con_skip();
 	int rc = drg_emmc_log_open();
 	con_hex2("GPU LOG", "rc=", (uint32_t)rc, "lba=", (uint32_t)drg_emmc_log_lba());
-	put("DRGGPULOG v12 G1+G2a+G2b+G2c+G2d+G2e SMMU, zap, CP, all GPU levels\n");
+	put("DRGGPULOG v13 G1+G2a..G2e + G3r replay of Nokia GPU work\n");
 	lv("log open rc", (uint32_t)rc);
 	core_states();
 	g1_snapshot("G1 as ABL left it");
@@ -1660,6 +1954,8 @@ void drg_gpu_bringup(void)
 			g2d_clocks();
 		if (g2d_ok)
 			g2e_levels();
+		if (g2e_ok)
+			g3_replay();
 		smmu_state("after g2d");
 	} else {
 		put("G2b RESULT: STOP (SMMU attach not verified; CP not started)\n");

@@ -627,6 +627,11 @@ static int main_(int argc, char **argv, char **envp)
 			nokia_gralloc = 1;
 			continue;
 		}
+		if (!strcmp(argv[i], "-capture") && i + 1 < argc) {
+			int rc = kgsl_capture_start(argv[++i]);
+			host_log("capture to %s: %d\n", argv[i], rc);
+			continue;
+		}
 		dirs[nd++] = argv[i];
 		dirs[nd] = 0;
 	}

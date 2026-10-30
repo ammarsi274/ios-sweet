@@ -21,5 +21,6 @@ void *kgsl_mmap(void *addr, size_t len, int prot, int flags, int fd, long off, i
 int kgsl_munmap(void *addr, size_t len);	/* 1 if it was ours */
 int kgsl_close(int fd);			/* 1 if it was ours */
 void kgsl_report(void);
+int kgsl_capture_start(const char *path);	/* bench: record GPU work for replay (0 or -errno) */
 
 #endif

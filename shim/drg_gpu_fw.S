@@ -34,3 +34,15 @@ drg_zap_b02:
 	.incbin	"a512_zap.b02"
 drg_zap_b02_end:
 	.balign	8
+
+/*
+ * GPU work captured from Nokia's driver in TWRP (research/vendor-adreno/
+ * capture/cap1.bin, drgles bench -capture; kept out of git, hash checked by
+ * build-drg.sh): replayed by drg_gpu.c (drg/GPU-IOS-DESIGN.md gate I2).
+ */
+	.balign	8
+	.global	drg_cap, drg_cap_end
+drg_cap:
+	.incbin	"cap1.bin"
+drg_cap_end:
+	.balign	8
