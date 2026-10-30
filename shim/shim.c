@@ -119,6 +119,9 @@ static void __attribute__((noreturn)) reset(unsigned after_s)
 
 /* ---- exceptions ---- */
 
+/* drg_gpu.c: called for SPIs before the EOI (a level source must be cleared there) */
+void (*volatile drg_irq_hook)(uint32_t intid);
+
 static void irq_handler(void)
 {
 	uint64_t iar = rsr("icc_iar1_el1");
@@ -131,6 +134,8 @@ static void irq_handler(void)
 		irq_count++;
 	else
 		irq_other++;
+	if (id >= 32 && drg_irq_hook)
+		drg_irq_hook(id);
 	if (id == VTIMER_INTID)
 		wsr("cntv_tval_el0", rsr("cntfrq_el0") / 100);	/* 10 ms */
 	else if (id == PTIMER_INTID)
@@ -334,6 +339,55 @@ static void gicd_wait_rwp(void)
 {
 	for (int i = 0; i < 1000000 && (rd32(GICD_BASE) & (1U << 31)); i++)
 		;
+}
+
+/*
+ * drg_gpu.c: route one SPI to the calling core as Group 1 NS, level,
+ * priority 0xa0 (what pe_fiq.c does for the timer PPI), or switch it off.
+ * GICD offsets (GICv3 spec): IGROUPR 0x80, ISENABLER 0x100, ICENABLER 0x180,
+ * IPRIORITYR 0x400, ICFGR 0xc00, IROUTER 0x6000 + 8n. With two security
+ * states a secure SPI's group bit is RAZ/WI for us: *grp_after says which.
+ */
+int drg_gic_spi(uint32_t intid, int on, uint32_t *grp_before, uint32_t *grp_after)
+{
+	uint32_t n = intid / 32, bit = 1U << (intid % 32);
+	if (!on) {
+		wr32(GICD_BASE + 0x180 + 4 * n, bit);
+		gicd_wait_rwp();
+		return 0;
+	}
+	uint64_t sre = rsr("icc_sre_el1");
+	if (!(sre & 1)) {
+		wsr("icc_sre_el1", sre | 1);
+		isb();
+	}
+	wsr("icc_pmr_el1", 0xff);
+	wsr("icc_bpr1_el1", 0);
+	wsr("icc_igrpen1_el1", 1);
+	isb();
+	wr32(GICD_BASE, rd32(GICD_BASE) | 0x13);	/* ARE_NS, EnableGrp1A, EnableGrp1 (as Linux) */
+	gicd_wait_rwp();
+	uintptr_t r = find_gicr();
+	if (!r)
+		return -1;
+	uint32_t waker = rd32(r + GICR_WAKER);
+	if (waker & 2) {
+		wr32(r + GICR_WAKER, waker & ~2U);
+		for (int i = 0; i < 100000 && (rd32(r + GICR_WAKER) & 4); i++)
+			;
+	}
+	*grp_before = (rd32(GICD_BASE + 0x80 + 4 * n) & bit) ? 1 : 0;
+	wr32(GICD_BASE + 0x80 + 4 * n, rd32(GICD_BASE + 0x80 + 4 * n) | bit);
+	*grp_after = (rd32(GICD_BASE + 0x80 + 4 * n) & bit) ? 1 : 0;
+	wr8(GICD_BASE + 0x400 + intid, 0xa0);
+	uintptr_t cfg = GICD_BASE + 0xc00 + 4 * (intid / 16);
+	wr32(cfg, rd32(cfg) & ~(2U << (2 * (intid % 16))));	/* level */
+	uint64_t m = rsr("mpidr_el1");
+	wr32(GICD_BASE + 0x6000 + 8 * intid, (uint32_t)(m & 0xffffff));	/* Aff2.Aff1.Aff0, IRM 0 */
+	wr32(GICD_BASE + 0x6004 + 8 * intid, (uint32_t)((m >> 32) & 0xff));	/* Aff3 */
+	wr32(GICD_BASE + 0x100 + 4 * n, bit);
+	gicd_wait_rwp();
+	return 0;
 }
 
 /* Run one interrupt source for ~300 ms and report what the GIC saw. */

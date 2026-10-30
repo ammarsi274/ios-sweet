@@ -716,6 +716,61 @@ int drgpu_set_level(struct drgpu *g, int lvl)
 	return 0;
 }
 
+/*
+ * Idle power-off, Linux's slumber on this phone (ftrace 30.3119-30.3124):
+ * interrupt mask 0, VBIF halt and drain (XIN_HALT_CTRL0 0xf, wait for
+ * CTRL1, 0), bus vote down to the non-GPU APPS aggregate, rbcpr /
+ * rbbmtimer / gfx3d branches off, PLL off, MX vote vlvl 16 and swen 0,
+ * gpu_bimc_gfx off, GX GDSC collapse with the IO clamp (gdsc_disable with
+ * force-root). CX stays on: the SMMU in it keeps its configuration.
+ */
+#define RBBM_INT_0_MASK		0x38
+#define VBIF_XIN_HALT_CTRL0	0x3080
+#define VBIF_XIN_HALT_CTRL1	0x3081
+#define BW_GPU_OFF		240000000ULL	/* §6g: the APPS aggregate without the GPU's share */
+
+int drgpu_power_off(struct drgpu *g)
+{
+	if (!g->powered)
+		return 0;
+	if (g->cp_running && ring_wait_idle(g, 100000))
+		return fail(g, "drgpu: not idle at power off");
+	drgpu_wr(R(g, RBBM_INT_0_MASK), 0);
+	drgpu_wr(R(g, VBIF_XIN_HALT_CTRL0), 0xf);
+	(void)drgpu_poll(R(g, VBIF_XIN_HALT_CTRL1), 0xf, 0xf, 100);
+	drgpu_wr(R(g, VBIF_XIN_HALT_CTRL0), 0);
+	g->cp_running = 0;
+	if (set_bw(g, BW_GPU_OFF))
+		return -1;
+	drgpu_wr(RBCPR_CBCR(g), drgpu_rd(RBCPR_CBCR(g)) & ~1U);
+	drgpu_wr(RBBMTIMER_CBCR(g), drgpu_rd(RBBMTIMER_CBCR(g)) & ~1U);
+	drgpu_wr(GFX3D_CBCR(g), drgpu_rd(GFX3D_CBCR(g)) & ~1U);
+	if (g->pll >= 0)
+		pll_off(g, (unsigned)g->pll);
+	if (g->level >= 0 && drgpu_rpm_kvp2(g, RPM_RES_RWMX, 0, RPM_KEY_VLVL, 16, RPM_KEY_SWEN, 0))
+		return fail(g, "drgpu: rpm mx vote off");
+	if (set_cx(g, 128))
+		return -1;
+	drgpu_wr(GCC_GPU_BIMC_GFX(g), drgpu_rd(GCC_GPU_BIMC_GFX(g)) & ~1U);
+	drgpu_wr(GFX3D_CMD(g), drgpu_rd(GFX3D_CMD(g)) | RCG_ROOT_EN);
+	drgpu_wr(GDSC_GX(g), drgpu_rd(GDSC_GX(g)) | GDSC_SW_COLLAPSE);
+	int us = drgpu_poll(GDSC_GX(g), GDSC_PWR_ON, 0, 2000);
+	drgpu_wr(GX_DOMAIN(g), drgpu_rd(GX_DOMAIN(g)) | 1);	/* CLAMP_IO */
+	drgpu_wr(GFX3D_CMD(g), drgpu_rd(GFX3D_CMD(g)) & ~(RCG_ROOT_EN | RCG_UPDATE));
+	g->powered = 0;
+	g->level = -1;
+	g->pll = -1;
+	g->cur_ctx = 0;
+	return us < 0 ? fail(g, "drgpu: gx gdsc did not collapse") : 0;
+}
+
+int drgpu_resume(struct drgpu *g, int level)
+{
+	if (drgpu_power_on(g) || drgpu_cp_start(g))
+		return -1;
+	return drgpu_set_level(g, level);
+}
+
 /* GPU clock in kHz: RBBM perf counter 1, countable 0, clock gating off (a5xx_hwcg_set) */
 static unsigned hwcg_end(void)
 {

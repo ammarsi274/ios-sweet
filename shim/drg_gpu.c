@@ -1983,6 +1983,24 @@ static void c_sleep(void *ctx, uint32_t us)
 }
 
 static struct drgpu core_gpu;
+/* the replay's last draw and its render target, for the power-cycle test */
+static struct drgpu_ib last_ibs[8];
+static unsigned last_n;
+static uint32_t last_ctx, last_ts;
+static uint64_t last_rt_pa, last_rt_len, last_rt_hash;
+extern void (*volatile drg_irq_hook)(uint32_t intid);	/* shim.c */
+int drg_gic_spi(uint32_t intid, int on, uint32_t *grp_before, uint32_t *grp_after);
+static volatile uint32_t gpu_irqs, gpu_irq_status;
+static volatile uint64_t gpu_irq_t;
+
+static void gpu_irq_hook(uint32_t intid)
+{
+	if (intid != 332)
+		return;
+	gpu_irq_status |= drgpu_irq(&core_gpu);	/* clear the level source before the EOI */
+	gpu_irq_t = ticks();
+	gpu_irqs++;
+}
 extern const uint8_t drg_pm4_file[], drg_pm4_file_end[], drg_pfp_file[], drg_pfp_file_end[];
 
 static void g4_core(void)
@@ -2111,6 +2129,11 @@ static void g4_core(void)
 					if (mine == h) {
 						matched++;
 						gpuw_ok += h != o->h0;
+						if (h != o->h0) {	/* render target after the last draw */
+							last_rt_pa = o->pa;
+							last_rt_len = n;
+							last_rt_hash = h;
+						}
 					} else {
 						put("MISMATCH obj ");
 						puthex(o->id);
@@ -2136,6 +2159,11 @@ static void g4_core(void)
 				if (cle32(co + 24) & KGSL_CMDLIST_IB)
 					ibs[n++] = (struct drgpu_ib){ cle64(co + 8), (uint32_t)(cle64(co + 16) >> 2) };
 			}
+			for (unsigned i = 0; i < n; i++)
+				last_ibs[i] = ibs[i];
+			last_n = n;
+			last_ctx = ctx;
+			last_ts = ts;
 			uint64_t s0 = ticks();
 			uint32_t got = drgpu_submit(g, ctx, ibs, n, ts);
 			int w = got ? drgpu_wait(g, ctx, ts, 2000000) : -1;
@@ -2168,6 +2196,106 @@ static void g4_core(void)
 	lv("gpu-written matching", gpuw_ok);
 	lv("pool used", (uint32_t)core_pool_used);
 	if (bad || executed != 3 || !compared || matched != compared || !gpuw || gpuw_ok != gpuw)
+		pass = 0;
+
+	/*
+	 * GPU interrupt to this core: kgsl-3d0 "interrupts = <0 0x12c 0>" =
+	 * SPI 300 = INTID 332. The end-of-pipe CP_EVENT_WRITE carries bit 31
+	 * (interrupt); the hook clears RBBM_INT_0 (a level source) before EOI.
+	 */
+	step("G4 4 gpu interrupt (SPI 300 = INTID 332) to this core");
+	uint32_t gb = 9, ga = 9;
+	rc = drg_gic_spi(332, 1, &gb, &ga);
+	lv("gic setup", (uint32_t)rc);
+	lv("group bit before", gb);
+	lv("group bit after", ga);
+	(void)drgpu_irq(g);
+	gpu_irqs = 0;
+	gpu_irq_status = 0;
+	drg_irq_hook = gpu_irq_hook;
+	__asm__ volatile("msr daifclr, #2" ::: "memory");
+	uint32_t got_irqs = 0, lat_max = 0, lat_sum = 0;
+	for (uint32_t k = 1; k <= 5; k++) {
+		uint32_t before = gpu_irqs;
+		uint64_t s0 = ticks();
+		if (!drgpu_submit(g, 3, 0, 0, k))
+			break;
+		uint64_t end2 = s0 + freq() / 10;
+		while (gpu_irqs == before && ticks() < end2)
+			;
+		if (gpu_irqs != before) {
+			got_irqs++;
+			uint32_t us = (uint32_t)((gpu_irq_t - s0) * 1000000 / freq());
+			lat_sum += us;
+			if (us > lat_max)
+				lat_max = us;
+		}
+	}
+	__asm__ volatile("msr daifset, #2" ::: "memory");
+	drg_irq_hook = 0;
+	(void)drg_gic_spi(332, 0, &gb, &ga);
+	lv("interrupts for 5 submits", got_irqs);
+	lv("int status seen", gpu_irq_status);
+	lv("latency us max", lat_max);
+	lv("latency us avg", got_irqs ? lat_sum / got_irqs : 0);
+	lv("retired ctx 3", drgpu_retired(g, 3));
+	if (got_irqs != 5 || !(gpu_irq_status & (1U << 20)))
+		pass = 0;
+
+	/*
+	 * Idle power collapse and restore, three times: GX off (clocks, PLL,
+	 * votes down), then resume at 266 MHz without reloading the zap shader
+	 * (a512: ADRENO_CPZ_RETENTION) and re-run the replay's last draw into a
+	 * cleared render target: it must come back identical to Linux's.
+	 */
+	step("G4 5 power collapse / restore x3 (last draw re-run each time)");
+	for (int cyc = 0; cyc < 3 && last_n && last_rt_pa; cyc++) {
+		uint64_t c0 = ticks();
+		int orc = drgpu_power_off(g);
+		uint32_t off_us = (uint32_t)((ticks() - c0) * 1000000 / freq());
+		uint32_t gx = rd(GDSC_GX), clk = rd(GPUCC_GFX3D_CBCR);
+		udelay(20000);
+		volatile uint8_t *rt = (volatile uint8_t *)(uintptr_t)last_rt_pa;
+		for (uint64_t i = 0; i < last_rt_len; i++)
+			rt[i] = 0;
+		c0 = ticks();
+		int rrc = drgpu_resume(g, 2);
+		uint32_t on_us = (uint32_t)((ticks() - c0) * 1000000 / freq());
+		uint32_t khz = drgpu_gpu_khz(g);
+		last_ts += 0x100;
+		uint32_t got = rrc ? 0 : drgpu_submit(g, last_ctx, last_ibs, last_n, last_ts);
+		int w = got ? drgpu_wait(g, last_ctx, last_ts, 2000000) : -1;
+		int same = fnv_mem(last_rt_pa, last_rt_len) == last_rt_hash;
+		put("cycle ");
+		puthex((uint32_t)cyc);
+		put(" off rc ");
+		puthex((uint32_t)orc);
+		put(" us ");
+		puthex(off_us);
+		put(" gx gdsc ");
+		puthex(gx);
+		put(" gfx3d cbcr ");
+		puthex(clk);
+		put(" | resume rc ");
+		puthex((uint32_t)rrc);
+		put(" us ");
+		puthex(on_us);
+		put(" kHz ");
+		puthex(khz);
+		put(" trust ");
+		puthex(rd(GPU_REG(A5XX_RBBM_SECVID_TRUST_CNTL)));
+		put(" | redraw wait ");
+		puthex((uint32_t)w);
+		put(" identical ");
+		puthex((uint32_t)same);
+		put("\n");
+		if (rrc)
+			put(drgpu_err(g)), put("\n");
+		flush();
+		if (orc || rrc || w || !same || (gx & GDSC_PWR_ON) || !(clk & CBCR_CLK_OFF) || khz < 260000 || khz > 272000)
+			pass = 0;
+	}
+	if (!last_n || !last_rt_pa)
 		pass = 0;
 	put(pass ? "G4 RESULT: PASS (portable core: bring-up, all levels, Nokia work identical to Linux)\n"
 		 : "G4 RESULT: FAIL (see above)\n");

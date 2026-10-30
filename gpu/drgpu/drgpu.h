@@ -69,6 +69,9 @@ int drgpu_power_on(struct drgpu *g);		/* CX, BHS, gfx3d on XO, GX, branches */
 int drgpu_smmu_attach(struct drgpu *g);		/* stream 0 -> CB0, globals mapped */
 int drgpu_cp_start(struct drgpu *g);		/* start sequence .. secure mode off */
 int drgpu_set_level(struct drgpu *g, int level);
+/* idle: GX collapsed, PLLs and GPU clocks off, votes down; CX (and the SMMU in it) stays on */
+int drgpu_power_off(struct drgpu *g);
+int drgpu_resume(struct drgpu *g, int level);	/* power on, CP restart (zap retained), level */
 uint32_t drgpu_gpu_khz(struct drgpu *g);	/* measured with an RBBM counter */
 
 /* one IB list submission for context ctx (KGSL framing); returns its timestamp, 0 on error */
