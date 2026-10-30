@@ -332,3 +332,73 @@ void drg_emmc_probe(void)
 	}
 	con_str("USERDATA", "not found in GPT");
 }
+
+/*
+ * GPU bring-up log (G2): up to LOG_BLOCKS blocks of text written to the
+ * unused part of userdata, right after the R6 test block, so TWRP can read
+ * the result back (dd from userdata at LOG_OFFSET). Same safety rule as the
+ * R6 test: only past the 16 GiB iOS image plus the margin (the iOS HFS+
+ * volume measured 2026-10-30: block size 4096, 4194304 blocks = 16 GiB).
+ */
+#define LOG_OFFSET		(WTEST_OFFSET + 0x100ULL)
+#define LOG_BLOCKS		64
+
+static uint64_t log_lba;	/* 0: not found / not safe */
+
+int drg_emmc_log_open(void)
+{
+	uint32_t resp = 0, st = 0;
+	log_lba = 0;
+	if (*(volatile uint32_t *)(CQ_BASE + CQ_CFG) & CQ_CFG_ENABLE)
+		return -1;
+	hc_wr(SDHCI_INT_ENABLE, hc_rd(SDHCI_INT_ENABLE) | INT_ERRORS | INT_CMD_DONE | INT_XFER_DONE | INT_BUF_READ);
+	if (read_block(1, &resp, &st) || u32_at(0) != 0x20494645 || u32_at(4) != 0x54524150)
+		return -2;
+	uint64_t ent_lba = u64_at(72);
+	uint32_t n = u32_at(80), esz = u32_at(84);
+	if (esz != 128 || !n)
+		return -3;
+	if (n > GPT_ENTRIES_MAX)
+		n = GPT_ENTRIES_MAX;
+	for (uint32_t i = 0; i < n; i++) {
+		if (i % 4 == 0 && read_block((uint32_t)ent_lba + i / 4, &resp, &st))
+			return -4;
+		unsigned off = (i % 4) * 128;
+		if (!name_is(off, "userdata"))
+			continue;
+		uint64_t first = u64_at(off + 32), last = u64_at(off + 40);
+		uint64_t lba = first + LOG_OFFSET;
+		if (lba < first + IOS_IMAGE_SECTORS + WTEST_MARGIN || lba + LOG_BLOCKS - 1 > last ||
+		    lba + LOG_BLOCKS > 0xffffffffULL)
+			return -5;
+		log_lba = lba;
+		return 0;
+	}
+	return -6;
+}
+
+uint64_t drg_emmc_log_lba(void)
+{
+	return log_lba;
+}
+
+/* write len bytes (zero padded to whole blocks, at most LOG_BLOCKS) */
+int drg_emmc_log_write(const char *buf, unsigned len)
+{
+	uint32_t resp = 0, st = 0;
+	if (!log_lba)
+		return -1;
+	unsigned nb = (len + 511) / 512;
+	if (nb > LOG_BLOCKS)
+		nb = LOG_BLOCKS;
+	for (unsigned b = 0; b < nb; b++) {
+		unsigned char *s = (unsigned char *)sector;
+		for (unsigned i = 0; i < 512; i++) {
+			unsigned k = b * 512 + i;
+			s[i] = k < len ? (unsigned char)buf[k] : 0;
+		}
+		if (xfer_block((uint32_t)(log_lba + b), 1, &resp, &st))
+			return -2 - (int)b;
+	}
+	return 0;
+}

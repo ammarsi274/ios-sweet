@@ -14,6 +14,7 @@
 #include "emmc.h"
 #include "drg_rpm.h"
 #include "drg_ts.h"
+#include "drg_gpu.h"
 
 #define RESTART_BOOTLOADER	0x77665500U
 
@@ -691,6 +692,9 @@ static void __attribute__((noreturn)) drg_gold_main(void)
 	 * only writes past the iOS image in userdata. The Gold core's ID registers
 	 * shown here before are in drg/BOOTLOG.md (boot #4).
 	 */
+	stage = "gold gpu";
+	drg_gpu_bringup();
+
 	stage = "gold emmc";
 	con_skip();
 	drg_emmc_probe();
