@@ -138,12 +138,19 @@ static void irq_handler(void)
 	isb();
 }
 
+#ifdef BOARD_DRG
+static void probe_fault(void);
+#endif
+
 void exc_handler(uint64_t slot, uint64_t *regs)
 {
 	if (slot == 5) {	/* IRQ from current EL, SPx */
 		irq_handler();
 		return;
 	}
+#ifdef BOARD_DRG
+	probe_fault();	/* returns only if this core is not running a probe */
+#endif
 	con_clear(BLUE);
 	switch (slot & 3) {
 	case 0: con_str("PANIC", "SYNC"); break;
@@ -173,11 +180,98 @@ static volatile uint64_t handoff_dtb;
 static volatile uint32_t handoff_req, gold_alive, silver_done;
 #endif
 
+#ifdef BOARD_DRG
+/*
+ * Risky reads for the GPU bring-up (drg_gpu.c): one address on a spare
+ * core, so a read that never completes stalls only that core and the
+ * caller sees a timeout. SError is unmasked for the read, so a bus error
+ * reported asynchronously is caught too (probe_fault).
+ */
+enum { PROBE_IDLE, PROBE_READING, PROBE_DONE, PROBE_FAULT };
+static volatile uintptr_t probe_addr[NR_CPUS];
+static void (*volatile probe_fn[NR_CPUS])(void);
+static volatile uint32_t probe_val[NR_CPUS], probe_state[NR_CPUS];
+static volatile uint64_t probe_esr[NR_CPUS];
+
+static unsigned core_index(void)
+{
+	uint64_t m = rsr("mpidr_el1");
+	return (unsigned)(((m >> 8) & 0xff) ? 4 + (m & 0xff) : (m & 0xff)) % NR_CPUS;
+}
+
+static void probe_fault(void)
+{
+	unsigned i = core_index();
+	if (probe_state[i] != PROBE_READING)
+		return;
+	probe_esr[i] = rsr("esr_el1");
+	probe_state[i] = PROBE_FAULT;
+	__asm__ volatile("dsb sy" ::: "memory");
+	smc(PSCI_CPU_OFF, 0, 0, 0);
+}
+
+static uint64_t drg_mpidr(int i);
+
+static int probe_run(int idx, uintptr_t addr, void (*fn)(void), uint32_t *val, uint64_t *esr,
+		     unsigned timeout_us)
+{
+	probe_fn[idx] = fn;
+	probe_addr[idx] = addr;
+	probe_state[idx] = PROBE_IDLE;
+	probe_esr[idx] = 0;
+	__asm__ volatile("dsb sy" ::: "memory");
+	int64_t r = smc(PSCI_CPU_ON, drg_mpidr(idx), (uintptr_t)secondary_entry, (uint64_t)idx);
+	if (r) {
+		*val = (uint32_t)r;
+		return -2;	/* CPU_ON refused: *val = PSCI error */
+	}
+	uint64_t deadline = now() + rsr("cntfrq_el0") / 1000000 * timeout_us;
+	while (probe_state[idx] < PROBE_DONE && now() < deadline)
+		;
+	*val = probe_val[idx];
+	*esr = probe_esr[idx];
+	switch (probe_state[idx]) {
+	case PROBE_DONE: return 0;
+	case PROBE_FAULT: return -3;
+	case PROBE_READING: return -1;	/* read never completed */
+	default: return -4;		/* core never started */
+	}
+}
+
+int drg_probe_read(int idx, uintptr_t addr, uint32_t *val, uint64_t *esr, unsigned timeout_us)
+{
+	return probe_run(idx, addr, 0, val, esr, timeout_us);
+}
+
+/* Same, but run fn on the spare core (register writes that might stall). */
+int drg_probe_call(int idx, void (*fn)(void), uint64_t *esr, unsigned timeout_us)
+{
+	uint32_t v;
+
+	return probe_run(idx, 0, fn, &v, esr, timeout_us);
+}
+#endif
+
 void secondary_main(uint64_t idx)
 {
 #ifdef BOARD_DRG
 	if (idx == 4 && handoff_req)
 		drg_gold_main();
+	if (probe_addr[idx] || probe_fn[idx]) {
+		probe_state[idx] = PROBE_READING;
+		__asm__ volatile("dsb sy; msr daifclr, #4; isb" ::: "memory");
+		uint32_t v = 0;
+		if (probe_fn[idx])
+			probe_fn[idx]();
+		else
+			/* plain [Xn] load: a hypervisor-trapped register needs a decodable access */
+			__asm__ volatile("ldr %w0, [%1]" : "=r"(v) : "r"(probe_addr[idx]) : "memory");
+		__asm__ volatile("dsb sy; isb" ::: "memory");	/* take a pending SError here */
+		probe_val[idx] = v;
+		probe_state[idx] = PROBE_DONE;
+		__asm__ volatile("dsb sy" ::: "memory");
+		smc(PSCI_CPU_OFF, 0, 0, 0);
+	}
 #endif
 	sec_midr[idx] = rsr("midr_el1");
 	sec_mmfr0[idx] = rsr("id_aa64mmfr0_el1");

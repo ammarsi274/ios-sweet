@@ -117,11 +117,26 @@
 
 extern const uint32_t drg_pm4_fw[], drg_pm4_fw_end[], drg_pfp_fw[], drg_pfp_fw_end[];
 
-static inline uint32_t rd(uintptr_t a) { return *(volatile uint32_t *)a; }
+/*
+ * MMIO with a plain [Xn] address only, like Linux's __raw_readl/writel.
+ * Measured (G2b runs 1, 5, 7): the GPU SMMU's global registers are trapped
+ * and emulated by the hypervisor, and an access the compiler emits with
+ * base writeback (str w3, [x2], #36) carries no decodable syndrome, so the
+ * core never comes back. Plain ldr/str to the same registers complete.
+ * Run 8: a store of the zero register (str wzr, [x0]) to TLBIALLH also
+ * never came back, while the same write from w1 completed in run 6, so the
+ * value always goes through a real register ("r", as Linux 4.4's writel).
+ */
+static inline uint32_t rd(uintptr_t a)
+{
+	uint32_t v;
+	__asm__ volatile("ldr %w0, [%1]" : "=r"(v) : "r"(a) : "memory");
+	return v;
+}
+
 static inline void wr(uintptr_t a, uint32_t v)
 {
-	*(volatile uint32_t *)a = v;
-	__asm__ volatile("dsb sy" ::: "memory");
+	__asm__ volatile("str %w0, [%1]\n\tdsb sy" : : "r"(v), "r"(a) : "memory");
 }
 
 static uint64_t ticks(void)
@@ -511,17 +526,329 @@ static void g2b_cp(void)
 	flush();
 }
 
-/* Last step on purpose: the SMMU's global space hung the CPU, the context
- * banks are where kgsl itself writes (KGSL_IOMMU_SET_CTX_REG). */
-static void g2b_smmu_cb0(void)
+/*
+ * GPU SMMU. Measured (run 4, every read on a spare core): IDR1 0x20008005
+ * (4 KiB pages, context banks at +0x8000, 5 banks), IDR2 0x7511 (IAS 36,
+ * UBS 49), sCR0 0x00200626 (enabled, unmatched streams fault), SMR0-2
+ * invalid, S2CR0-2 0x000200ff (fault). CB0 and CB1 read as zero; reading
+ * CB2 stalls a core for good (that read hung Gold 0 in run 1). With every
+ * stream set to fault, the CP's first fetch could only fault: the reset of
+ * run 2. A core whose read stalls is not used again; this core never
+ * touches the SMMU itself. Silver cores 1-3 did not start within 20 ms in
+ * run 3, so only Gold 1-3 (indices 5-7) are used.
+ */
+static int cores[6] = { 5, 6, 7 }, ncores = 3, rr, probe_dead[8], probe_left = 3;
+
+static int next_core(void)
 {
-	step("G2b 6 smmu context bank 0 (last step, may hang)");
-	lreg("cb0 sctlr", SMMU_CB_DT + SMMU_CB_SCTLR);
+	for (int k = 0; k < ncores; k++) {
+		int core = cores[(rr + k) % ncores];
+		if (!probe_dead[core]) {
+			rr = (rr + k + 1) % ncores;
+			return core;
+		}
+	}
+	return cores[0];	/* not reached while probe_left > 0 */
+}
+
+/* log a probe outcome; marks the core dead on a stall */
+static void probe_result(int rc, int core, uint64_t esr)
+{
+	switch (rc) {
+	case 0:
+		break;
+	case -1:
+		put("STALLED on core ");
+		puthex((uint32_t)core);
+		probe_dead[core] = 1;
+		probe_left--;
+		break;
+	case -3:
+		put("FAULT esr ");
+		puthex((uint32_t)esr);
+		break;
+	default:
+		put("probe rc ");
+		puthex((uint32_t)rc);
+		break;
+	}
+}
+
+static int pr(const char *name, uintptr_t a, uint32_t *v)
+{
+	put(name);
+	put(" @");
+	puthex((uint32_t)a);
+	put(" = ");
+	if (!probe_left) {
+		put("not read (no spare core left)\n");
+		return -5;
+	}
+	int core = next_core();
+	uint64_t esr = 0;
+	int rc = drg_probe_read(core, a, v, &esr, 20000);
+	if (!rc)
+		puthex(*v);
+	probe_result(rc, core, esr);
+	put("\n");
 	flush();
-	lreg("cb0 fsr", SMMU_CB_DT + SMMU_CB_FSR);
-	lreg("cb0 ttbr0 lo", SMMU_CB_DT + SMMU_CB_TTBR0);
-	lreg("cb0 ttbr0 hi", SMMU_CB_DT + SMMU_CB_TTBR0 + 4);
+	return rc;
+}
+
+/* a register write on a spare core (a stalled write stalls only that core) */
+static volatile uintptr_t pw_addr;
+static volatile uint32_t pw_val;
+
+static void pw_fn(void)
+{
+	wr(pw_addr, pw_val);
+}
+
+static int __attribute__((unused)) pwr(const char *name, uintptr_t a, uint32_t v)
+{
+	put(name);
+	put(" @");
+	puthex((uint32_t)a);
+	put(" <- ");
+	puthex(v);
+	put(": ");
+	if (!probe_left) {
+		put("not written (no spare core left)\n");
+		return -5;
+	}
+	int core = next_core();
+	uint64_t esr = 0;
+	pw_addr = a;
+	pw_val = v;
+	int rc = drg_probe_call(core, pw_fn, &esr, 20000);
+	if (!rc)
+		put("done");
+	probe_result(rc, core, esr);
+	put("\n");
 	flush();
+	return rc;
+}
+
+
+#define SMMU_GR0_SCR0		0x000
+#define SMMU_GR0_SGFSR		0x048
+#define SMMU_GR0_TLBIALLNSNH	0x068
+#define SMMU_GR0_TLBIALLH	0x06c
+#define SMMU_GR0_STLBGSYNC	0x070
+#define SMMU_GR0_STLBGSTATUS	0x074
+#define SMMU_GR0_SMR(n)		(0x800 + 4 * (n))
+#define SMMU_GR0_S2CR(n)	(0xc00 + 4 * (n))
+#define SMMU_GR1		(SMMU + 0x1000)	/* IDR1 PAGESIZE 0: 4 KiB */
+#define SMMU_GR1_CBAR(n)	(4 * (n))
+#define SMMU_GR1_CBA2R(n)	(0x800 + 4 * (n))
+#define SMMU_MICRO_MMU_CTRL	(SMMU + 6 * 0x1000)	/* ARM_SMMU_IMPL_DEF1 */
+#define SMMU_CB0		SMMU_CB_DT	/* IDR1 NUMPAGENDXB 2: SMMU + 8 pages */
+#define SMMU_CB_ACTLR		0x04
+#define SMMU_CB_TCR2		0x10
+#define SMMU_CB_TTBR1		0x28
+#define SMMU_CB_TCR		0x30
+#define SMMU_CB_MAIR0		0x38
+#define SMMU_CB_MAIR1		0x3c
+#define SMMU_CB_FAR		0x60
+#define SMMU_CB_FSYNR0		0x68
+#define SMMU_CB_TLBIALL		0x618
+#define SMMU_CB_TLBSYNC		0x7f0
+#define SMMU_CB_TLBSTATUS	0x7f4
+
+/*
+ * What HMD's arm-smmu.c and io-pgtable-arm.c program on kgsl's first attach
+ * (gfx3d_user, stream 0, first free context bank CB0), with this SMMU's IDs:
+ *   arm_smmu_device_reset: clear sGFSR, TLBIALLH + TLBIALLNSNH, sync,
+ *     sCR0 |= GFRE|GFIE|GCFGFRE|GCFGFIE|VMIDPNE|PTM|USFCFG, &= ~CLIENTPD|FB|BSU
+ *   arm_smmu_impl_def_programming: halt, the DT's attach-impl-defs, resume
+ *   arm_smmu_init_context_bank: CBA2R RW64, CBAR S1 (S2 bypass) BPSHCFG NSH
+ *     MEMATTR WB VMID cbndx+2, TTBR0/1 with ASID cbndx+1, TCR, MAIR, ACTLR
+ *     QCOM ISH|OSH|NSH, SCTLR CFIE|CFRE|AFE|TRE|M|ASIDPNE and, for kgsl's
+ *     pagefault policy 0 (TWRP sysfs ft_pagefault_policy), HUPCF not CFCFG
+ *   io-pgtable ARM_64_LPAE_S1, ias = min(UBS 49, 39) = 39, oas = IAS 36,
+ *     page table not coherent: TCR SH0 OS, IRGN0/ORGN0 NC, TG0 4K, IPS 36,
+ *     T0SZ 25, EPD1, SEP_UPSTREAM; MAIR0 NC 0x44 | WBRWA 0xff | DEVICE 0x04
+ *   arm_smmu_domain_add_master: SMR0 = VALID | id 0, S2CR0 = TRANS | CB0
+ * The page table maps the shim's 2 MiB block VA = PA (GPU address =
+ * physical address), PTE as arm_lpae_prot_to_pte/__arm_lpae_init_pte for
+ * IOMMU_READ|IOMMU_WRITE: nG, AP_RW, AF, SH_OS, block, attr index 0 (NC).
+ */
+#define SCR0_SET	(0x2 | 0x4 | 0x10 | 0x20 | 0x400 | 0x800 | 0x1000)
+#define SCR0_CLEAR	(0x1 | 0x2000 | 0xc000)
+#define CB0_CBAR	(0x1u << 16 | 0x3u << 8 | 0xfu << 12 | 2u)	/* 0x0001f302 */
+#define CB0_ASID	1ULL
+#define CB0_TCR		0x00802019u	/* SH0 OS, TG0 4K, T0SZ 25, EPD1 */
+#define CB0_TCR2	0x00038001u	/* IPS 36 bit, SEP_UPSTREAM */
+#define CB0_MAIR0	0x0004ff44u
+#define CB0_ACTLR	0x70000000u
+#define CB0_SCTLR	0x1167u		/* M TRE AFE CFRE CFIE HUPCF ASIDPNE */
+#define PTE_BLOCK_RW_NC	(0x800 | 0x40 | 0x400 | 0x200 | 0x1)	/* nG AP_RW AF SH_OS block */
+#define PTE_TABLE	0x3
+
+static const uint32_t impl_defs[][2] = {	/* arm,smmu-kgsl@5040000 attach-impl-defs */
+	{ 0x6000, 0x2378 }, { 0x6060, 0x1055 }, { 0x678c, 0x8 }, { 0x6794, 0x28 },
+	{ 0x6800, 0x6 }, { 0x6900, 0x3ff }, { 0x6924, 0x204 }, { 0x6928, 0x11000 },
+	{ 0x6930, 0x800 }, { 0x6960, 0xffffffff }, { 0x6b64, 0x1a5551 }, { 0x6b68, 0x9a82a382 },
+};
+
+static uint64_t smmu_l1[512] __attribute__((aligned(4096)));
+static uint64_t smmu_l2[512] __attribute__((aligned(4096)));
+static volatile uint32_t attach_step, attach_halt_us, attach_sync_ok, attach_cbsync_ok;
+static volatile uint32_t attach_scr0_old;
+
+static inline void wr64(uintptr_t a, uint64_t v)
+{
+	__asm__ volatile("str %x0, [%1]\n\tdsb sy" : : "r"(v), "r"(a) : "memory");
+}
+
+/* runs on a spare core: attach_step says how far it got */
+static void smmu_attach(void)
+{
+	uint32_t v;
+
+	attach_step = 10;
+	wr(SMMU + SMMU_GR0_SGFSR, rd(SMMU + SMMU_GR0_SGFSR));
+	attach_step = 20;
+	wr(SMMU + SMMU_GR0_TLBIALLH, 0);
+	attach_step = 30;
+	wr(SMMU + SMMU_GR0_TLBIALLNSNH, 0);
+	attach_step = 40;
+	wr(SMMU + SMMU_GR0_STLBGSYNC, 0);
+	attach_step = 50;
+	attach_sync_ok = poll(SMMU + SMMU_GR0_STLBGSTATUS, 1, 0, 30000) >= 0;
+	attach_step = 60;
+	v = rd(SMMU + SMMU_GR0_SCR0);
+	attach_scr0_old = v;
+	attach_step = 70;
+	wr(SMMU + SMMU_GR0_SCR0, (v | SCR0_SET) & ~SCR0_CLEAR);
+
+	attach_step = 80;
+	wr(SMMU_MICRO_MMU_CTRL, rd(SMMU_MICRO_MMU_CTRL) | 0x4);	/* LOCAL_HALT_REQ */
+	attach_step = 90;
+	attach_halt_us = (uint32_t)poll(SMMU_MICRO_MMU_CTRL, 0x8, 0x8, 30000);	/* IDLE */
+	for (unsigned i = 0; i < sizeof(impl_defs) / sizeof(impl_defs[0]); i++) {
+		attach_step = 100 + i;	/* 100..111 */
+		wr(SMMU + impl_defs[i][0], impl_defs[i][1]);
+	}
+	attach_step = 120;
+	wr(SMMU_MICRO_MMU_CTRL, rd(SMMU_MICRO_MMU_CTRL) & ~0x4u);
+
+	attach_step = 130;
+	wr(SMMU_GR1 + SMMU_GR1_CBA2R(0), 1);	/* RW64 */
+	attach_step = 140;
+	wr(SMMU_GR1 + SMMU_GR1_CBAR(0), CB0_CBAR);
+	attach_step = 150;
+	wr64(SMMU_CB0 + SMMU_CB_TTBR0, (uintptr_t)smmu_l1 | CB0_ASID << 48);
+	attach_step = 160;
+	wr64(SMMU_CB0 + SMMU_CB_TTBR1, CB0_ASID << 48);
+	attach_step = 170;
+	wr(SMMU_CB0 + SMMU_CB_TCR, CB0_TCR);
+	attach_step = 180;
+	wr(SMMU_CB0 + SMMU_CB_TCR2, CB0_TCR2);
+	attach_step = 190;
+	wr(SMMU_CB0 + SMMU_CB_MAIR0, CB0_MAIR0);
+	attach_step = 200;
+	wr(SMMU_CB0 + SMMU_CB_MAIR1, 0);
+	attach_step = 210;
+	wr(SMMU_CB0 + SMMU_CB_ACTLR, CB0_ACTLR);
+	attach_step = 220;
+	wr(SMMU_CB0 + SMMU_CB_SCTLR, CB0_SCTLR);
+
+	attach_step = 230;
+	wr(SMMU + SMMU_GR0_SMR(0), 0x80000000u);	/* VALID, id 0, mask 0 */
+	attach_step = 240;
+	wr(SMMU + SMMU_GR0_S2CR(0), 0);			/* TRANS, CB0 */
+
+	attach_step = 250;
+	wr(SMMU_CB0 + SMMU_CB_TLBIALL, 0);
+	attach_step = 260;
+	wr(SMMU_CB0 + SMMU_CB_TLBSYNC, 0);
+	attach_step = 270;
+	attach_cbsync_ok = poll(SMMU_CB0 + SMMU_CB_TLBSTATUS, 1, 0, 30000) >= 0;
+	attach_step = 999;
+}
+
+static void smmu_state(const char *when)
+{
+	uint32_t v;
+
+	put("-- smmu ");
+	put(when);
+	put("\n");
+	pr("scr0", SMMU + SMMU_GR0_SCR0, &v);
+	pr("sgfsr", SMMU + SMMU_GR0_SGFSR, &v);
+	pr("sgfsynr0", SMMU + 0x50, &v);
+	pr("smr0", SMMU + SMMU_GR0_SMR(0), &v);
+	pr("s2cr0", SMMU + SMMU_GR0_S2CR(0), &v);
+	pr("cbar0", SMMU_GR1 + SMMU_GR1_CBAR(0), &v);
+	pr("cba2r0", SMMU_GR1 + SMMU_GR1_CBA2R(0), &v);
+	pr("cb0 sctlr", SMMU_CB0 + SMMU_CB_SCTLR, &v);
+	pr("cb0 ttbr0lo", SMMU_CB0 + SMMU_CB_TTBR0, &v);
+	pr("cb0 ttbr0hi", SMMU_CB0 + SMMU_CB_TTBR0 + 4, &v);
+	pr("cb0 tcr", SMMU_CB0 + SMMU_CB_TCR, &v);
+	pr("cb0 tcr2", SMMU_CB0 + SMMU_CB_TCR2, &v);
+	pr("cb0 mair0", SMMU_CB0 + SMMU_CB_MAIR0, &v);
+	pr("cb0 fsr", SMMU_CB0 + SMMU_CB_FSR, &v);
+	pr("cb0 farlo", SMMU_CB0 + SMMU_CB_FAR, &v);
+	pr("cb0 fsynr0", SMMU_CB0 + SMMU_CB_FSYNR0, &v);
+	pr("micro_mmu_ctrl", SMMU_MICRO_MMU_CTRL, &v);
+}
+
+/* 0 if CB0 now translates stream 0 with our table, as read back */
+static int g2b_smmu_attach(void)
+{
+	uint32_t v;
+	int bad = 0;
+
+	step("G2b 1 smmu attach (spare core)");
+	smmu_state("before");
+	extern char _head[], _end[];
+	uintptr_t lo = (uintptr_t)_head & ~0x1fffffUL;
+	lv("image pa", (uint32_t)(uintptr_t)_head);
+	lv("image end", (uint32_t)(uintptr_t)_end);
+	if (((uintptr_t)_end - 1) >> 21 != lo >> 21 || lo >> 30 >= 512) {
+		put("image not inside one 2 MiB block: stop\n");
+		return -1;
+	}
+	smmu_l1[lo >> 30] = (uintptr_t)smmu_l2 | PTE_TABLE;
+	smmu_l2[(lo >> 21) & 511] = lo | PTE_BLOCK_RW_NC;
+	__asm__ volatile("dsb sy" ::: "memory");
+	lv("l1 pa", (uint32_t)(uintptr_t)smmu_l1);
+	lv("l1 entry", (uint32_t)smmu_l1[lo >> 30]);
+	lv("l2 entry", (uint32_t)smmu_l2[(lo >> 21) & 511]);
+	flush();
+
+	if (!probe_left) {
+		put("no spare core left: stop\n");
+		return -1;
+	}
+	int core = next_core();
+	uint64_t esr = 0;
+	attach_step = 0;
+	int rc = drg_probe_call(core, smmu_attach, &esr, 200000);
+	put("attach: ");
+	probe_result(rc, core, esr);
+	lv("rc", (uint32_t)rc);
+	lv("step reached", attach_step);
+	lv("scr0 before", attach_scr0_old);
+	lv("tlb sync ok", attach_sync_ok);
+	lv("halt us", attach_halt_us);
+	lv("cb0 tlb sync ok", attach_cbsync_ok);
+	flush();
+	if (rc || attach_step != 999)
+		return -1;
+
+	smmu_state("after attach");
+	/* the values HMD's driver would have written must read back */
+	bad |= pr("check smr0", SMMU + SMMU_GR0_SMR(0), &v) || v != 0x80000000u;
+	bad |= pr("check s2cr0", SMMU + SMMU_GR0_S2CR(0), &v) || (v & 0x300ff) != 0;
+	bad |= pr("check cbar0", SMMU_GR1 + SMMU_GR1_CBAR(0), &v) || v != CB0_CBAR;
+	bad |= pr("check cb0 sctlr", SMMU_CB0 + SMMU_CB_SCTLR, &v) || v != CB0_SCTLR;
+	bad |= pr("check cb0 ttbr0lo", SMMU_CB0 + SMMU_CB_TTBR0, &v) || v != (uint32_t)(uintptr_t)smmu_l1;
+	bad |= pr("check scr0", SMMU + SMMU_GR0_SCR0, &v) || (v & 1);
+	put(bad ? "G2b SMMU attach: readback MISMATCH\n" : "G2b SMMU attach: readback OK\n");
+	flush();
+	return bad ? -1 : 0;
 }
 
 void drg_gpu_bringup(void)
@@ -529,7 +856,7 @@ void drg_gpu_bringup(void)
 	con_skip();
 	int rc = drg_emmc_log_open();
 	con_hex2("GPU LOG", "rc=", (uint32_t)rc, "lba=", (uint32_t)drg_emmc_log_lba());
-	put("DRGGPULOG v3 G1+G2a+G2b (no SMMU global reads)\n");
+	put("DRGGPULOG v8 G1+G2a+G2b SMMU attach (numbered) + CP test\n");
 	lv("log open rc", (uint32_t)rc);
 	g1_snapshot("G1 as ABL left it");
 	if (g2a_power()) {
@@ -541,10 +868,21 @@ void drg_gpu_bringup(void)
 	}
 	g1_snapshot("G1 after power-up");
 	g2a_registers();
-	g2b_cp();
-	put("== end of G2b CP test\n");
-	flush();
-	g2b_smmu_cb0();
+	/*
+	 * run 2: the CP start reset the phone while every SMMU stream faulted.
+	 * run 5: the attach stalled its core somewhere in its first three
+	 * writes. run 6: each of those writes (and CB0, SMR, TLB sync writes)
+	 * completed on its own core. The attach now numbers every access
+	 * (attach_step), so a stall names its register; the CP only starts
+	 * after the attach reads back as written.
+	 */
+	if (g2b_smmu_attach() == 0) {
+		g2b_cp();
+		smmu_state("after cp test");
+	} else {
+		put("G2b RESULT: STOP (SMMU attach not verified; CP not started)\n");
+		con_str("G2b", "STOP smmu attach");
+	}
 	put("== end\n");
 	flush();
 }
