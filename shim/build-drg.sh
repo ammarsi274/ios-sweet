@@ -10,13 +10,18 @@ OBJCOPY=aarch64-linux-gnu-objcopy
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -DBOARD_DRG"
 OUT=out-drg
 mkdir -p $OUT
+# Nokia's CP microcode (vendor_b, kept out of git), checked against the hashes taken from the phone
+FW=${DRG_GPU_FW:-../../research/vendor-adreno/files/firmware}
+(cd "$FW" && grep -E ' \./firmware/a530_(pm4|pfp)\.fw$' ../../SHA256SUMS | sed 's# \./firmware/# #' | sha256sum -c --quiet -) ||
+	{ echo "error: GPU microcode missing or changed in $FW" >&2; exit 1; }
+$CC $CFLAGS -I "$FW" -c drg_gpu_fw.S -o $OUT/drg_gpu_fw.o
 for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c emmc.c drg_rpm.c drg_ts.c drg_gpu.c; do
 	$CC $CFLAGS -c $f -o $OUT/${f%.*}.o
 done
 abs=$(aarch64-linux-gnu-readelf -r $OUT/shim.o $OUT/console.o $OUT/mmu.o $OUT/fdt.o $OUT/loader.o $OUT/ufs.o $OUT/emmc.o $OUT/drg_rpm.o $OUT/drg_ts.o $OUT/drg_gpu.o | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
 $CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
-	$OUT/start.o $OUT/shim.o $OUT/console.o $OUT/mmu.o $OUT/fdt.o $OUT/loader.o $OUT/ufs.o $OUT/emmc.o $OUT/drg_rpm.o $OUT/drg_ts.o $OUT/drg_gpu.o -o $OUT/shim.elf
+	$OUT/start.o $OUT/shim.o $OUT/console.o $OUT/mmu.o $OUT/fdt.o $OUT/loader.o $OUT/ufs.o $OUT/emmc.o $OUT/drg_rpm.o $OUT/drg_ts.o $OUT/drg_gpu.o $OUT/drg_gpu_fw.o -o $OUT/shim.elf
 $OBJCOPY -O binary $OUT/shim.elf $OUT/Image
 size=$(aarch64-linux-gnu-nm $OUT/shim.elf | awk '$3=="_end"{print strtonum("0x"$1)}')
 truncate -s "$size" $OUT/Image
