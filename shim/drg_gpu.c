@@ -1256,6 +1256,8 @@ static uint32_t rail_mv(const char *name, uint32_t ppid)
 
 /* ring_w: next free ring dword after g2b_cp; cp_ok: its memory write landed */
 
+static int g2d_ok;
+
 static void g2d_clocks(void)
 {
 	step("G2d 1 gpu clock at xo");
@@ -1360,6 +1362,241 @@ static void g2d_clocks(void)
 		: clk_ok ? "G2d RESULT: PARTIAL (266 MHz measured, CP write not seen)\n"
 			 : "G2d RESULT: FAIL (clock not measured at 266 MHz)\n");
 	con_str("G2d", clk_ok && wrote ? "PASS" : clk_ok ? "PARTIAL" : "FAIL");
+	g2d_ok = clk_ok && wrote;
+	flush();
+}
+
+/*
+ * ---- G2e: every GPU power level, 160/266/370/430 MHz ----
+ * Measured in TWRP (research/vendor-adreno/trace/levels-trace.txt, kgsl
+ * stepped 3 -> 2 -> 1 -> 0 -> 2 with the GPU forced on):
+ *   level  GPU    PLL      L     ALPHA       ALPHA_U
+ *   3      160    640 /2*  0x21  0x55555600  0x55
+ *   2      266    532      0x1b  0x55555600  0xb5
+ *   1      370    740      0x26  0xaaaaab00  0x8a
+ *   0      430    860      0x2c  0xaaaaab00  0xca
+ *   (* PLL post-divider 2: gpucc-sdm660.c pll_data {640 MHz, 0x1})
+ *   - ping-pong: each change uses the PLL that is off (430 -> 266 ran 532 MHz
+ *     on PLL1); RCG CFG = source << 8 | 3 (div 2), PLL0 source 1, PLL1 source 3
+ *   - a PLL is programmed while off, enabled (2, 6, lock, 7), the RCG muxed
+ *     to it with UPDATE, then the other PLL turned off (0x80000006, 0x80000000);
+ *   - bus: gpubw -> RPM bslv 0 (EBI) "bw" = the APPS aggregate msm_bus sends
+ *     (sum_ab, bus_agg_bw in the trace), which includes the display:
+ *     439229440 (levels 2, 3), 1007557632 (level 1), 1592663040 (level 0);
+ *   - CX (rwcx vlvl) 192 and mem-acc corner 2 only at level 0, CX 128 and
+ *     mem-acc corner 1 below (cpr4 gfx_corner: closed loop and LDO mode off
+ *     for all corners in the DT, so it only votes CX and mem-acc);
+ *     mem-acc = TCSR 0x1fcf004 bit 0, corner 1 -> 1, corner 2 -> 0
+ *     (gfx_mem_acc_corner, corner-acc-map <1 0>, read-modify-write);
+ *   - MX (rwmx) vlvl 192 with swen 1 while a GPU PLL runs;
+ *   - PM660L S3 (CX) 764 mV and S5 (MX) 852 mV at every level.
+ * Order here is the safe one: voltage, mem-acc and bus up before a clock
+ * goes up, down only after it came down. (Linux's clock framework sends the
+ * CX vote just after switching to 430 MHz.)
+ */
+#define PLL_BASE(n)		(GPUCC_PLL0 + 0x40UL * (n))
+#define PLL_POSTDIV_MASK	(0xfU << 8)
+#define MEM_ACC_SEL		0x1fcf004UL
+#define GPU_PLL_CONFIG_CTL	0x4001055bu	/* gpu_pll0_config, applied to both PLLs at probe */
+
+static const struct gpu_level {
+	uint32_t khz, l, alpha, alpha_u, postdiv, cx, memacc;
+	uint64_t bw;
+} gpu_levels[4] = {
+	{ 430000, 0x2c, 0xaaaaab00, 0xca, 0, 192, 2, 1592663040ULL },
+	{ 370000, 0x26, 0xaaaaab00, 0x8a, 0, 128, 1, 1007557632ULL },
+	{ 266000, 0x1b, 0x55555600, 0xb5, 0, 128, 1, 439229440ULL },
+	{ 160000, 0x21, 0x55555600, 0x55, 1, 128, 1, 439229440ULL },
+};
+
+static int cur_level = 2, cur_pll = 0;	/* after G2d: 266 MHz on PLL0 */
+static uint64_t cur_bw;
+static uint32_t cur_cx = 128, cur_memacc = 1;
+
+static int rpm_ack_ok(const char *what, int rc)
+{
+	uint32_t w[4];
+	drg_rpm_last_ack(w);
+	put("rpm ");
+	put(what);
+	put(" rc ");
+	puthex((uint32_t)rc);
+	put(" ack ");
+	for (int i = 0; i < 4; i++) {
+		puthex(w[i]);
+		put(" ");
+	}
+	put("\n");
+	flush();
+	return rc;
+}
+
+static int set_bw(uint64_t bw)
+{
+	if (bw == cur_bw)
+		return 0;
+	int rc = rpm_ack_ok("bslv 0 bw", drg_rpm_request64(RPM_RES_BSLV, RPM_BSLV_EBI, RPM_KEY_BW, bw));
+	if (!rc)
+		cur_bw = bw;
+	return rc;
+}
+
+static int set_cx(uint32_t lvl)
+{
+	if (lvl == cur_cx)
+		return 0;
+	int rc = rpm_ack_ok("rwcx vlvl", drg_rpm_request2(RPM_RES_RWCX, 0, RPM_KEY_SWEN, 1, RPM_KEY_VLVL, lvl));
+	if (!rc)
+		cur_cx = lvl;
+	return rc;
+}
+
+/* mem_acc_regulator_set_voltage: one corner at a time, RMW of bit 0 */
+static void set_memacc(uint32_t corner)
+{
+	while (cur_memacc != corner) {
+		cur_memacc += corner > cur_memacc ? 1 : -1;
+		uint32_t bit = cur_memacc == 1 ? 1 : 0;
+		wr(MEM_ACC_SEL, (rd(MEM_ACC_SEL) & ~1U) | bit);
+	}
+	lv("mem-acc sel", rd(MEM_ACC_SEL));
+}
+
+/* program PLL n (off) and lock it; 0 or -1 */
+static int pll_on(unsigned n, const struct gpu_level *g)
+{
+	uintptr_t p = PLL_BASE(n);
+	uint32_t mode = rd(p);
+	if (mode & (PLL_VOTE_FSM_ENA | PLL_OUTCTRL | PLL_RESET_N | PLL_BYPASSNL)) {
+		lv("pll busy, mode", mode);
+		return -1;
+	}
+	wr(p + 0x18, GPU_PLL_CONFIG_CTL);
+	wr(p + 0x10, (rd(p + 0x10) & ~(PLL_VCO_MASK | PLL_POSTDIV_MASK)) | PLL_VCO_500_1000 | g->postdiv << 8);
+	wr(p + 0x04, g->l);
+	wr(p + 0x08, g->alpha);
+	wr(p + 0x0c, g->alpha_u);
+	wr(p, rd(p) | PLL_BYPASSNL);
+	udelay(5);
+	wr(p, rd(p) | PLL_RESET_N);
+	int us = poll(p, PLL_LOCK_DET, PLL_LOCK_DET, 1000);
+	if (us < 0) {
+		wr(p, rd(p) & ~(PLL_RESET_N | PLL_BYPASSNL));
+		lv("pll did not lock, mode", rd(p));
+		return -1;
+	}
+	wr(p, rd(p) | PLL_OUTCTRL);
+	put("pll ");
+	puthex(n);
+	put(" locked us ");
+	puthex((uint32_t)us);
+	put(" mode ");
+	puthex(rd(p));
+	put(" user_ctl ");
+	puthex(rd(p + 0x10));
+	put("\n");
+	return 0;
+}
+
+static void pll_off(unsigned n)
+{
+	uintptr_t p = PLL_BASE(n);
+	wr(p, rd(p) & ~PLL_OUTCTRL);
+	wr(p, rd(p) & ~(PLL_RESET_N | PLL_BYPASSNL));
+}
+
+/* switch the GPU clock to gpu_levels[lvl]; 0 when measured there */
+static int gpu_set_level(int lvl)
+{
+	const struct gpu_level *g = &gpu_levels[lvl];
+	int up = g->khz > gpu_levels[cur_level].khz;
+	unsigned n = cur_pll ^ 1;	/* ping-pong: the PLL that is off */
+	if (up) {
+		if (set_bw(g->bw) || set_cx(g->cx > cur_cx ? g->cx : cur_cx))
+			return -1;
+		set_memacc(g->memacc > cur_memacc ? g->memacc : cur_memacc);
+	}
+	if (pll_on(n, g))
+		return -1;
+	wr(GPUCC_GFX3D_CFG, (n ? 3U : 1U) << 8 | 3);	/* PLL1 source 3, PLL0 source 1; div 2 */
+	wr(GPUCC_GFX3D_CMD, rd(GPUCC_GFX3D_CMD) | RCG_UPDATE);
+	int us = poll(GPUCC_GFX3D_CMD, RCG_UPDATE, 0, 2000);
+	if (us < 0) {
+		lv("rcg update timeout, cfg", rd(GPUCC_GFX3D_CFG));
+		pll_off(n);
+		return -1;
+	}
+	pll_off(cur_pll);
+	cur_pll = n;
+	cur_level = lvl;
+	if (!up) {
+		set_memacc(g->memacc);
+		set_cx(g->cx);
+		set_bw(g->bw);
+	}
+	return 0;
+}
+
+static void g2e_levels(void)
+{
+	static const int order[] = { 3, 2, 1, 0, 2 };	/* the TWRP trace's order */
+	uint32_t v;
+	int pass = 1;
+
+	step("G2e 1 pll1 and mem-acc reachable (spare core reads)");
+	if (pr("pll1 mode", PLL_BASE(1), &v) || pr("pll1 user_ctl", PLL_BASE(1) + 0x10, &v) ||
+	    pr("mem-acc sel", MEM_ACC_SEL, &v)) {
+		put("G2e RESULT: STOP (pll1 or mem-acc not readable)\n");
+		con_str("G2e", "STOP reads");
+		flush();
+		return;
+	}
+	cur_memacc = (v & 1) ? 1 : 2;
+	lv("mem-acc corner now", cur_memacc);
+
+	step("G2e 2 bus and mx votes for the running GPU");
+	rpm_ack_ok("rwmx swen 1 vlvl 192", drg_rpm_request2(RPM_RES_RWMX, 0, RPM_KEY_SWEN, 1, RPM_KEY_VLVL, 192));
+	set_bw(gpu_levels[2].bw);
+
+	for (unsigned i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
+		int lvl = order[i];
+		char name[] = "G2e 3 level x";
+		name[12] = (char)('0' + lvl);
+		step(name);
+		int rc = gpu_set_level(lvl);
+		uint32_t khz = gpu_khz("at level");
+		uint32_t want = gpu_levels[lvl].khz;
+		int clk_ok = !rc && khz > want - want / 50 && khz < want + want / 50;
+		rail_mv("cx", PM660L_S3_CTRL);
+		rail_mv("mx", PM660L_S5_CTRL);
+		/* one CP memory write at this clock */
+		int wrote = 0;
+		if (cp_ok && ring_w + 5 < RB_DWORDS) {
+			unsigned w = ring_w;
+			scratch[2] = 0;
+			ring[w++] = pkt7(CP_MEM_WRITE, 3);
+			ring[w++] = (uint32_t)(uintptr_t)&scratch[2];
+			ring[w++] = 0;
+			ring[w++] = 0xc0de0000 | want / 1000;
+			ring[w++] = pkt7(CP_NOP, 0);
+			__asm__ volatile("dsb sy" ::: "memory");
+			int rus = rb_submit(w, 2000000);
+			int mus = poll((uintptr_t)&scratch[2], 0xffffffff, 0xc0de0000 | want / 1000, 100000);
+			wrote = rus >= 0 && mus >= 0;
+			ring_w = w;
+		}
+		lv("cp write", (uint32_t)wrote);
+		lv("cp hw fault", rd(GPU_REG(A5XX_CP_HW_FAULT)));
+		put(clk_ok && wrote ? "level OK\n" : "level FAILED\n");
+		flush();
+		if (!(clk_ok && wrote)) {
+			pass = 0;
+			break;
+		}
+	}
+	put(pass ? "G2e RESULT: PASS (160/266/370/430 MHz measured, CP works at each, back at 266)\n"
+		 : "G2e RESULT: FAIL (see the level above)\n");
+	con_str("G2e", pass ? "PASS" : "FAIL");
 	flush();
 }
 
@@ -1368,7 +1605,7 @@ void drg_gpu_bringup(void)
 	con_skip();
 	int rc = drg_emmc_log_open();
 	con_hex2("GPU LOG", "rc=", (uint32_t)rc, "lba=", (uint32_t)drg_emmc_log_lba());
-	put("DRGGPULOG v11 G1+G2a+G2b+G2c+G2d SMMU, zap, CP, 266 MHz (hwcg off to count)\n");
+	put("DRGGPULOG v12 G1+G2a+G2b+G2c+G2d+G2e SMMU, zap, CP, all GPU levels\n");
 	lv("log open rc", (uint32_t)rc);
 	g1_snapshot("G1 as ABL left it");
 	if (g2a_power()) {
@@ -1393,6 +1630,8 @@ void drg_gpu_bringup(void)
 		smmu_state("after cp test");
 		if (cp_ok)
 			g2d_clocks();
+		if (g2d_ok)
+			g2e_levels();
 		smmu_state("after g2d");
 	} else {
 		put("G2b RESULT: STOP (SMMU attach not verified; CP not started)\n");

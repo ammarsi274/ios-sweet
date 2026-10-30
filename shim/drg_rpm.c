@@ -216,28 +216,35 @@ static int link_open(void)
 }
 
 /*
- * One v0 request in the active set with two 4-byte KVPs: header 28 bytes +
- * two KVPs of 12 bytes = 52, padded to 56. Waits for the RPM's answer.
+ * One v0 request in the active set: header 28 bytes + KVP words (key,
+ * nbytes, value padded to 4), the whole TX_DATA padded to 8. Waits for the
+ * RPM's answer; kvp_words <= 16.
  */
-int drg_rpm_request2(uint32_t type, uint32_t id, uint32_t k1, uint32_t v1, uint32_t k2, uint32_t v2)
+static int rpm_send(uint32_t type, uint32_t id, const uint32_t *kvp, uint32_t kvp_words)
 {
 	int rc = link_open();
 	if (rc)
 		return rc;
-	uint32_t pkt[4 + 14] = {
-		CMD_TX_DATA | (LCID << 16), 0, 52, 0,
-		0x716572,               /* service 'req' */
-		20 + 24,                /* request_len: after the first two words */
-		next_msg_id++,          /* msg_id */
-		0,                      /* active set */
-		type, id,
-		24,                     /* data_len */
-		k1, 4, v1,
-		k2, 4, v2,
-		0,
-	};
+	if (kvp_words > 16)
+		return -7;
+	uint32_t data = 28 + 4 * kvp_words;
+	uint32_t words = 4 + (data + 7) / 8 * 2;
+	uint32_t pkt[4 + 7 + 16 + 1];	/* filled word by word: no memset in the shim */
+	for (uint32_t i = 0; i < words; i++)
+		pkt[i] = 0;
+	pkt[0] = CMD_TX_DATA | (LCID << 16);
+	pkt[2] = data;			/* size; size_left 0 */
+	pkt[4] = 0x716572;		/* service 'req' */
+	pkt[5] = 20 + 4 * kvp_words;	/* request_len: after the first two words */
+	pkt[6] = next_msg_id++;		/* msg_id */
+	pkt[7] = 0;			/* active set */
+	pkt[8] = type;
+	pkt[9] = id;
+	pkt[10] = 4 * kvp_words;	/* data_len */
+	for (uint32_t i = 0; i < kvp_words; i++)
+		pkt[11 + i] = kvp[i];
 	uint32_t before = st_data_seen;
-	if (fifo_write(pkt, sizeof(pkt)))
+	if (fifo_write(pkt, 4 * words))
 		return -5;
 	uint32_t seen = 0;
 	for (int i = 0; i < 500 && !seen; i++) {
@@ -250,7 +257,27 @@ int drg_rpm_request2(uint32_t type, uint32_t id, uint32_t k1, uint32_t v1, uint3
 	return seen ? 0 : -6;
 }
 
+/* two 4-byte KVPs */
+int drg_rpm_request2(uint32_t type, uint32_t id, uint32_t k1, uint32_t v1, uint32_t k2, uint32_t v2)
+{
+	const uint32_t kvp[6] = { k1, 4, v1, k2, 4, v2 };
+	return rpm_send(type, id, kvp, 6);
+}
+
+/* one 8-byte KVP (bus "bw", bytes/s, as msm_bus send_rpm_msg) */
+int drg_rpm_request64(uint32_t type, uint32_t id, uint32_t key, uint64_t v)
+{
+	const uint32_t kvp[4] = { key, 8, (uint32_t)v, (uint32_t)(v >> 32) };
+	return rpm_send(type, id, kvp, 4);
+}
+
 int drg_rpm_ldo_enable(uint32_t type, uint32_t id, uint32_t uv)
 {
 	return drg_rpm_request2(type, id, RPM_KEY_SWEN, 1, RPM_KEY_UV, uv);
+}
+
+void drg_rpm_last_ack(uint32_t w[4])
+{
+	for (int i = 0; i < 4; i++)
+		w[i] = st_data_words[i];
 }
