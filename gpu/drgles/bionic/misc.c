@@ -477,12 +477,55 @@ int *b_native_handle_clone(const int *h)
 }
 
 /* ---- gralloc: the bench lends TWRP's libhardware for now ---- */
+/* gralloc: ours (gralloc.c); the bench can lend Nokia's real module for
+ * measurements through bionic_bench_hook */
+int b_gralloc_get_module(const char *id, const void **out);
+
 int b_hw_get_module(const char *id, const void **module)
 {
 	int (*f)(const char *, const void **) = bionic_bench_hook ? bionic_bench_hook("hw_get_module") : 0;
-	if (!f) {
-		b_log("drgles: hw_get_module(%s): no gralloc yet\n", id);
-		return -LE_NOENT;
-	}
-	return f(id, module);
+	return f ? f(id, module) : b_gralloc_get_module(id, module);
+}
+
+/* basename/dirname: the result lives in a per-thread buffer, like bionic's */
+static char *pathbuf(const char *src, size_t n)
+{
+	struct bthread *t = bthread_self();
+	if (!t->keys[BKEYS - 1])
+		t->keys[BKEYS - 1] = host_alloc(4096);
+	char *b = t->keys[BKEYS - 1];
+	if (n > 4095)
+		n = 4095;
+	memcpy(b, src, n);
+	b[n] = 0;
+	return b;
+}
+
+char *b_basename(const char *p)
+{
+	if (!p || !*p)
+		return pathbuf(".", 1);
+	size_t e = strlen(p);
+	while (e > 1 && p[e - 1] == '/')
+		e--;
+	size_t s = e;
+	while (s && p[s - 1] != '/')
+		s--;
+	return e == s ? pathbuf("/", 1) : pathbuf(p + s, e - s);
+}
+
+char *b_dirname(const char *p)
+{
+	if (!p || !*p)
+		return pathbuf(".", 1);
+	size_t e = strlen(p);
+	while (e > 1 && p[e - 1] == '/')
+		e--;
+	while (e && p[e - 1] != '/')
+		e--;
+	if (!e)
+		return pathbuf(".", 1);
+	while (e > 1 && p[e - 1] == '/')
+		e--;
+	return pathbuf(p, e);
 }

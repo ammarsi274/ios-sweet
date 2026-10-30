@@ -73,7 +73,7 @@ D(b_system) D(b___getcwd_chk) D(b___umask_chk) D(b_isatty) D(b_getlogin) D(b_clo
 D(b_usleep) D(b_abort) D(b_exit) D(b_raise) D(b___stack_chk_fail) D(b___cxa_atexit) D(b___cxa_finalize)
 D(b___register_atfork) D(b___strlen_chk) D(b___strlcpy_chk) D(b___strlcat_chk) D(b___memcpy_chk) D(b___memset_chk)
 D(b___strrchr_chk) D(b_memalign) D(b_sync_wait) D(b_sync_merge) D(b_native_handle_create) D(b_native_handle_delete)
-D(b_native_handle_close) D(b_native_handle_clone) D(b_hw_get_module)
+D(b_native_handle_close) D(b_native_handle_clone) D(b_hw_get_module) D(b_basename) D(b_dirname)
 D(b_new) D(b_new_nothrow) D(b_delete) D(b___cxa_pure_virtual) D(b___cxa_guard_acquire) D(b___cxa_guard_release)
 D(b___cxa_guard_abort) D(b_str_grow_by) D(b_str_ctor_copy) D(b_str_ctor_sub) D(b_str_dtor) D(b_str_assign)
 D(b_str_operator_eq) D(b_str_append_n) D(b_str_append) D(b_str_insert) D(b_str_insert_char) D(b_str_erase)
@@ -185,7 +185,7 @@ static const struct {
 	{ "memalign", b_memalign }, { "setjmp", drg_setjmp }, { "longjmp", drg_longjmp }, { "sync_wait", b_sync_wait },
 	{ "sync_merge", b_sync_merge }, { "native_handle_create", b_native_handle_create },
 	{ "native_handle_delete", b_native_handle_delete }, { "native_handle_close", b_native_handle_close },
-	{ "native_handle_clone", b_native_handle_clone }, { "hw_get_module", b_hw_get_module },
+	{ "native_handle_clone", b_native_handle_clone }, { "hw_get_module", b_hw_get_module }, { "basename", b_basename }, { "dirname", b_dirname },
 
 	/* ---- ours: C++ ---- */
 	{ "_Znwm", b_new }, { "_Znam", b_new }, { "_ZdlPv", b_delete }, { "_ZdaPv", b_delete },

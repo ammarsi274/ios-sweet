@@ -219,9 +219,103 @@ static const char *const host_names[] = { "libc.so", "libm.so", "libz.so", "libl
 					  "libc++.so", "libhardware.so", 0 };
 
 static void *host_libs[8];
+/*
+ * Measurement of what Nokia's EGL asks from gralloc. Android's HAL ABI as
+ * compiled into eglSubDriverAndroid.so (LP64):
+ *   hw_module_t: u32 tag, u16 module_api_version, u16 hal_api_version,
+ *     id, name, author, methods, dso, reserved[25]
+ *   methods: open(module, id, hw_device_t **)
+ *   hw_device_t: u32 tag, u32 version, module, reserved[12], close
+ *   gralloc1_device_t: hw_device_t, getCapabilities, getFunction
+ * The real module (via TWRP's libhardware) is used; its open and
+ * getFunction are wrapped so every function EGL takes is logged and counted.
+ */
+struct hw_module {
+	uint32_t tag;
+	uint16_t mver, hver;
+	const char *id, *name, *author;
+	struct { int (*open)(const struct hw_module *, const char *, void **); } *methods;
+	void *dso;
+	uint64_t reserved[25];
+};
+struct gr1_dev {
+	uint32_t tag, version;
+	const struct hw_module *module;
+	uint64_t reserved[12];
+	int (*close)(void *);
+	void (*caps)(void *, uint32_t *, int32_t *);
+	void *(*get)(void *, int32_t);
+};
+static struct hw_module gr_mod;
+static struct { int (*open)(const struct hw_module *, const char *, void **); } gr_methods;
+static int (*gr_real_open)(const struct hw_module *, const char *, void **);
+static void *(*gr_real_get)(void *, int32_t);
+static int (*real_hw_get_module)(const char *, const struct hw_module **);
+
+static void *gr_get(void *dev, int32_t desc)
+{
+	void *f = gr_real_get(dev, desc);
+	host_log("gralloc1 getFunction(%d) -> %s\n", desc, f ? "fn" : "null");
+	if (!f)
+		return 0;
+	char *name = host_alloc(24);
+	snprintf(name, 24, "gralloc1 fn %d", desc);
+	if (nfwd == MAXFWD)
+		return f;
+	struct fwd *w = &fwd[nfwd++];
+	w->name = name;
+	w->target = f;
+	make_tramp(w);
+	return tramp + (w - fwd) * 10;
+}
+
+static int gr_open(const struct hw_module *m, const char *id, void **dev)
+{
+	int r = gr_real_open(m, id, dev);
+	host_log("gralloc open(%s) -> %d\n", id, r);
+	if (!r && *dev) {
+		struct gr1_dev *d = *dev;
+		uint32_t n = 0;
+		host_log("gralloc device tag %08x version %08x\n", d->tag, d->version);
+		if (d->caps) {
+			int32_t caps[16];
+			d->caps(d, &n, 0);
+			if (n > 16)
+				n = 16;
+			d->caps(d, &n, caps);
+			for (uint32_t i = 0; i < n; i++)
+				host_log("gralloc capability %d\n", caps[i]);
+		}
+		gr_real_get = d->get;
+		d->get = gr_get;
+	}
+	return r;
+}
+
+static int gr_hw_get_module(const char *id, const struct hw_module **out)
+{
+	const struct hw_module *m = 0;
+	int r = real_hw_get_module(id, &m);
+	host_log("hw_get_module(%s) -> %d\n", id, r);
+	if (r || !m) {
+		*out = m;
+		return r;
+	}
+	host_log("gralloc module tag %08x api %04x hal %04x id %s name \"%s\" author \"%s\"\n", m->tag, m->mver, m->hver,
+		 m->id, m->name, m->author);
+	gr_mod = *m;
+	gr_real_open = m->methods->open;
+	gr_methods.open = gr_open;
+	gr_mod.methods = (void *)&gr_methods;
+	*out = &gr_mod;
+	return 0;
+}
+
+static int nokia_gralloc;
 static void *bench_hook(const char *name)
 {
-	return dlsym(host_libs[6], name);	/* libhardware: Nokia's gralloc via TWRP for now */
+	real_hw_get_module = dlsym(host_libs[6], name);	/* libhardware: Nokia's gralloc via TWRP */
+	return gr_hw_get_module;
 }
 
 /* stage 2: the bionic layer answers first; whatever it lacks is still
@@ -529,10 +623,15 @@ static int main_(int argc, char **argv, char **envp)
 			stage = 1;
 			continue;
 		}
+		if (!strcmp(argv[i], "-nokiagralloc")) {
+			nokia_gralloc = 1;
+			continue;
+		}
 		dirs[nd++] = argv[i];
 		dirs[nd] = 0;
 	}
-	bionic_bench_hook = bench_hook;
+	if (nokia_gralloc)
+		bionic_bench_hook = bench_hook;
 	static const char *const sys[] = { "libc.so", "libm.so", "libdl.so", "liblog.so", "libcutils.so", "libutils.so",
 					   "libz.so", "libc++.so", "libhardware.so", "libsync.so", 0 };
 	for (int i = 0; host_names[i]; i++)

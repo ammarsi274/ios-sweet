@@ -2,9 +2,12 @@
  * Files, devices and memory for the Nokia's driver. Linux flag values and
  * errno numbers in, host calls out. Devices: /dev/kgsl-3d0 goes to the KGSL
  * layer; the 2D cores (/dev/kgsl-2d0/2d1) do not exist on this phone
- * (measured: ENOENT under TWRP). /dev/ion is opened by the driver but its
- * use is still being measured: on the bench it is passed through and every
- * ioctl on it is counted.
+ * (measured: ENOENT under TWRP). /dev/ion: libgsl will not start without
+ * it ("ioctl_kgsl_driver_entry: open(/dev/ion) failed", EGL_BAD_ALLOC), but
+ * made no ion call in the measured runs (stage 2 bench, 2026-10-30). iOS has
+ * no ion, so the driver gets a placeholder (/dev/null, present on both
+ * hosts) and every ioctl on it fails with ENOTTY, logged. The bench can pass
+ * the real device through instead (bench_ion = 1) to measure.
  */
 #include "bionic.h"
 #include "../kgsl.h"
@@ -13,6 +16,7 @@
 #define LO_TMPFILE 020200000
 
 static int ion_fd = -1;
+int bench_ion;
 static unsigned long ion_req[16];
 static unsigned ion_count[16];
 
@@ -22,10 +26,8 @@ int b_open(const char *path, int flags, int mode)
 	if (!strcmp(path, "/dev/kgsl-3d0"))
 		r = kgsl_open(flags);
 	else if (!strcmp(path, "/dev/ion")) {
-		r = host_open(path, flags, mode);
-		if (r >= 0)
-			ion_fd = (int)r;
-		b_log("drgles: open(/dev/ion) -> %ld\n", r);
+		r = bench_ion ? host_open(path, flags, mode) : host_open("/dev/null", flags & 0x80000 /* O_CLOEXEC */, 0);
+		ion_fd = (int)r;
 	} else if (!strncmp(path, "/dev/", 5))
 		r = -LE_NOENT;
 	else
@@ -128,6 +130,10 @@ long b_ioctl_fixed(int fd, unsigned req, void *arg)
 		if (i < 16) {
 			ion_req[i] = req;
 			ion_count[i]++;
+		}
+		if (!bench_ion) {
+			b_log("drgles: ion ioctl %08x refused\n", req);
+			return b_ret(-LE_NOTTY);
 		}
 	}
 	return b_ret(host_ioctl(fd, req, arg));
