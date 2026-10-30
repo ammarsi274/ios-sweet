@@ -18,6 +18,19 @@ drg_pfp_fw:
 drg_pfp_fw_end:
 	.balign	4096
 
+/* the same two files whole, for the portable core (gpu/drgpu), which drops the first dword itself */
+	.balign	8
+	.global	drg_pm4_file, drg_pm4_file_end
+drg_pm4_file:
+	.incbin	"a530_pm4.fw"
+drg_pm4_file_end:
+	.balign	8
+	.global	drg_pfp_file, drg_pfp_file_end
+drg_pfp_file:
+	.incbin	"a530_pfp.fw"
+drg_pfp_file_end:
+	.balign	8
+
 /*
  * Nokia's zap shader (a512_zap, PAS id 0xd): the .mdt (ELF header, program
  * headers and hash segment, handed to TZ as metadata) and the one loadable

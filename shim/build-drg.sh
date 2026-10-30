@@ -25,11 +25,13 @@ $CC $CFLAGS -I "$FW" -I "$CAP" -c drg_gpu_fw.S -o $OUT/drg_gpu_fw.o
 for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c emmc.c drg_rpm.c drg_ts.c drg_gpu.c; do
 	$CC $CFLAGS -I ../gpu/drgpu -c $f -o $OUT/${f%.*}.o
 done
-$CC $CFLAGS -c ../gpu/drgpu/drgpu_pt.c -o $OUT/drgpu_pt.o	# portable GPU core, shared with XNU
-abs=$(aarch64-linux-gnu-readelf -r $OUT/shim.o $OUT/console.o $OUT/mmu.o $OUT/fdt.o $OUT/loader.o $OUT/ufs.o $OUT/emmc.o $OUT/drg_rpm.o $OUT/drg_ts.o $OUT/drg_gpu.o $OUT/drgpu_pt.o | grep -c ABS64 || true)
+for f in drgpu drgpu_pt drgpu_rpm; do	# portable GPU core, shared with XNU
+	$CC $CFLAGS -c ../gpu/drgpu/$f.c -o $OUT/$f.o
+done
+abs=$(aarch64-linux-gnu-readelf -r $OUT/shim.o $OUT/console.o $OUT/mmu.o $OUT/fdt.o $OUT/loader.o $OUT/ufs.o $OUT/emmc.o $OUT/drg_rpm.o $OUT/drg_ts.o $OUT/drg_gpu.o $OUT/drgpu.o $OUT/drgpu_pt.o $OUT/drgpu_rpm.o | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
 $CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
-	$OUT/start.o $OUT/shim.o $OUT/console.o $OUT/mmu.o $OUT/fdt.o $OUT/loader.o $OUT/ufs.o $OUT/emmc.o $OUT/drg_rpm.o $OUT/drg_ts.o $OUT/drg_gpu.o $OUT/drgpu_pt.o $OUT/drg_gpu_fw.o -o $OUT/shim.elf
+	$OUT/start.o $OUT/shim.o $OUT/console.o $OUT/mmu.o $OUT/fdt.o $OUT/loader.o $OUT/ufs.o $OUT/emmc.o $OUT/drg_rpm.o $OUT/drg_ts.o $OUT/drg_gpu.o $OUT/drgpu.o $OUT/drgpu_pt.o $OUT/drgpu_rpm.o $OUT/drg_gpu_fw.o -o $OUT/shim.elf
 $OBJCOPY -O binary $OUT/shim.elf $OUT/Image
 size=$(aarch64-linux-gnu-nm $OUT/shim.elf | awk '$3=="_end"{print strtonum("0x"$1)}')
 truncate -s "$size" $OUT/Image

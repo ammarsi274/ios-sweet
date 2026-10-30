@@ -40,6 +40,7 @@
 #include "drg_gpu.h"
 #include "drg_rpm.h"
 #include "drgpu_pt.h"
+#include "drgpu.h"
 
 #define GCC			0x100000UL
 #define GCC_GPU_CFG_AHB_CBCR	(GCC + 0x71004)
@@ -117,7 +118,7 @@
 #define GDSC_SW_COLLAPSE	(1U << 0)
 #define GDSC_HW_CONTROL		(1U << 1)
 
-#include "drg_gpu_start.h"
+#include "drgpu_start.h"
 
 extern const uint32_t drg_pm4_fw[], drg_pm4_fw_end[], drg_pfp_fw[], drg_pfp_fw_end[];
 
@@ -277,7 +278,7 @@ static int branch_on(const char *label, uintptr_t cbcr)
 }
 
 /* ---- G2a ---- */
-static int g2a_power(void)
+static __attribute__((unused)) int g2a_power(void)
 {
 	int us;
 
@@ -372,7 +373,7 @@ static int g2a_power(void)
 	return 0;
 }
 
-static void g2a_registers(void)
+static __attribute__((unused)) void g2a_registers(void)
 {
 	step("G2a 7 gpu registers");
 	lreg("rbbm status", GPU_REG(A5XX_RBBM_STATUS));
@@ -444,7 +445,7 @@ static int zap_load(void);
 static unsigned ring_w;
 static int cp_ok;
 
-static void g2b_cp(void)
+static __attribute__((unused)) void g2b_cp(void)
 {
 	step("G2b 2 a5xx start sequence");
 	for (unsigned i = 0; i < sizeof(a5xx_start_seq) / sizeof(a5xx_start_seq[0]); i++)
@@ -839,7 +840,7 @@ static void smmu_state(const char *when)
 }
 
 /* 0 if CB0 now translates stream 0 with our table, as read back */
-static int g2b_smmu_attach(void)
+static __attribute__((unused)) int g2b_smmu_attach(void)
 {
 	uint32_t v;
 	int bad = 0;
@@ -1262,7 +1263,7 @@ static uint32_t rail_mv(const char *name, uint32_t ppid)
 
 static int g2d_ok;
 
-static void g2d_clocks(void)
+static __attribute__((unused)) void g2d_clocks(void)
 {
 	step("G2d 1 gpu clock at xo");
 	uint32_t k0 = gpu_khz("at xo");
@@ -1543,7 +1544,7 @@ static int gpu_set_level(int lvl)
 
 static int g2e_ok;
 
-static void g2e_levels(void)
+static __attribute__((unused)) void g2e_levels(void)
 {
 	static const int order[] = { 3, 2, 1, 0, 2 };	/* the TWRP trace's order */
 	uint32_t v;
@@ -1734,7 +1735,7 @@ static struct robj *robj_of(uint32_t id)
 	return 0;
 }
 
-static void g3_replay(void)
+static __attribute__((unused)) void g3_replay(void)
 {
 	step("G3r 1 replay of the Nokia driver's GPU work (cap1)");
 	gpu_pt = (struct drgpu_pt){ { (uintptr_t)smmu_l1, smmu_l1 }, os_alloc_table, os_table_va, os_publish, 0 };
@@ -1921,46 +1922,269 @@ static void g3_replay(void)
 	flush();
 }
 
+/*
+ * ---- G4: the portable driver core (gpu/drgpu) on the phone ----
+ * drg/GPU-IOS-DESIGN.md gate I3: the same calls XNU's DrgGPU will make,
+ * with this file as the OS layer (MMU off: physical = CPU address). RPM in
+ * attach mode: drg_rpm.c opened the channel earlier in this boot, exactly
+ * the situation XNU is in. Then cap1 replayed through drgpu_map/submit/wait
+ * and every object compared with Linux, as G3r did with the old code.
+ */
+static uint8_t core_pool[0x400000] __attribute__((aligned(4096)));
+static uint64_t core_pool_used;
+
+static uintptr_t c_mmio(void *ctx, uint64_t pa, uint64_t len)
+{
+	(void)ctx;
+	(void)len;
+	return (uintptr_t)pa;
+}
+
+static int c_alloc(void *ctx, uint64_t size, uint64_t align, struct drgpu_mem *out)
+{
+	(void)ctx;
+	uint64_t base = (uintptr_t)core_pool, at = (base + core_pool_used + align - 1) & ~(align - 1);
+	if (at + size > base + sizeof(core_pool))
+		return -1;
+	core_pool_used = at + size - base;
+	volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)at;
+	for (uint64_t i = 0; i < size; i++)
+		p[i] = 0;
+	out->pa = at;
+	out->va = (void *)(uintptr_t)at;
+	out->size = size;
+	return 0;
+}
+
+static void c_free(void *ctx, struct drgpu_mem *m)
+{
+	(void)ctx;
+	(void)m;	/* bump allocator: the test frees nothing it needs back */
+}
+
+static uint64_t *c_ptov(void *ctx, uint64_t pa)
+{
+	(void)ctx;
+	return (uint64_t *)(uintptr_t)pa;
+}
+
+static void c_log(void *ctx, const char *msg)
+{
+	(void)ctx;
+	put(msg);
+	put("\n");
+	flush();
+}
+
+static void c_sleep(void *ctx, uint32_t us)
+{
+	(void)ctx;
+	udelay(us);
+}
+
+static struct drgpu core_gpu;
+extern const uint8_t drg_pm4_file[], drg_pm4_file_end[], drg_pfp_file[], drg_pfp_file_end[];
+
+static void g4_core(void)
+{
+	/* built at run time: the shim is not relocated, so no function pointers in static data */
+	struct drgpu_os os;
+	os.ctx = 0;
+	os.mmio = c_mmio;
+	os.alloc = c_alloc;
+	os.free = c_free;
+	os.ptov = c_ptov;
+	os.log = c_log;
+	os.sleep_us = c_sleep;
+	struct drgpu_fw fw = {
+		drg_pm4_file, (uint32_t)(drg_pm4_file_end - drg_pm4_file),
+		drg_pfp_file, (uint32_t)(drg_pfp_file_end - drg_pfp_file),
+		drg_zap_mdt, (uint32_t)(drg_zap_mdt_end - drg_zap_mdt), drg_zap_b02, (uint32_t)(drg_zap_b02_end - drg_zap_b02),
+	};
+	struct drgpu *g = &core_gpu;
+	int pass = 1;
+
+	step("G4 1 drgpu_init + power + smmu + cp start");
+	uint64_t t0 = ticks();
+	int rc = drgpu_init(g, &os, &fw);
+	lv("init", (uint32_t)rc);
+	if (!rc)
+		lv("rpm attach", (uint32_t)(rc = drgpu_rpm_attach(g, 1)));
+	if (!rc)
+		lv("power_on", (uint32_t)(rc = drgpu_power_on(g)));
+	if (!rc)
+		lv("smmu_attach", (uint32_t)(rc = drgpu_smmu_attach(g)));
+	if (!rc)
+		lv("cp_start", (uint32_t)(rc = drgpu_cp_start(g)));
+	lv("bring-up us", (uint32_t)((ticks() - t0) * 1000000 / freq()));
+	if (rc) {
+		put("G4 RESULT: FAIL (");
+		put(drgpu_err(g));
+		put(")\n");
+		con_str("G4", "FAIL bring-up");
+		flush();
+		return;
+	}
+	lv("trust cntl", rd(GPU_REG(A5XX_RBBM_SECVID_TRUST_CNTL)));
+	lv("kHz on xo", drgpu_gpu_khz(g));
+
+	step("G4 2 levels 160/266/370/430/266");
+	static const int order[] = { 3, 2, 1, 0, 2 };
+	static const uint32_t want[] = { 430000, 370000, 266000, 160000 };
+	for (unsigned i = 0; i < 5; i++) {
+		int l = order[i];
+		rc = drgpu_set_level(g, l);
+		uint32_t khz = drgpu_gpu_khz(g);
+		put("level ");
+		puthex((uint32_t)l);
+		put(" rc ");
+		puthex((uint32_t)rc);
+		put(" kHz ");
+		puthex(khz);
+		put(" mem-acc ");
+		puthex(g->memacc);
+		put("\n");
+		flush();
+		if (rc || khz < want[l] - want[l] / 50 || khz > want[l] + want[l] / 50)
+			pass = 0;
+	}
+
+	step("G4 3 cap1 replay through the core");
+	const uint8_t *p = drg_cap, *end = drg_cap_end;
+	struct cobj { uint32_t id, live; uint64_t va, len, pa, h0; } objs[64];
+	for (int i = 0; i < 64; i++)
+		objs[i].live = 0;
+	int dirty = 0, executed = 0, bad = 0;
+	uint32_t compared = 0, matched = 0, gpuw = 0, gpuw_ok = 0;
+	while (p + 16 <= end && !bad) {
+		uint32_t type = cle32(p + 4), len = cle32(p + 8);
+		const uint8_t *d = p + 16;
+		if (cle32(p) != 0x43475244 || d + len > end) {
+			bad = 1;
+			break;
+		}
+		p = d + len;
+		if (type == 1) {
+			for (int i = 0; i < 64; i++)
+				if (!objs[i].live) {
+					objs[i] = (struct cobj){ cle32(d + 32), 1, 0, cle64(d + 24), 0, 0 };
+					break;
+				}
+		} else if (type == 2 || type == 3 || type == 5) {
+			uint32_t id = type == 2 ? (uint32_t)(cle64(d) >> 12) : cle32(d);
+			struct cobj *o = 0;
+			for (int i = 0; i < 64; i++)
+				if (objs[i].live && objs[i].id == id)
+					o = &objs[i];
+			if (!o)
+				continue;
+			if (type == 2 && (cle32(d + 24) & 1) && !o->pa) {
+				struct drgpu_mem m;
+				uint64_t n = (cle64(d + 16) + 0xfff) & ~0xfffULL;
+				if (c_alloc(0, n, 0x1000, &m) || drgpu_map(g, cle64(d + 8), m.pa, n, 0)) {
+					put("map failed\n");
+					bad = 1;
+					break;
+				}
+				o->pa = m.pa;
+				o->va = cle64(d + 8);
+				o->len = cle64(d + 16);
+				dirty = 1;
+			} else if (type == 3) {
+				if (o->pa)
+					drgpu_unmap(g, o->va, (o->len + 0xfff) & ~0xfffULL);
+				o->live = 0;
+				dirty = 1;
+			} else if (type == 5 && o->pa) {
+				uint32_t phase = cle32(d + 4), has = cle32(d + 12);
+				uint64_t n = cle64(d + 24), h = cle64(d + 32);
+				if (phase == 0) {
+					volatile uint8_t *dst = (volatile uint8_t *)(uintptr_t)o->pa;
+					if (has)
+						for (uint64_t i = 0; i < n; i++)
+							dst[i] = d[40 + i];
+					o->h0 = h;
+				} else {
+					uint64_t mine = fnv_mem(o->pa, n);
+					compared++;
+					gpuw += h != o->h0;
+					if (mine == h) {
+						matched++;
+						gpuw_ok += h != o->h0;
+					} else {
+						put("MISMATCH obj ");
+						puthex(o->id);
+						put("\n");
+					}
+				}
+			}
+		} else if (type == 4) {
+			const uint8_t *c = d + 4;
+			uint64_t flags = cle64(c);
+			uint32_t cmdsize = cle32(c + 16), numcmds = cle32(c + 20), ctx = cle32(c + 56), ts = cle32(c + 60);
+			if (flags & KGSL_CMDBATCH_MARKER)
+				continue;
+			if (dirty && drgpu_tlb_flush(g)) {
+				bad = 1;
+				break;
+			}
+			dirty = 0;
+			struct drgpu_ib ibs[8];
+			unsigned n = 0;
+			for (uint32_t i = 0; i < numcmds && n < 8; i++) {
+				const uint8_t *co = c + 64 + i * cmdsize;
+				if (cle32(co + 24) & KGSL_CMDLIST_IB)
+					ibs[n++] = (struct drgpu_ib){ cle64(co + 8), (uint32_t)(cle64(co + 16) >> 2) };
+			}
+			uint64_t s0 = ticks();
+			uint32_t got = drgpu_submit(g, ctx, ibs, n, ts);
+			int w = got ? drgpu_wait(g, ctx, ts, 2000000) : -1;
+			put("submit ctx ");
+			puthex(ctx);
+			put(" ts ");
+			puthex(ts);
+			put(" wait ");
+			puthex((uint32_t)w);
+			put(" us ");
+			puthex((uint32_t)((ticks() - s0) * 1000000 / freq()));
+			put(" retired ");
+			puthex(drgpu_retired(g, ctx));
+			put(" irq ");
+			puthex(drgpu_irq(g));
+			put("\n");
+			flush();
+			executed++;
+			if (w || rd(GPU_REG(A5XX_CP_HW_FAULT))) {
+				put(drgpu_err(g));
+				put("\n");
+				bad = 1;
+			}
+		}
+	}
+	lv("submits run", (uint32_t)executed);
+	lv("objects compared", compared);
+	lv("objects matching Linux", matched);
+	lv("gpu-written", gpuw);
+	lv("gpu-written matching", gpuw_ok);
+	lv("pool used", (uint32_t)core_pool_used);
+	if (bad || executed != 3 || !compared || matched != compared || !gpuw || gpuw_ok != gpuw)
+		pass = 0;
+	put(pass ? "G4 RESULT: PASS (portable core: bring-up, all levels, Nokia work identical to Linux)\n"
+		 : "G4 RESULT: FAIL (see above)\n");
+	con_str("G4", pass ? "PASS" : "FAIL");
+	flush();
+}
+
 void drg_gpu_bringup(void)
 {
 	con_skip();
 	int rc = drg_emmc_log_open();
 	con_hex2("GPU LOG", "rc=", (uint32_t)rc, "lba=", (uint32_t)drg_emmc_log_lba());
-	put("DRGGPULOG v13 G1+G2a..G2e + G3r replay of Nokia GPU work\n");
+	put("DRGGPULOG v14 G1 + G4 portable core (bring-up, levels, cap1 replay)\n");
 	lv("log open rc", (uint32_t)rc);
 	core_states();
 	g1_snapshot("G1 as ABL left it");
-	if (g2a_power()) {
-		put("G2a RESULT: FAIL (power-up step, see above)\n");
-		con_str("G2a", "FAIL power-up");
-		g1_snapshot("G1 after failure");
-		flush();
-		return;
-	}
-	g1_snapshot("G1 after power-up");
-	g2a_registers();
-	/*
-	 * run 2: the CP start reset the phone while every SMMU stream faulted.
-	 * run 5: the attach stalled its core somewhere in its first three
-	 * writes. run 6: each of those writes (and CB0, SMR, TLB sync writes)
-	 * completed on its own core. The attach now numbers every access
-	 * (attach_step), so a stall names its register; the CP only starts
-	 * after the attach reads back as written.
-	 */
-	if (g2b_smmu_attach() == 0) {
-		g2b_cp();
-		smmu_state("after cp test");
-		if (cp_ok)
-			g2d_clocks();
-		if (g2d_ok)
-			g2e_levels();
-		if (g2e_ok)
-			g3_replay();
-		smmu_state("after g2d");
-	} else {
-		put("G2b RESULT: STOP (SMMU attach not verified; CP not started)\n");
-		con_str("G2b", "STOP smmu attach");
-	}
+	g4_core();
 	put("== end\n");
 	flush();
 }
