@@ -26,6 +26,13 @@ struct drgpu_os {
 	/* zeroed, physically contiguous, aligned to `align` (a power of two >= 4 KiB) */
 	int (*alloc)(void *ctx, uint64_t size, uint64_t align, struct drgpu_mem *out);
 	void (*free)(void *ctx, struct drgpu_mem *m);
+	/*
+	 * Memory TZ takes over (the zap image and its metadata), never freed:
+	 * no cacheable CPU alias of it may exist once TZ protects it. Linux on
+	 * this phone clears its linear-map PTEs for both (HMD arm64
+	 * dma-mapping.c __dma_remap, for NO_KERNEL_MAPPING / STRONGLY_ORDERED).
+	 */
+	int (*alloc_tz)(void *ctx, uint64_t size, uint64_t align, struct drgpu_mem *out);
 	uint64_t *(*ptov)(void *ctx, uint64_t pa);	/* CPU address of memory from alloc */
 	void (*log)(void *ctx, const char *msg);	/* one line, no newline needed */
 	void (*sleep_us)(void *ctx, uint32_t us);	/* may sleep; the core busy-waits below 50 us itself */
@@ -83,9 +90,19 @@ static inline uint64_t drgpu_freq(void)
 }
 #endif
 
+/*
+ * Ticks for `us` microseconds: freq * us first (19.2 MHz * 2^32 us < 2^64);
+ * freq / 1000000 * us truncated 19.2 to 19, every wait 1% short
+ * (gpu/drgpu/test/clock_test.c on the phone: 19796 us for 20 ms).
+ */
+static inline uint64_t drgpu_us_ticks(uint32_t us)
+{
+	return drgpu_freq() * us / 1000000;
+}
+
 static inline void drgpu_udelay(uint32_t us)
 {
-	uint64_t end = drgpu_ticks() + drgpu_freq() / 1000000 * us + 1;
+	uint64_t end = drgpu_ticks() + drgpu_us_ticks(us) + 1;
 	while (drgpu_ticks() < end)
 		;
 }
@@ -96,11 +113,11 @@ static inline void drgpu_udelay(uint32_t us)
  */
 static inline int drgpu_poll(uintptr_t a, uint32_t mask, uint32_t want, uint32_t timeout_us)
 {
-	uint64_t f = drgpu_freq(), t0 = drgpu_ticks(), end = t0 + f / 1000000 * timeout_us;
+	uint64_t f = drgpu_freq(), t0 = drgpu_ticks(), end = t0 + drgpu_us_ticks(timeout_us);
 	while ((drgpu_rd(a) & mask) != want)
 		if (drgpu_ticks() > end)
 			return -1;
-	uint64_t us = f >= 1000000 ? (drgpu_ticks() - t0) / (f / 1000000) : 0;
+	uint64_t us = f ? (drgpu_ticks() - t0) * 1000000 / f : 0;
 	return us > 0x7fffffff ? 0x7fffffff : (int)us;
 }
 

@@ -32,10 +32,10 @@ index a424bf1..80ccf68 100644
  bsd/dev/unix_startup.c			standard
 diff --git a/bsd/dev/drgpu/drgpu.c b/bsd/dev/drgpu/drgpu.c
 new file mode 100755
-index 0000000..bb1d443
+index 0000000..b3d25be
 --- /dev/null
 +++ b/bsd/dev/drgpu/drgpu.c
-@@ -0,0 +1,1038 @@
+@@ -0,0 +1,1039 @@
 +/*
 + * drgpu core, see drgpu.h. Each sequence is the one the shim proved on the
 + * phone (shim/drg_gpu.c G2a-G3r, drg/gpu-research/TWRP-MEASURED.md §6b-6g),
@@ -281,6 +281,7 @@ index 0000000..bb1d443
 +	g->os.mmio = os->mmio;
 +	g->os.alloc = os->alloc;
 +	g->os.free = os->free;
++	g->os.alloc_tz = os->alloc_tz;
 +	g->os.ptov = os->ptov;
 +	g->os.log = os->log;
 +	g->os.sleep_us = os->sleep_us;
@@ -591,8 +592,8 @@ index 0000000..bb1d443
 +		return fail(g, "drgpu: zap layout is not mdt + b02");
 +	uint32_t size = ((max_r + 0xfff) & ~0xfffU) - min_r;
 +	struct drgpu_mem meta, region;
-+	if (g->os.alloc(g->os.ctx, (msz + 0xfff) & ~0xfffU, 0x1000, &meta) ||
-+	    g->os.alloc(g->os.ctx, size, 0x100000, &region))	/* pil_alloc_region: 1 MiB */
++	if (g->os.alloc_tz(g->os.ctx, (msz + 0xfff) & ~0xfffU, 0x1000, &meta) ||
++	    g->os.alloc_tz(g->os.ctx, size, 0x100000, &region))	/* pil_alloc_region: 1 MiB */
 +		return fail(g, "drgpu: zap memory");
 +	volatile uint8_t *d = meta.va;
 +	for (uint32_t i = 0; i < msz; i++)
@@ -843,7 +844,7 @@ index 0000000..bb1d443
 +
 +int drgpu_wait(struct drgpu *g, uint32_t ctx, uint32_t ts, uint32_t timeout_us)
 +{
-+	uint64_t end = drgpu_ticks() + drgpu_freq() / 1000000 * timeout_us;
++	uint64_t end = drgpu_ticks() + drgpu_us_ticks(timeout_us);
 +	while ((int32_t)(drgpu_retired(g, ctx) - ts) < 0) {	/* KGSL_TIMESTAMP_WINDOW compare */
 +		if (drgpu_ticks() > end)
 +			return -1;
@@ -1286,10 +1287,10 @@ index 0000000..f70322e
 +#endif
 diff --git a/bsd/dev/drgpu/drgpu_os.h b/bsd/dev/drgpu/drgpu_os.h
 new file mode 100755
-index 0000000..cab06bf
+index 0000000..bd8e1d6
 --- /dev/null
 +++ b/bsd/dev/drgpu/drgpu_os.h
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,124 @@
 +/*
 + * drgpu: what the portable GPU core needs from its OS (shim or XNU), and
 + * the register accessors every MMIO access goes through.
@@ -1318,6 +1319,13 @@ index 0000000..cab06bf
 +	/* zeroed, physically contiguous, aligned to `align` (a power of two >= 4 KiB) */
 +	int (*alloc)(void *ctx, uint64_t size, uint64_t align, struct drgpu_mem *out);
 +	void (*free)(void *ctx, struct drgpu_mem *m);
++	/*
++	 * Memory TZ takes over (the zap image and its metadata), never freed:
++	 * no cacheable CPU alias of it may exist once TZ protects it. Linux on
++	 * this phone clears its linear-map PTEs for both (HMD arm64
++	 * dma-mapping.c __dma_remap, for NO_KERNEL_MAPPING / STRONGLY_ORDERED).
++	 */
++	int (*alloc_tz)(void *ctx, uint64_t size, uint64_t align, struct drgpu_mem *out);
 +	uint64_t *(*ptov)(void *ctx, uint64_t pa);	/* CPU address of memory from alloc */
 +	void (*log)(void *ctx, const char *msg);	/* one line, no newline needed */
 +	void (*sleep_us)(void *ctx, uint32_t us);	/* may sleep; the core busy-waits below 50 us itself */
@@ -1375,9 +1383,19 @@ index 0000000..cab06bf
 +}
 +#endif
 +
++/*
++ * Ticks for `us` microseconds: freq * us first (19.2 MHz * 2^32 us < 2^64);
++ * freq / 1000000 * us truncated 19.2 to 19, every wait 1% short
++ * (gpu/drgpu/test/clock_test.c on the phone: 19796 us for 20 ms).
++ */
++static inline uint64_t drgpu_us_ticks(uint32_t us)
++{
++	return drgpu_freq() * us / 1000000;
++}
++
 +static inline void drgpu_udelay(uint32_t us)
 +{
-+	uint64_t end = drgpu_ticks() + drgpu_freq() / 1000000 * us + 1;
++	uint64_t end = drgpu_ticks() + drgpu_us_ticks(us) + 1;
 +	while (drgpu_ticks() < end)
 +		;
 +}
@@ -1388,11 +1406,11 @@ index 0000000..cab06bf
 + */
 +static inline int drgpu_poll(uintptr_t a, uint32_t mask, uint32_t want, uint32_t timeout_us)
 +{
-+	uint64_t f = drgpu_freq(), t0 = drgpu_ticks(), end = t0 + f / 1000000 * timeout_us;
++	uint64_t f = drgpu_freq(), t0 = drgpu_ticks(), end = t0 + drgpu_us_ticks(timeout_us);
 +	while ((drgpu_rd(a) & mask) != want)
 +		if (drgpu_ticks() > end)
 +			return -1;
-+	uint64_t us = f >= 1000000 ? (drgpu_ticks() - t0) / (f / 1000000) : 0;
++	uint64_t us = f ? (drgpu_ticks() - t0) * 1000000 / f : 0;
 +	return us > 0x7fffffff ? 0x7fffffff : (int)us;
 +}
 +
@@ -2020,10 +2038,10 @@ index 0000000..f24ec61
 +#endif
 diff --git a/iokit/Kernel/arm/DrgGPU.cpp b/iokit/Kernel/arm/DrgGPU.cpp
 new file mode 100755
-index 0000000..6cb3170
+index 0000000..329afb7
 --- /dev/null
 +++ b/iokit/Kernel/arm/DrgGPU.cpp
-@@ -0,0 +1,1554 @@
+@@ -0,0 +1,1605 @@
 +/*
 + * DRG (Nokia 6.1 Plus) GPU: the Adreno 512 for iOS userland.
 + *
@@ -2091,7 +2109,19 @@ index 0000000..6cb3170
 +#define DRG_GPU_POOL_CHUNK      (2u << 20)
 +#define DRG_GPU_POOL_CHUNKS     8
 +#define DRG_GPU_POOL_PAGES      (DRG_GPU_POOL_CHUNK / 0x1000)
-+#define DRG_GPU_BIG_ALLOCS      4               /* zap image region and meta */
++#define DRG_GPU_BIG_ALLOCS      4               /* allocations above a pool chunk or 16 KiB alignment */
++/*
++ * Memory TZ takes (zap image + metadata, osAllocTz): a low-bank window XNU
++ * never maps (its RAM starts at 0xae000000, tools/mkadt.py), so no cacheable
++ * alias of XPU-protected pages exists, as Linux ensures by clearing their
++ * linear-map PTEs. Plain RAM (TWRP /proc/iomem 80000000-855fffff System RAM),
++ * above the eMMC DMA window 0x84800000+2 MiB and the payload (0x83400000,
++ * boot #8), below wlan_msa_guard@85600000 (fdt.dts). Shim G2c: TZ took a zap
++ * region at 0x80100000 and metadata at 0x801b8000 from this bank.
++ */
++#define DRG_GPU_TZ_WINDOW       0x84a00000ull
++#define DRG_GPU_TZ_WINDOW_SIZE  0x200000ull
++#define DRG_GPU_TZ_MAPS         4
 +#define DRG_GPU_PA_MASK         0x0000000fffffffffull   /* SMMU oas 36 */
 +#define DRG_GPU_KCTX            (DRGPU_MS_RB - 1)       /* the kernel's own context */
 +#define DRG_GPU_DEFAULT_LEVEL   2               /* 266 MHz, Linux default_pwrlevel */
@@ -2164,6 +2194,8 @@ index 0000000..6cb3170
 +	uintptr_t            fGicd;
 +	struct drg_gpu_chunk fPool[DRG_GPU_POOL_CHUNKS];
 +	struct drg_gpu_big   fBig[DRG_GPU_BIG_ALLOCS];
++	IOMemoryMap         *fTzMap[DRG_GPU_TZ_MAPS];   /* released once TZ owns the memory */
++	uint64_t             fTzUsed;
 +	struct drg_gpu_ctx   fCtx[DRGPU_MS_RB];
 +	int                  fLevel;
 +	bool                 fDcvs;
@@ -2188,6 +2220,7 @@ index 0000000..6cb3170
 +	uintptr_t osMmio(uint64_t pa, uint64_t len);
 +	int osAlloc(uint64_t size, uint64_t align, struct drgpu_mem *out);
 +	void osFree(struct drgpu_mem *m);
++	int osAllocTz(uint64_t size, uint64_t align, struct drgpu_mem *out);
 +	uint64_t *osPtov(uint64_t pa);
 +
 +private:
@@ -2380,6 +2413,12 @@ index 0000000..6cb3170
 +	static_cast<DrgGPU *>(ctx)->osFree(m);
 +}
 +
++static int
++drg_gpu_os_alloc_tz(void *ctx, uint64_t size, uint64_t align, struct drgpu_mem *out)
++{
++	return static_cast<DrgGPU *>(ctx)->osAllocTz(size, align, out);
++}
++
 +static uint64_t *
 +drg_gpu_os_ptov(void *ctx, uint64_t pa)
 +{
@@ -2486,6 +2525,37 @@ index 0000000..6cb3170
 +		return 0;
 +	}
 +	return -1;
++}
++
++/* Zeroed, from DRG_GPU_TZ_WINDOW, written write-combined; never freed (osFree ignores it). */
++int
++DrgGPU::osAllocTz(uint64_t size, uint64_t align, struct drgpu_mem *out)
++{
++	if (size == 0 || align < 0x1000 || (align & (align - 1)) != 0) {
++		return -1;
++	}
++	size = (size + 0xfff) & ~0xfffull;
++	uint64_t pa = (DRG_GPU_TZ_WINDOW + fTzUsed + align - 1) & ~(align - 1);
++	unsigned slot = 0;
++	while (slot < DRG_GPU_TZ_MAPS && fTzMap[slot] != NULL) {
++		slot++;
++	}
++	if (pa + size > DRG_GPU_TZ_WINDOW + DRG_GPU_TZ_WINDOW_SIZE || slot == DRG_GPU_TZ_MAPS) {
++		return -1;
++	}
++	IOMemoryDescriptor *phys = IOMemoryDescriptor::withPhysicalAddress(pa, size, kIODirectionInOut);
++	IOMemoryMap *map = phys != NULL ? phys->map(kIOMapWriteCombineCache) : NULL;
++	OSSafeReleaseNULL(phys);
++	if (map == NULL) {
++		return -1;
++	}
++	fTzMap[slot] = map;
++	fTzUsed = pa + size - DRG_GPU_TZ_WINDOW;
++	out->pa = pa;
++	out->va = (void *)(uintptr_t)map->getVirtualAddress();
++	out->size = size;
++	bzero(out->va, size);
++	return 0;
 +}
 +
 +void
@@ -2760,6 +2830,7 @@ index 0000000..6cb3170
 +	os.mmio = drg_gpu_os_mmio;
 +	os.alloc = drg_gpu_os_alloc;
 +	os.free = drg_gpu_os_free;
++	os.alloc_tz = drg_gpu_os_alloc_tz;
 +	os.ptov = drg_gpu_os_ptov;
 +	os.log = drg_gpu_os_log;
 +	os.sleep_us = drg_gpu_os_sleep;
@@ -2776,11 +2847,9 @@ index 0000000..6cb3170
 +	fCtx[DRG_GPU_KCTX].submitted = true;    /* reserved: never handed out */
 +	IOLockLock(fLock);
 +	bool up = bringUp();
-+	if (up && fG.zap_loaded) {
-+		/* the zap region now belongs to TZ: no CPU mapping of it stays (its pages stay ours) */
-+		for (unsigned b = 0; b < DRG_GPU_BIG_ALLOCS; b++) {
-+			OSSafeReleaseNULL(fBig[b].map);
-+		}
++	/* the zap is loaded once per boot (zap_load): TZ owns the window now, no CPU mapping of it stays */
++	for (unsigned i = 0; i < DRG_GPU_TZ_MAPS; i++) {
++		OSSafeReleaseNULL(fTzMap[i]);
 +	}
 +	IOLockUnlock(fLock);
 +	if (!up) {

@@ -243,6 +243,7 @@ int drgpu_init(struct drgpu *g, const struct drgpu_os *os, const struct drgpu_fw
 	g->os.mmio = os->mmio;
 	g->os.alloc = os->alloc;
 	g->os.free = os->free;
+	g->os.alloc_tz = os->alloc_tz;
 	g->os.ptov = os->ptov;
 	g->os.log = os->log;
 	g->os.sleep_us = os->sleep_us;
@@ -553,8 +554,8 @@ static int zap_load(struct drgpu *g)
 		return fail(g, "drgpu: zap layout is not mdt + b02");
 	uint32_t size = ((max_r + 0xfff) & ~0xfffU) - min_r;
 	struct drgpu_mem meta, region;
-	if (g->os.alloc(g->os.ctx, (msz + 0xfff) & ~0xfffU, 0x1000, &meta) ||
-	    g->os.alloc(g->os.ctx, size, 0x100000, &region))	/* pil_alloc_region: 1 MiB */
+	if (g->os.alloc_tz(g->os.ctx, (msz + 0xfff) & ~0xfffU, 0x1000, &meta) ||
+	    g->os.alloc_tz(g->os.ctx, size, 0x100000, &region))	/* pil_alloc_region: 1 MiB */
 		return fail(g, "drgpu: zap memory");
 	volatile uint8_t *d = meta.va;
 	for (uint32_t i = 0; i < msz; i++)
@@ -805,7 +806,7 @@ uint32_t drgpu_retired(struct drgpu *g, uint32_t ctx)
 
 int drgpu_wait(struct drgpu *g, uint32_t ctx, uint32_t ts, uint32_t timeout_us)
 {
-	uint64_t end = drgpu_ticks() + drgpu_freq() / 1000000 * timeout_us;
+	uint64_t end = drgpu_ticks() + drgpu_us_ticks(timeout_us);
 	while ((int32_t)(drgpu_retired(g, ctx) - ts) < 0) {	/* KGSL_TIMESTAMP_WINDOW compare */
 		if (drgpu_ticks() > end)
 			return -1;

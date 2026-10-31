@@ -65,7 +65,19 @@ vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);   /* as drg_ts.c, 
 #define DRG_GPU_POOL_CHUNK      (2u << 20)
 #define DRG_GPU_POOL_CHUNKS     8
 #define DRG_GPU_POOL_PAGES      (DRG_GPU_POOL_CHUNK / 0x1000)
-#define DRG_GPU_BIG_ALLOCS      4               /* zap image region and meta */
+#define DRG_GPU_BIG_ALLOCS      4               /* allocations above a pool chunk or 16 KiB alignment */
+/*
+ * Memory TZ takes (zap image + metadata, osAllocTz): a low-bank window XNU
+ * never maps (its RAM starts at 0xae000000, tools/mkadt.py), so no cacheable
+ * alias of XPU-protected pages exists, as Linux ensures by clearing their
+ * linear-map PTEs. Plain RAM (TWRP /proc/iomem 80000000-855fffff System RAM),
+ * above the eMMC DMA window 0x84800000+2 MiB and the payload (0x83400000,
+ * boot #8), below wlan_msa_guard@85600000 (fdt.dts). Shim G2c: TZ took a zap
+ * region at 0x80100000 and metadata at 0x801b8000 from this bank.
+ */
+#define DRG_GPU_TZ_WINDOW       0x84a00000ull
+#define DRG_GPU_TZ_WINDOW_SIZE  0x200000ull
+#define DRG_GPU_TZ_MAPS         4
 #define DRG_GPU_PA_MASK         0x0000000fffffffffull   /* SMMU oas 36 */
 #define DRG_GPU_KCTX            (DRGPU_MS_RB - 1)       /* the kernel's own context */
 #define DRG_GPU_DEFAULT_LEVEL   2               /* 266 MHz, Linux default_pwrlevel */
@@ -138,6 +150,8 @@ private:
 	uintptr_t            fGicd;
 	struct drg_gpu_chunk fPool[DRG_GPU_POOL_CHUNKS];
 	struct drg_gpu_big   fBig[DRG_GPU_BIG_ALLOCS];
+	IOMemoryMap         *fTzMap[DRG_GPU_TZ_MAPS];   /* released once TZ owns the memory */
+	uint64_t             fTzUsed;
 	struct drg_gpu_ctx   fCtx[DRGPU_MS_RB];
 	int                  fLevel;
 	bool                 fDcvs;
@@ -162,6 +176,7 @@ public:
 	uintptr_t osMmio(uint64_t pa, uint64_t len);
 	int osAlloc(uint64_t size, uint64_t align, struct drgpu_mem *out);
 	void osFree(struct drgpu_mem *m);
+	int osAllocTz(uint64_t size, uint64_t align, struct drgpu_mem *out);
 	uint64_t *osPtov(uint64_t pa);
 
 private:
@@ -354,6 +369,12 @@ drg_gpu_os_free(void *ctx, struct drgpu_mem *m)
 	static_cast<DrgGPU *>(ctx)->osFree(m);
 }
 
+static int
+drg_gpu_os_alloc_tz(void *ctx, uint64_t size, uint64_t align, struct drgpu_mem *out)
+{
+	return static_cast<DrgGPU *>(ctx)->osAllocTz(size, align, out);
+}
+
 static uint64_t *
 drg_gpu_os_ptov(void *ctx, uint64_t pa)
 {
@@ -460,6 +481,37 @@ DrgGPU::osAlloc(uint64_t size, uint64_t align, struct drgpu_mem *out)
 		return 0;
 	}
 	return -1;
+}
+
+/* Zeroed, from DRG_GPU_TZ_WINDOW, written write-combined; never freed (osFree ignores it). */
+int
+DrgGPU::osAllocTz(uint64_t size, uint64_t align, struct drgpu_mem *out)
+{
+	if (size == 0 || align < 0x1000 || (align & (align - 1)) != 0) {
+		return -1;
+	}
+	size = (size + 0xfff) & ~0xfffull;
+	uint64_t pa = (DRG_GPU_TZ_WINDOW + fTzUsed + align - 1) & ~(align - 1);
+	unsigned slot = 0;
+	while (slot < DRG_GPU_TZ_MAPS && fTzMap[slot] != NULL) {
+		slot++;
+	}
+	if (pa + size > DRG_GPU_TZ_WINDOW + DRG_GPU_TZ_WINDOW_SIZE || slot == DRG_GPU_TZ_MAPS) {
+		return -1;
+	}
+	IOMemoryDescriptor *phys = IOMemoryDescriptor::withPhysicalAddress(pa, size, kIODirectionInOut);
+	IOMemoryMap *map = phys != NULL ? phys->map(kIOMapWriteCombineCache) : NULL;
+	OSSafeReleaseNULL(phys);
+	if (map == NULL) {
+		return -1;
+	}
+	fTzMap[slot] = map;
+	fTzUsed = pa + size - DRG_GPU_TZ_WINDOW;
+	out->pa = pa;
+	out->va = (void *)(uintptr_t)map->getVirtualAddress();
+	out->size = size;
+	bzero(out->va, size);
+	return 0;
 }
 
 void
@@ -734,6 +786,7 @@ DrgGPU::start(IOService *provider)
 	os.mmio = drg_gpu_os_mmio;
 	os.alloc = drg_gpu_os_alloc;
 	os.free = drg_gpu_os_free;
+	os.alloc_tz = drg_gpu_os_alloc_tz;
 	os.ptov = drg_gpu_os_ptov;
 	os.log = drg_gpu_os_log;
 	os.sleep_us = drg_gpu_os_sleep;
@@ -750,11 +803,9 @@ DrgGPU::start(IOService *provider)
 	fCtx[DRG_GPU_KCTX].submitted = true;    /* reserved: never handed out */
 	IOLockLock(fLock);
 	bool up = bringUp();
-	if (up && fG.zap_loaded) {
-		/* the zap region now belongs to TZ: no CPU mapping of it stays (its pages stay ours) */
-		for (unsigned b = 0; b < DRG_GPU_BIG_ALLOCS; b++) {
-			OSSafeReleaseNULL(fBig[b].map);
-		}
+	/* the zap is loaded once per boot (zap_load): TZ owns the window now, no CPU mapping of it stays */
+	for (unsigned i = 0; i < DRG_GPU_TZ_MAPS; i++) {
+		OSSafeReleaseNULL(fTzMap[i]);
 	}
 	IOLockUnlock(fLock);
 	if (!up) {

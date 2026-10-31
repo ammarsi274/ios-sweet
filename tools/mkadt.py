@@ -60,6 +60,7 @@ DRG_GOLD_MPIDRS = (0x100, 0x101, 0x102, 0x103)
 # eMMC host (sdhci@c0c4000 hc_mem / cmdq_mem) and the low-bank DMA range, see the drg-emmc node
 DRG_EMMC_HC, DRG_EMMC_CQ = 0x0c0c4000, 0x0c0c5000
 DRG_EMMC_DMA, DRG_EMMC_DMA_SIZE = 0x84800000, 0x200000
+# Taken next in the low bank: 0x84a00000+2 MiB, DrgGPU's zap window (DRG_GPU_TZ_WINDOW in DrgGPU.cpp)
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 

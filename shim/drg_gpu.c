@@ -2050,6 +2050,7 @@ static void g4_core(void)
 	os.mmio = c_mmio;
 	os.alloc = c_alloc;
 	os.free = c_free;
+	os.alloc_tz = c_alloc;	/* as before: the shim never maps its zap memory again */
 	os.ptov = c_ptov;
 	os.log = c_log;
 	os.sleep_us = c_sleep;
