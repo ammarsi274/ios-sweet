@@ -910,9 +910,17 @@ int drgpu_set_level(struct drgpu *g, int lvl)
  * Idle power-off, Linux's slumber on this phone (ftrace 30.3119-30.3124):
  * interrupt mask 0, VBIF halt and drain (XIN_HALT_CTRL0 0xf, wait for
  * CTRL1, 0), bus vote down to the non-GPU APPS aggregate, rbcpr /
- * rbbmtimer / gfx3d branches off, PLL off, MX vote vlvl 16 and swen 0,
- * gpu_bimc_gfx off, GX GDSC collapse with the IO clamp (gdsc_disable with
- * force-root). CX stays on: the SMMU in it keeps its configuration.
+ * rbbmtimer / gfx3d branches off, PLL off, gpu_bimc_gfx off, GX GDSC
+ * collapse with the IO clamp (gdsc_disable with force-root). CX stays on:
+ * the SMMU in it keeps its configuration.
+ *
+ * The MX vote stays. Linux drops only the GPU's share of rwmx: its
+ * rpm-smd-regulator sums every consumer of the rail (the display among
+ * them) before it sends, and the trace shows the send, not the sum. Here
+ * drgpu is APPS's only RPM client, so a lower vote is APPS's whole request:
+ * boot #32 sent vlvl 16 / swen 0 on the first idle collapse and the panel
+ * stopped at the boot logo while iOS kept running. A vote never lowers a
+ * rail below what ABL left (MX 852 mV = level 192 at boot, measured).
  */
 #define RBBM_INT_0_MASK		0x38
 #define VBIF_XIN_HALT_CTRL0	0x3080
@@ -940,8 +948,6 @@ int drgpu_power_off(struct drgpu *g)
 	drgpu_wr(GFX3D_CBCR(g), drgpu_rd(GFX3D_CBCR(g)) & ~1U);
 	if (g->pll >= 0)
 		pll_off(g, (unsigned)g->pll);
-	if (g->level >= 0 && drgpu_rpm_kvp2(g, RPM_RES_RWMX, 0, RPM_KEY_VLVL, 16, RPM_KEY_SWEN, 0))
-		return fail(g, "drgpu: rpm mx vote off");
 	if (set_cx(g, 128))
 		return -1;
 	drgpu_wr(GCC_GPU_BIMC_GFX(g), drgpu_rd(GCC_GPU_BIMC_GFX(g)) & ~1U);

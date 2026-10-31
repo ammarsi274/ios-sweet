@@ -243,12 +243,22 @@ void *host_read_file(const char *path, size_t *size)
 void *host_map(size_t len, int prot)
 {
 	void *p = mmap(0, len, prot, D_MAP_PRIVATE | D_MAP_ANON | D_MAP_JIT, -1, 0);
+	if (p != (void *)-1)
+		return p;
+	int jit_err = *__error();
+	p = mmap(0, len, prot, D_MAP_PRIVATE | D_MAP_ANON, -1, 0);
+	int err = p == (void *)-1 ? *__error() : 0;
+	host_log("drgles: mmap %zu bytes prot %d: MAP_JIT errno %d, plain mapping %s (errno %d)\n", len, prot,
+		 jit_err, p == (void *)-1 ? "failed" : "used", err);
 	return p == (void *)-1 ? 0 : p;
 }
 
 int host_protect(void *addr, size_t len, int prot)
 {
-	return mprotect(addr, len, prot) ? -1 : 0;
+	if (!mprotect(addr, len, prot))
+		return 0;
+	host_log("drgles: mprotect %p %zu prot %d: errno %d\n", addr, len, prot, *__error());
+	return -1;
 }
 
 void host_unmap(void *addr, size_t len)
