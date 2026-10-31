@@ -619,6 +619,7 @@ static int main_(int argc, char **argv, char **envp)
 	static const char *dirs[8] = { "/tmp/adreno" };
 	int nd = 0;
 	for (int i = 1; i < argc && nd < 7; i++) {
+#ifndef __APPLE__	/* both need TWRP's own libraries */
 		if (!strcmp(argv[i], "-stage1")) {
 			stage = 1;
 			continue;
@@ -627,6 +628,7 @@ static int main_(int argc, char **argv, char **envp)
 			nokia_gralloc = 1;
 			continue;
 		}
+#endif
 		if (!strcmp(argv[i], "-capture") && i + 1 < argc) {
 			int rc = kgsl_capture_start(argv[++i]);
 			host_log("capture to %s: %d\n", argv[i], rc);
@@ -639,8 +641,10 @@ static int main_(int argc, char **argv, char **envp)
 		bionic_bench_hook = bench_hook;
 	static const char *const sys[] = { "libc.so", "libm.so", "libdl.so", "liblog.so", "libcutils.so", "libutils.so",
 					   "libz.so", "libc++.so", "libhardware.so", "libsync.so", 0 };
+#ifndef __APPLE__	/* iOS: stage 2 only, nothing to forward to */
 	for (int i = 0; host_names[i]; i++)
 		host_libs[i] = dlopen(host_names[i], RTLD_NOW);
+#endif
 	struct drg_elf_config c = { dirs, sys, resolver, 0, 1 };
 	drg_elf_setup(&c);
 	int fails = run();
@@ -665,6 +669,13 @@ static int main_(int argc, char **argv, char **envp)
 	return fails ? 1 : 0;
 }
 
+#ifdef __APPLE__
+/* iOS: dyld and libSystem start the process */
+int main(int argc, char **argv, char **envp)
+{
+	return main_(argc, argv, envp);
+}
+#else
 __attribute__((used)) static void start_c(void *raw_args)
 {
 	static void *structors[6];
@@ -672,3 +683,4 @@ __attribute__((used)) static void start_c(void *raw_args)
 }
 __asm__(".text\n.globl _start\n.type _start,%function\n_start:\n"
 	"mov x29, #0\nmov x30, #0\nmov x0, sp\nb start_c\n");
+#endif
