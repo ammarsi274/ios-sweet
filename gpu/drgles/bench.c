@@ -629,6 +629,14 @@ static int main_(int argc, char **argv, char **envp)
 			continue;
 		}
 #endif
+		if (!strcmp(argv[i], "-delay") && i + 1 < argc) {	/* seconds before touching the GPU (boot #37) */
+			int s = 0;
+			for (const char *p = argv[++i]; *p >= '0' && *p <= '9'; p++)
+				s = s * 10 + (*p - '0');
+			host_log("delay %d s\n", s);
+			host_sleep_ns((int64_t)s * 1000000000);
+			continue;
+		}
 		if (!strcmp(argv[i], "-capture") && i + 1 < argc) {
 			int rc = kgsl_capture_start(argv[++i]);
 			host_log("capture to %s: %d\n", argv[i], rc);

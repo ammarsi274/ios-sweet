@@ -3,7 +3,7 @@
  * (drg/gpu-research/vendor-adreno trace kgsl-trace-2/-1-bytes) against a
  * mock of XNU's DrgGPU user client that checks every selector and argument
  * and behaves as DrgGPU.cpp does (objects at task addresses, 16 KiB pages).
- *   gcc -O1 -Wall -Wextra -I.. -o /tmp/kt kgsl_ios_test.c ../kgsl_ios.c && /tmp/kt
+ *   gcc -O1 -Wall -Wextra -I.. -o /tmp/kt kgsl_ios_test.c ../kgsl_ios.c ../kgsl_cap.c && /tmp/kt
  */
 #include <stdarg.h>
 #include <stdio.h>
@@ -23,6 +23,7 @@ int host_close(int fd) { CHECK(fd == 7); closed++; return 0; }
 void *host_alloc(size_t n) { return calloc(1, n); }
 void host_sleep_ns(int64_t ns) { (void)ns; }
 void host_free(void *p) { free(p); }
+long host_write(int fd, const void *b, size_t n) { (void)fd; (void)b; CHECK(0); return (long)n; }	/* no capture here */
 void host_log(const char *fmt, ...) { va_list ap; va_start(ap, fmt); printf("  log: "); vprintf(fmt, ap); va_end(ap); }
 
 /* ---- mock DrgGPU ---- */

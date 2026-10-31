@@ -324,7 +324,7 @@ static long gpu_command(struct kdev *d, struct gpu_command *c)
 	return 0;
 }
 
-long kgsl_ioctl(int fd, unsigned long req, void *arg)
+static long ioctl_(int fd, unsigned long req, void *arg)
 {
 	struct kdev *d = dev_of(fd);
 	int i;
@@ -379,7 +379,23 @@ long kgsl_ioctl(int fd, unsigned long req, void *arg)
 	}
 }
 
-void *kgsl_mmap(void *addr, size_t len, int prot, int flags, int fd, long off, int *err)
+long kgsl_ioctl(int fd, unsigned long req, void *arg)
+{
+	kgsl_cap_before(fd, req, arg);
+	long rc = ioctl_(fd, req, arg);
+	kgsl_cap_after(fd, req, arg, rc);
+	return rc;
+}
+
+/* kgsl_cap.c: wait for a captured submit (DrgGPU WAIT, timeout in ms) */
+long kgsl_cap_wait(int fd, uint32_t ctx, uint32_t ts, uint32_t timeout_ms)
+{
+	struct kdev *d = dev_of(fd);
+	uint64_t in[3] = { ctx, ts, timeout_ms };
+	return d ? call(d, DRGPU_UC_WAIT, in, 3, 0, 0, 0, 0, 0, 0) : -E_INVAL;
+}
+
+static void *mmap_(void *addr, size_t len, int prot, int flags, int fd, long off, int *err)
 {
 	struct kdev *d = dev_of(fd);
 	*err = E_INVAL;
@@ -409,6 +425,13 @@ void *kgsl_mmap(void *addr, size_t len, int prot, int flags, int fd, long off, i
 	return (void *)(uintptr_t)o->va;	/* USE_CPU_MAP: the CPU address is the GPU address */
 }
 
+void *kgsl_mmap(void *addr, size_t len, int prot, int flags, int fd, long off, int *err)
+{
+	void *p = mmap_(addr, len, prot, flags, fd, off, err);
+	kgsl_cap_mmap(p, len, prot, flags, off);
+	return p;
+}
+
 int kgsl_munmap(void *addr, size_t len)
 {
 	uint64_t a = (uintptr_t)addr;
@@ -436,8 +459,3 @@ void kgsl_report(void)
 		host_log("kgsl ioctl %08lx x%u\n", seen_req[i], seen_count[i]);
 }
 
-int kgsl_capture_start(const char *path)
-{
-	(void)path;
-	return -E_NOSYS;	/* capture is a bench (TWRP) feature */
-}

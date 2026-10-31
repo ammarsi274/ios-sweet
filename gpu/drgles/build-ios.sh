@@ -14,7 +14,7 @@ OBJ=$OUT/obj
 rm -rf "$OBJ"
 mkdir -p "$OBJ"
 CC="clang-21 --target=arm64-apple-ios16.0 -O2 -g -ffreestanding -fno-stack-protector -Wall -Wextra -Werror -Wno-unused-parameter"
-for f in bench.c elf.c host_darwin.c kgsl_ios.c bionic/*.c bionic/vararg.S; do
+for f in bench.c elf.c host_darwin.c kgsl_ios.c kgsl_cap.c bionic/*.c bionic/vararg.S; do
 	$CC -c "$SRC/$f" -o "$OBJ/$(echo "$f" | tr / _).o"
 done
 

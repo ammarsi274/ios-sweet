@@ -20,7 +20,10 @@ LABEL = 'com.drg.gpubench'
 KEY = '/System/Library/LaunchDaemons/' + LABEL + '.plist'
 JOB = {
     'Label': LABEL,
-    'ProgramArguments': ['/usr/local/bin/drgles-bench', '/usr/local/drgles/adreno'],
+    # -delay: SpringBoard starts unaffected (boot #37 tells whether the bench kept the lock screen away);
+    # -capture: the GPU work, compared with the TWRP run by gpu/drgles/tools/cap-diff.py
+    'ProgramArguments': ['/usr/local/bin/drgles-bench', '-delay', '240', '-capture', '/private/var/log/drgles-cap.bin',
+                         '/usr/local/drgles/adreno'],
     'RunAtLoad': True,
     'LaunchOnlyOnce': True,
     'KeepAlive': False,

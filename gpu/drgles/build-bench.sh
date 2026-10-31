@@ -14,7 +14,7 @@ CC="clang-21 --target=aarch64-linux-android29 -O2 -g -fPIC -fno-stack-protector 
 $CC -pie -Wl,--dynamic-linker=/sbin/linker64 -Wl,-z,max-page-size=4096 -Wl,--hash-style=both \
 	-Wl,--export-dynamic-symbol=atrace_get_enabled_tags \
 	-Wl,-z,noexecstack -Wl,-e,_start -o "$OUT/drgles-bench" \
-	"$SRC/bench.c" "$SRC/elf.c" "$SRC/host_linux.c" "$SRC/kgsl_bench.c" \
+	"$SRC/bench.c" "$SRC/elf.c" "$SRC/host_linux.c" "$SRC/kgsl_bench.c" "$SRC/kgsl_cap.c" \
 	"$SRC"/bionic/*.c "$SRC/bionic/vararg.S" \
 	"$SYS/libc.so" "$SYS/libdl.so" "$SYS/libm.so" "$SYS/libz.so"
 llvm-readelf -d "$OUT/drgles-bench" | grep NEEDED

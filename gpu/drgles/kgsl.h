@@ -22,5 +22,10 @@ int kgsl_munmap(void *addr, size_t len);	/* 1 if it was ours */
 int kgsl_close(int fd);			/* 1 if it was ours */
 void kgsl_report(void);
 int kgsl_capture_start(const char *path);	/* bench: record GPU work for replay (0 or -errno) */
+/* kgsl_cap.c, called by each platform's layer around every ioctl and mmap */
+void kgsl_cap_before(int fd, unsigned long req, void *arg);
+void kgsl_cap_after(int fd, unsigned long req, void *arg, long rc);
+void kgsl_cap_mmap(void *p, size_t len, int prot, int flags, long off);
+long kgsl_cap_wait(int fd, uint32_t ctx, uint32_t ts, uint32_t timeout_ms);	/* the platform's: 0 or -errno */
 
 #endif
