@@ -173,6 +173,25 @@ static uint32_t pkt7(uint32_t op, uint32_t cnt)	/* cp_type7_packet() */
 	       ((0x9669 >> (p2 & 15)) & 1) << 23;
 }
 
+/*
+ * A branch that does not start: name, CBCR before the enable and after the
+ * wait (bit 31 CLK_OFF). Boot #34 (XNU, 32 s after boot) failed in the
+ * first group while the shim right after ABL never did: ABL leaves
+ * gpu_cfg_ahb and gpu_bimc_gfx running and bimc_gfx off (shim G1).
+ * Voted branches (gcc-sdm660.c BRANCH_VOTED) may take longer than a plain
+ * one, so the wait is 20 ms here.
+ */
+static int branch_on_named(struct drgpu *g, uintptr_t cbcr, const char *name)
+{
+	uint32_t before = drgpu_rd(cbcr);
+	drgpu_wr(cbcr, before | 1);
+	if (drgpu_poll(cbcr, CBCR_CLK_OFF, 0, 20000) >= 0)
+		return 0;
+	logx(g, name, before);
+	logx(g, "drgpu:   ... CBCR after 20 ms", drgpu_rd(cbcr));
+	return -1;
+}
+
 static int branch_on(uintptr_t cbcr)
 {
 	drgpu_wr(cbcr, drgpu_rd(cbcr) | 1);
@@ -282,8 +301,11 @@ static int gfx3d_to_xo(struct drgpu *g)
 /* ---- power (G2a: gdsc-regulator.c gdsc_enable, msm_gfx_ldo.c enable_bhs_mode) ---- */
 int drgpu_power_on(struct drgpu *g)
 {
-	if (branch_on(GCC_GPU_CFG_AHB(g)) || branch_on(GCC_BIMC_GFX(g)) || branch_on(GCC_GPU_BIMC_GFX(g)) ||
-	    branch_on(CXO_CBCR(g)))
+	int b1 = branch_on_named(g, GCC_GPU_CFG_AHB(g), "drgpu: gcc_gpu_cfg_ahb did not start, CBCR before");
+	int b2 = branch_on_named(g, GCC_BIMC_GFX(g), "drgpu: gcc_bimc_gfx did not start, CBCR before");
+	int b3 = branch_on_named(g, GCC_GPU_BIMC_GFX(g), "drgpu: gcc_gpu_bimc_gfx did not start, CBCR before");
+	int b4 = branch_on_named(g, CXO_CBCR(g), "drgpu: gpucc_cxo did not start, CBCR before");
+	if (b1 || b2 || b3 || b4)	/* every one tried and reported, then fail */
 		return fail(g, "drgpu: gcc/cxo branch did not start");
 	if (drgpu_rd(GDSC_CX(g)) & GDSC_HW_CONTROL)
 		return fail(g, "drgpu: cx gdsc under hw control");

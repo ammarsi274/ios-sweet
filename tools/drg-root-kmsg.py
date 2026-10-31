@@ -26,6 +26,25 @@ JOB = {
 }
 
 
+JETSAM = 'System/Library/LaunchDaemons/com.apple.jetsamproperties.D22.plist'
+
+
+def jetsam(root, label, limits):
+    """Daemon memory limits (MB, -1 = none) in the iPhone X (D22) jetsam file
+    launchd reads; without an entry a daemon gets 6 MB (boot #34: the bench
+    was killed with "exceeded mem limit: InactiveHard 6 MB")."""
+    path = os.path.join(root, JETSAM)
+    st = os.stat(path)
+    with open(path, 'rb') as f:
+        props = plistlib.load(f)
+    props['Version4']['Daemon']['Override'][label] = limits
+    with open(path, 'wb') as f:
+        plistlib.dump(props, f, fmt=plistlib.FMT_BINARY)
+    os.chown(path, st.st_uid, st.st_gid)
+    os.chmod(path, st.st_mode & 0o7777)
+    print(f'jetsam {label}: {limits}')
+
+
 def main():
     if len(sys.argv) != 3:
         sys.exit(__doc__)
@@ -50,6 +69,7 @@ def main():
     os.chown(job, 0, 0)
     os.chmod(job, 0o644)
     print(f'drg-kmsg + job {LABEL} ({len(plist["LaunchDaemons"])} jobs in launchd.plist)')
+    jetsam(root, LABEL, {'JetsamPriority': 180, 'ActiveSoftMemoryLimit': 16, 'InactiveHardMemoryLimit': 16})
 
 
 if __name__ == '__main__':
