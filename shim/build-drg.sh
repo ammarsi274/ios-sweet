@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 STOCK=${1:?usage: build-drg.sh path/to/stock-boot.img [ramdisk]}
 CC=aarch64-linux-gnu-gcc
 OBJCOPY=aarch64-linux-gnu-objcopy
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -DBOARD_DRG"
+CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -DBOARD_DRG ${SHIM_CFLAGS:-}"	# SHIM_CFLAGS=-DDRG_EMMC_MB_TEST: eMMC multi-block test run
 OUT=out-drg
 mkdir -p $OUT
 # Nokia's CP microcode and zap shader (vendor_b, kept out of git), checked

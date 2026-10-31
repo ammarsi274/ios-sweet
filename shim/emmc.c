@@ -344,6 +344,7 @@ void drg_emmc_probe(void)
 #define LOG_BLOCKS		64
 
 static uint64_t log_lba;	/* 0: not found / not safe */
+static uint64_t ud_first, ud_last;	/* userdata, from the GPT (drg_emmc_log_open) */
 
 int drg_emmc_log_open(void)
 {
@@ -368,6 +369,8 @@ int drg_emmc_log_open(void)
 			continue;
 		uint64_t first = u64_at(off + 32), last = u64_at(off + 40);
 		uint64_t lba = first + LOG_OFFSET;
+		ud_first = first;
+		ud_last = last;
 		if (lba < first + IOS_IMAGE_SECTORS + WTEST_MARGIN || lba + LOG_BLOCKS - 1 > last ||
 		    lba + LOG_BLOCKS > 0xffffffffULL)
 			return -5;
@@ -401,4 +404,255 @@ int drg_emmc_log_write(const char *buf, unsigned len)
 			return -2 - (int)b;
 	}
 	return 0;
+}
+
+/*
+ * Multi-block transfers (for XNU's drg_emmc.c, which moves one 512-byte
+ * sector per command: ~100 KiB/s, boot #18). As HMD's kernel does on this
+ * controller (sdhci.c, sdhci-msm.c, sdhci.h): CMD18/CMD25 with Auto-CMD23,
+ * the block count in ARGUMENT2 (0x00); one ADMA2 chain of 12-byte 64-bit
+ * descriptors (SDHCI_ADMA2_64_DESC_SZ; Host Control 2 = 0x0003 measured:
+ * no v4 mode), END on the last data descriptor
+ * (SDHCI_QUIRK_NO_ENDATTR_IN_NOPDESC). SDHCI 3.00 (0x6B02), so Auto-CMD23
+ * is available (sdhci_add_host). Descriptors carry 32 KiB each.
+ */
+#define SDHCI_ARGUMENT2		0x00
+#define CMD18			((18U << 8) | 0x20 | 0x10 | 0x08 | 0x02)
+#define CMD25			((25U << 8) | 0x20 | 0x10 | 0x08 | 0x02)
+#define XFER_DMA		(1U << 0)
+#define XFER_BLK_CNT_EN		(1U << 1)
+#define XFER_AUTO_CMD23		(1U << 3)
+#define XFER_READ		(1U << 4)
+#define XFER_MULTI		(1U << 5)
+#define R1_ERRORS		0xfff98008U
+#define MB_DESC_BYTES		0x8000U
+
+/* MMU off: these low-bank addresses are their own PAs (free RAM below wlan_msa_guard@85600000) */
+#define MB_DESC			0x84a00000UL
+#define MB_ORIG			0x84b00000UL
+#define MB_WORK			0x84d00000UL
+#define MB_SECTORS		4096U		/* 2 MiB */
+#define MB_OFFSET		(WTEST_OFFSET + 0x1000ULL)	/* past the R6 block and the log */
+
+static uint32_t mb_acmd_err;
+
+/* count sectors between the card and buf; 0, or a negative step code; *resp = R1 */
+static int xfer_multi(uint32_t lba, uint32_t count, int write, uintptr_t buf, uint32_t *resp, uint32_t *st)
+{
+	volatile uint32_t *d = (volatile uint32_t *)MB_DESC;
+	uint32_t bytes = count * 512, n = (bytes + MB_DESC_BYTES - 1) / MB_DESC_BYTES;
+	uint64_t end = now() + ticks_ms(5000);
+	while (hc_rd(SDHCI_PRESENT) & (PRESENT_CMD_INHIBIT | PRESENT_DAT_INHIBIT))
+		if (now() > end)
+			return -1;
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t len = i + 1 < n ? MB_DESC_BYTES : bytes - i * MB_DESC_BYTES;
+		uint64_t a = buf + (uint64_t)i * MB_DESC_BYTES;
+		d[3 * i] = (len << 16) | ADMA2_TRAN | ADMA2_VALID | (i + 1 == n ? ADMA2_END : 0);
+		d[3 * i + 1] = (uint32_t)a;
+		d[3 * i + 2] = (uint32_t)(a >> 32);
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+	hc_wr(SDHCI_INT_STATUS, 0xffffffffU);
+	hc_wr(SDHCI_ADMA_ADDR_LO, (uint32_t)MB_DESC);
+	hc_wr(SDHCI_ADMA_ADDR_HI, (uint32_t)((uint64_t)MB_DESC >> 32));
+	hc_wr(SDHCI_ARGUMENT2, count);		/* Auto-CMD23 argument: block count */
+	hc_wr(SDHCI_BLOCK, (count << 16) | 512);
+	hc_wr(SDHCI_ARGUMENT, lba);
+	uint32_t mode = XFER_DMA | XFER_BLK_CNT_EN | XFER_AUTO_CMD23 | XFER_MULTI | (write ? 0 : XFER_READ);
+	hc_wr(SDHCI_XFER_CMD, ((write ? CMD25 : CMD18) << 16) | mode);
+
+	int rc = 0;
+	*st = 0;
+	*resp = 0;
+	end = now() + ticks_ms(5000);
+	for (;;) {
+		*st = hc_rd(SDHCI_INT_STATUS);
+		if (*st & INT_ERROR) {
+			rc = -2;
+			break;
+		}
+		if (*st & INT_CMD_DONE) {
+			*resp = hc_rd(SDHCI_RESPONSE0);
+			hc_wr(SDHCI_INT_STATUS, INT_CMD_DONE);
+			break;
+		}
+		if (now() > end) {
+			rc = -3;
+			break;
+		}
+	}
+	while (!rc) {
+		*st = hc_rd(SDHCI_INT_STATUS);
+		if (*st & INT_ERROR) {
+			rc = -4;
+			break;
+		}
+		if (*st & INT_XFER_DONE) {
+			hc_wr(SDHCI_INT_STATUS, INT_XFER_DONE);
+			break;
+		}
+		if (now() > end) {
+			rc = -5;
+			break;
+		}
+	}
+	mb_acmd_err = hc_rd(SDHCI_HOST_CTRL2) & 0xffff;
+	last_adma_err = hc_rd(SDHCI_ADMA_ERROR);
+	if (!rc && (*resp & R1_ERRORS))
+		rc = -6;
+	if (rc) {	/* reset the CMD and DAT lines only (as drg_emmc.c recover_lines) */
+		hc_wr(SDHCI_CLOCK, hc_rd(SDHCI_CLOCK) | (0x6U << 24));
+		uint64_t e2 = now() + ticks_ms(200);
+		while ((hc_rd(SDHCI_CLOCK) & (0x6U << 24)) && now() < e2)
+			;
+		hc_wr(SDHCI_INT_STATUS, 0xffffffffU);
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+	return rc;
+}
+
+/* ---- results, as text, into the userdata log (read back from TWRP) ---- */
+static char mb_log[4096];
+static unsigned mb_len;
+
+static void mb_put(const char *label, uint32_t v)
+{
+	static const char hex[] = "0123456789abcdef";
+	while (*label && mb_len < sizeof(mb_log) - 12)
+		mb_log[mb_len++] = *label++;
+	mb_log[mb_len++] = ' ';
+	for (int sh = 28; sh >= 0; sh -= 4)
+		mb_log[mb_len++] = hex[(v >> sh) & 15];
+	mb_log[mb_len++] = '\n';
+	con_hex(label, v);
+}
+
+static uint32_t mb_pattern(uint32_t salt, uint32_t i)
+{
+	return 0x4d424c4bU ^ salt ^ (i * 0x9e3779b1U);	/* "MBLK" */
+}
+
+static uint32_t ms_since(uint64_t t0)
+{
+	return (uint32_t)((now() - t0) / ticks_ms(1));
+}
+
+void drg_emmc_mb_test(void)
+{
+	static const uint32_t spot[] = { 0, 1, 63, 64, 65, 127, 128, 2047, 2048, 4094, 4095 };
+	volatile uint32_t *orig = (volatile uint32_t *)MB_ORIG, *work = (volatile uint32_t *)MB_WORK;
+	const uint32_t words = MB_SECTORS * 128;
+	uint32_t resp = 0, st = 0, bad;
+	int rc, rc2;
+	uint64_t t0;
+
+	con_str("EMMC", "multi-block test (CMD18/CMD25 + Auto-CMD23)");
+	mb_len = 0;
+	mb_put("MB log open rc", (uint32_t)drg_emmc_log_open());
+	uint64_t lba = ud_first + MB_OFFSET;
+	mb_put("MB lba", (uint32_t)lba);
+	if (!log_lba || lba < ud_first + IOS_IMAGE_SECTORS + WTEST_MARGIN || lba + MB_SECTORS - 1 > ud_last ||
+	    lba + MB_SECTORS > 0xffffffffULL) {
+		mb_put("MB refused: not in the safe range", 0);
+		goto out;
+	}
+	mb_put("MB host ctrl2", hc_rd(SDHCI_HOST_CTRL2));
+	mb_put("MB clock", hc_rd(SDHCI_CLOCK));
+
+	/* 1. back up the region with the proven single-block reads */
+	t0 = now();
+	for (uint32_t s = 0; s < MB_SECTORS; s++) {
+		if (read_block((uint32_t)lba + s, &resp, &st)) {
+			mb_put("MB backup read failed at sector", s);
+			goto out;
+		}
+		for (int i = 0; i < 128; i++)
+			orig[s * 128 + i] = sector[i];
+	}
+	mb_put("MB single-block read 2 MiB ms", ms_since(t0));
+
+	/* 2. multi-block write of a pattern */
+	for (uint32_t i = 0; i < words; i++)
+		work[i] = mb_pattern(0, i);
+	t0 = now();
+	rc = xfer_multi((uint32_t)lba, MB_SECTORS, 1, MB_WORK, &resp, &st);
+	mb_put("MB write 2 MiB ms", ms_since(t0));
+	mb_put("MB write rc", (uint32_t)-rc);
+	mb_put("MB write r1", resp);
+	mb_put("MB write int", st);
+	mb_put("MB write acmd err", mb_acmd_err);
+	mb_put("MB write adma err", last_adma_err);
+	if (rc)
+		goto restore;
+
+	/* 3. multi-block read back */
+	for (uint32_t i = 0; i < words; i++)
+		work[i] = FILL;
+	t0 = now();
+	rc = xfer_multi((uint32_t)lba, MB_SECTORS, 0, MB_WORK, &resp, &st);
+	mb_put("MB read 2 MiB ms", ms_since(t0));
+	mb_put("MB read rc", (uint32_t)-rc);
+	mb_put("MB read r1", resp);
+	mb_put("MB read acmd err", mb_acmd_err);
+	bad = 0;
+	for (uint32_t i = 0; i < words; i++)
+		bad += work[i] != mb_pattern(0, i);
+	mb_put("MB read bad words", bad);
+
+	/* 4. the same data through the proven single-block reads */
+	bad = 0;
+	for (unsigned k = 0; k < sizeof(spot) / sizeof(spot[0]); k++) {
+		if (read_block((uint32_t)lba + spot[k], &resp, &st)) {
+			mb_put("MB spot read failed at sector", spot[k]);
+			goto restore;
+		}
+		for (int i = 0; i < 128; i++)
+			bad += sector[i] != mb_pattern(0, spot[k] * 128 + i);
+	}
+	mb_put("MB single-block spot bad words", bad);
+
+	/* 5. an odd size: 100 sectors (one 32 KiB descriptor + 18 KiB) at sector 200, read 300 from 100 */
+	for (uint32_t i = 0; i < 100 * 128; i++)
+		work[i] = mb_pattern(0x55aa55aaU, i);
+	rc = xfer_multi((uint32_t)lba + 200, 100, 1, MB_WORK, &resp, &st);
+	mb_put("MB odd write rc", (uint32_t)-rc);
+	for (uint32_t i = 0; i < 300 * 128; i++)
+		work[i] = FILL;
+	rc2 = xfer_multi((uint32_t)lba + 100, 300, 0, MB_WORK, &resp, &st);
+	mb_put("MB odd read rc", (uint32_t)-rc2);
+	bad = 0;
+	for (uint32_t i = 0; i < 300 * 128; i++) {
+		uint32_t s = 100 + i / 128;	/* sector in the region */
+		uint32_t want = s >= 200 && s < 300 ? mb_pattern(0x55aa55aaU, (s - 200) * 128 + i % 128)
+						    : mb_pattern(0, s * 128 + i % 128);
+		bad += work[i] != want;
+	}
+	mb_put("MB odd bad words", bad);
+
+restore:
+	/* 6. the original contents back, checked by a multi-block read and single-block spots */
+	rc = xfer_multi((uint32_t)lba, MB_SECTORS, 1, MB_ORIG, &resp, &st);
+	mb_put("MB restore rc", (uint32_t)-rc);
+	for (uint32_t i = 0; i < words; i++)
+		work[i] = FILL;
+	rc2 = xfer_multi((uint32_t)lba, MB_SECTORS, 0, MB_WORK, &resp, &st);
+	bad = 0;
+	for (uint32_t i = 0; i < words; i++)
+		bad += work[i] != orig[i];
+	mb_put("MB restore read rc", (uint32_t)-rc2);
+	mb_put("MB restore bad words", bad);
+	bad = 0;
+	for (unsigned k = 0; k < sizeof(spot) / sizeof(spot[0]); k++) {
+		if (read_block((uint32_t)lba + spot[k], &resp, &st)) {
+			bad = 0xffffffffU;
+			break;
+		}
+		for (int i = 0; i < 128; i++)
+			bad += sector[i] != orig[spot[k] * 128 + i];
+	}
+	mb_put("MB restore single-block spot bad words", bad);
+out:
+	mb_put("MB end", 0xe0d);
+	drg_emmc_log_write(mb_log, mb_len);
 }

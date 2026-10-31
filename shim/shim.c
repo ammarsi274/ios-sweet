@@ -861,6 +861,13 @@ static void __attribute__((noreturn)) drg_gold_main(void)
 	 * only writes past the iOS image in userdata. The Gold core's ID registers
 	 * shown here before are in drg/BOOTLOG.md (boot #4).
 	 */
+#ifdef DRG_EMMC_MB_TEST
+	/* only the multi-block eMMC test (emmc.c): no GPU, no R6 */
+	stage = "gold emmc mb";
+	con_skip();
+	drg_emmc_mb_test();
+	con_skip();
+#else
 	stage = "gold gpu";
 	drg_gpu_bringup();
 
@@ -868,6 +875,7 @@ static void __attribute__((noreturn)) drg_gold_main(void)
 	con_skip();
 	drg_emmc_probe();
 	con_skip();
+#endif
 
 	stage = "gold done";
 	con_str("DONE", "from Gold; fastboot in ~90s");

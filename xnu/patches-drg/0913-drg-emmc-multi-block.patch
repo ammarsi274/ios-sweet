@@ -1,0 +1,214 @@
+drg: eMMC runs of sectors in one command, CMD18/CMD25 + Auto-CMD23 (patch 0913)
+
+drg_emmc.c moved one 512-byte sector per CMD17/CMD24. Boot #18 measured
+69-154 KiB/s, and boot #38 took ~25 min to the lock screen: installd,
+LaunchServices and SQLite (analyticsd 92 s of kernel time) waiting on it.
+A run of sectors is now one CMD18/CMD25 with Auto-CMD23 through one ADMA2
+chain, as HMD's kernel drives this controller (sdhci.c, sdhci-msm.c,
+sdhci.h): block count in ARGUMENT2, 12-byte 64-bit descriptors (Host
+Control 2 = 0x0003, no v4 mode), END on the last data descriptor. One
+sector stays CMD17/CMD24; a failed run is stopped with CMD12 (a plain R1b
+command, as HMD's sdhci sends it) and redone one sector at a time.
+Descriptors take the first 4 KiB of the DMA range. Shim test (same
+sequence, scratch region 24 GiB into userdata): 2 MiB written in 14 ms and
+read in 13 ms, every word and 11 sectors through CMD17 checked, an odd
+100-sector run checked, original restored and checked; one sector at a
+time took 753 ms for 2 MiB.
+
+diff --git a/bsd/dev/drg_emmc.c b/bsd/dev/drg_emmc.c
+index 011be68..76a2479 100755
+--- a/bsd/dev/drg_emmc.c
++++ b/bsd/dev/drg_emmc.c
+@@ -14,10 +14,18 @@
+  *     equal, original restored (R6 write test, 8 GiB past the iOS image)
+  *
+  * So this driver keeps ABL's controller state as it is (no reset, clock,
+- * power or host-control writes in normal operation) and reads one 512-byte
+- * block per CMD17 (writes one per CMD24) through ADMA2. The DMA buffer is the low-bank range the
+- * ADT gives in /drg-emmc "dma" (outside XNU's RAM; the shim proved ADMA2
+- * into the low bank works), mapped non-cacheable, so no cache maintenance.
++ * power or host-control writes in normal operation). A run of sectors is one
++ * CMD18 (read) or CMD25 (write) with Auto-CMD23, through one ADMA2 chain,
++ * as HMD's kernel drives this controller (sdhci.c, sdhci-msm.c): block
++ * count in ARGUMENT2, 12-byte 64-bit descriptors (Host Control 2 = 0x0003:
++ * no v4 mode), END on the last data descriptor. One sector stays one
++ * CMD17/CMD24. Shim test (boot log, 2026-10-31): 2 MiB written in 14 ms and
++ * read in 13 ms, every word checked, against 753 ms for 2 MiB one sector
++ * at a time (boot #18 measured 69-154 KiB/s under XNU). A failed run is
++ * stopped with CMD12 and done again one sector at a time. The DMA buffer is
++ * the low-bank range the ADT gives in /drg-emmc "dma" (outside XNU's RAM;
++ * the shim proved ADMA2 into the low bank works), mapped non-cacheable, so
++ * no cache maintenance; its first 4 KiB hold the descriptors.
+  *
+  * It finds the GPT partition named by boot-arg emmcroot= (default
+  * "userdata") and exposes it as the BSD disk emmcroot0 / remmcroot0.
+@@ -52,6 +60,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ 
+ /* SD Host Controller registers (offsets from hc_mem) */
++#define HC_ARGUMENT2		0x00	/* Auto-CMD23 argument: block count */
+ #define HC_BLOCK		0x04	/* block size [15:0], block count [31:16] */
+ #define HC_ARGUMENT		0x08
+ #define HC_XFER_CMD		0x0c	/* transfer mode [15:0], command [31:16] */
+@@ -61,6 +70,7 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ #define HC_CLOCK		0x2c	/* clock [15:0], timeout [23:16], reset [31:24] */
+ #define HC_INT_STATUS		0x30	/* normal [15:0], error [31:16] */
+ #define HC_INT_ENABLE		0x34
++#define HC_HOST_CTRL2		0x3c	/* auto-CMD error [15:0], host control 2 [31:16] */
+ #define HC_ADMA_ERROR		0x54
+ #define HC_ADMA_ADDR_LO		0x58
+ #define HC_ADMA_ADDR_HI		0x5c
+@@ -81,6 +91,11 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ #define CMD17			((17u << 8) | 0x20 | 0x10 | 0x08 | 0x02)
+ /* CMD24 WRITE_BLOCK: data, index + CRC check, R1 */
+ #define CMD24			((24u << 8) | 0x20 | 0x10 | 0x08 | 0x02)
++/* CMD18 READ_MULTIPLE_BLOCK / CMD25 WRITE_MULTIPLE_BLOCK: data, index + CRC check, R1 */
++#define CMD18			((18u << 8) | 0x20 | 0x10 | 0x08 | 0x02)
++#define CMD25			((25u << 8) | 0x20 | 0x10 | 0x08 | 0x02)
++/* CMD12 STOP_TRANSMISSION: index + CRC check, R1b (HMD sdhci.c sends it as a plain R1b command) */
++#define CMD12			((12u << 8) | 0x10 | 0x08 | 0x03)
+ /* CMD8 SEND_EXT_CSD: data, index + CRC check, R1 */
+ #define CMD8			((8u << 8) | 0x20 | 0x10 | 0x08 | 0x02)
+ /* CMD6 SWITCH: no data, index + CRC check, R1b (busy) */
+@@ -89,6 +104,9 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ #define XFER_READ_ONE_DMA	((1u << 4) | (1u << 1) | (1u << 0))
+ /* transfer mode: write, block count enable, DMA */
+ #define XFER_WRITE_ONE_DMA	((1u << 1) | (1u << 0))
++/* transfer mode: multiple blocks, Auto-CMD23, block count enable, DMA (+ read) */
++#define XFER_MULTI_DMA		((1u << 5) | (1u << 3) | (1u << 1) | (1u << 0))
++#define XFER_READ		(1u << 4)
+ #define R1_ERRORS		0xfff98008u	/* R1 card status error bits */
+ #define R1_SWITCH_ERROR		(1u << 7)
+ 
+@@ -102,11 +120,15 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ #define SWITCH_FLUSH		((3u << 24) | (EXT_CSD_FLUSH_CACHE << 16) | (1u << 8))
+ 
+ #define ADMA2_ATTR_TRAN_END	((2u << 4) | (1u << 1) | (1u << 0))
++#define ADMA2_ATTR_TRAN		((2u << 4) | (1u << 0))
++#define ADMA2_DESC_WORDS	3u		/* 12-byte 64-bit descriptor (SDHCI_ADMA2_64_DESC_SZ) */
++#define ADMA2_DESC_LEN		0x8000u		/* bytes per descriptor, as the shim test */
+ 
+ #define SECTOR			512u
+-#define DESC_BYTES		64u		/* descriptor at the start of the DMA range */
++#define DESC_BYTES		4096u		/* descriptors at the start of the DMA range, data after */
+ #define CMD_TIMEOUT_NS		(200 * NSEC_PER_MSEC)
+ #define WRITE_TIMEOUT_NS	(1000 * NSEC_PER_MSEC)
++#define MULTI_TIMEOUT_NS	(2000 * NSEC_PER_MSEC)	/* a 2 MiB run took 14 ms in the shim */
+ #define FLUSH_TIMEOUT_NS	(2000 * NSEC_PER_MSEC)
+ 
+ static struct {
+@@ -255,6 +277,82 @@ fail:
+ 	return EIO;
+ }
+ 
++/*
++ * One run of count > 1 sectors between the card and DMA range offset
++ * buf_off: CMD18/CMD25 with Auto-CMD23 through one ADMA2 chain.
++ */
++static int
++issue_multi(const char *what, bool write, uint32_t lba, uint32_t count, uint32_t buf_off)
++{
++	volatile uint32_t *desc = (volatile uint32_t *)se.dma;
++	uint32_t bytes = count * SECTOR;
++	uint32_t n = (bytes + ADMA2_DESC_LEN - 1) / ADMA2_DESC_LEN;
++	uint64_t deadline;
++	uint32_t st = 0, r1 = 0;
++	int step;
++
++	nanoseconds_to_deadline(MULTI_TIMEOUT_NS, &deadline);
++	if (n * ADMA2_DESC_WORDS * 4 > DESC_BYTES || buf_off + bytes > se.dma_size) {
++		step = 0;
++		goto fail;
++	}
++	if (!wait_clear(HC_PRESENT, PRESENT_INHIBIT, deadline)) {
++		step = 1;
++		goto fail;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		uint32_t len = i + 1 < n ? ADMA2_DESC_LEN : bytes - i * ADMA2_DESC_LEN;
++		uint64_t pa = se.dma_pa + buf_off + (uint64_t)i * ADMA2_DESC_LEN;
++		desc[ADMA2_DESC_WORDS * i] = (len << 16) | (i + 1 < n ? ADMA2_ATTR_TRAN : ADMA2_ATTR_TRAN_END);
++		desc[ADMA2_DESC_WORDS * i + 1] = (uint32_t)pa;
++		desc[ADMA2_DESC_WORDS * i + 2] = (uint32_t)(pa >> 32);
++	}
++	/* the descriptors and, for writes, the data must reach memory first */
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	hc_wr(HC_INT_STATUS, 0xffffffffu);
++	hc_wr(HC_ADMA_ADDR_LO, (uint32_t)se.dma_pa);
++	hc_wr(HC_ADMA_ADDR_HI, (uint32_t)(se.dma_pa >> 32));
++	hc_wr(HC_ARGUMENT2, count);
++	hc_wr(HC_BLOCK, (count << 16) | SECTOR);
++	hc_wr(HC_ARGUMENT, lba);
++	hc_wr(HC_XFER_CMD, ((write ? CMD25 : CMD18) << 16) | XFER_MULTI_DMA | (write ? 0 : XFER_READ));
++
++	if (wait_int(INT_CMD_DONE, deadline, &st)) {
++		step = 2;
++		goto fail;
++	}
++	r1 = hc_rd(HC_RESPONSE0);
++	hc_wr(HC_INT_STATUS, INT_CMD_DONE);
++	if (wait_int(INT_XFER_DONE, deadline, &st)) {
++		step = 3;
++		goto fail;
++	}
++	hc_wr(HC_INT_STATUS, INT_XFER_DONE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (r1 & R1_ERRORS) {
++		st = r1;
++		step = 4;
++		goto fail;
++	}
++	return 0;
++
++fail:
++	if (se.errors++ < 8) {
++		printf("DRG EMMC: %s 0x%x+%u failed at step %d: status 0x%08x present 0x%08x adma 0x%08x acmd 0x%04x\n",
++		    what, lba, count, step, st, hc_rd(HC_PRESENT), hc_rd(HC_ADMA_ERROR), hc_rd(HC_HOST_CTRL2) & 0xffff);
++	}
++	recover_lines();
++	return EIO;
++}
++
++/* After a failed run: CMD12 brings the card back to the transfer state (result not needed). */
++static void
++stop_transmission(void)
++{
++	(void)issue("stop", CMD12, 0, 0, 0, true, WRITE_TIMEOUT_NS, 0);
++}
++
+ /* Read one sector (absolute LBA on the eMMC) to DMA range offset buf_off. */
+ static int
+ read_sector(uint64_t lba, uint32_t buf_off)
+@@ -295,6 +393,13 @@ flush_cache(void)
+ static int
+ read_sectors(uint64_t lba, uint32_t count, uint32_t buf_off)
+ {
++	if (count > 1 && lba + count - 1 <= UINT32_MAX &&
++	    issue_multi("read", false, (uint32_t)lba, count, buf_off) == 0) {
++		return 0;
++	}
++	if (count > 1) {
++		stop_transmission();
++	}
+ 	for (uint32_t i = 0; i < count; i++) {
+ 		int error = read_sector(lba + i, buf_off + i * SECTOR);
+ 		if (error) {
+@@ -307,6 +412,17 @@ read_sectors(uint64_t lba, uint32_t count, uint32_t buf_off)
+ static int
+ write_sectors(uint64_t lba, uint32_t count, uint32_t buf_off)
+ {
++	/* checked here again, right before the command: only with writes on, only inside the partition */
++	if (!se.writable || lba < se.first_lba || count > se.nsect || lba - se.first_lba > se.nsect - count ||
++	    lba + count - 1 > UINT32_MAX) {
++		return EROFS;
++	}
++	if (count > 1 && issue_multi("write", true, (uint32_t)lba, count, buf_off) == 0) {
++		return 0;
++	}
++	if (count > 1) {
++		stop_transmission();
++	}
+ 	for (uint32_t i = 0; i < count; i++) {
+ 		int error = write_sector(lba + i, buf_off + i * SECTOR);
+ 		if (error) {
