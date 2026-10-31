@@ -59,9 +59,10 @@ for entry in "${FORBIDDEN[@]}"; do
 	fi
 done
 # sanity: plain ARMv8.0 exclusives must be there, else the scan saw nothing
+# (MIN_EXCLUSIVES=0 for a small tool that has no atomics at all)
 ex=$(grep -cE "${T}(ldaxr|stlxr|ldxr|stxr)${T}" "$DIS" || true)
-printf '%-22s %6d (expected > 0)\n' "ldxr/stxr exclusives" "$ex"
-[ "$ex" -gt 0 ] || { echo "check-armv80: no exclusives found, scan is broken" >&2; exit 2; }
+printf '%-22s %6d (expected >= %d)\n' "ldxr/stxr exclusives" "$ex" "${MIN_EXCLUSIVES:-1}"
+[ "$ex" -ge "${MIN_EXCLUSIVES:-1}" ] || { echo "check-armv80: no exclusives found, scan is broken" >&2; exit 2; }
 if [ "$bad" = 0 ]; then
 	echo "check-armv80: OK, no instructions beyond ARMv8.0 (+crc, crypto) in $K ($lines lines)"
 else
