@@ -88,6 +88,7 @@
 #define A5XX_CP_HW_FAULT	0xb1a
 #define A5XX_CP_PROTECT_STATUS	0xb1c
 #define A5XX_RBBM_INT_0_STATUS	0x4e1
+#define A5XX_RBBM_INT_0_MASK	0x38
 #define A5XX_RBBM_AHB_ERROR_STATUS	0x4f4
 #define A5XX_RBBM_STATUS	0x4f5
 #define A5XX_RBBM_STATUS3	0x530
@@ -1984,6 +1985,7 @@ static void c_sleep(void *ctx, uint32_t us)
 }
 
 static struct drgpu core_gpu;
+static struct drgpu_space space_a, space_b;	/* two process address spaces */
 uint64_t drg_fwblob_write(uintptr_t pa);	/* loader.c */
 /* the replay's last draw and its render target, for the power-cycle test */
 static struct drgpu_ib last_ibs[8];
@@ -2004,6 +2006,41 @@ static void gpu_irq_hook(uint32_t intid)
 	gpu_irqs++;
 }
 extern const uint8_t drg_pm4_file[], drg_pm4_file_end[], drg_pfp_file[], drg_pfp_file_end[];
+
+/* after a failed submission: where the CP stopped and why (a5xx_cp_hw_err_callback, SMMU fault regs) */
+static void gpu_fail_dump(struct drgpu *g)
+{
+	lreg("cp hw fault", GPU_REG(A5XX_CP_HW_FAULT));
+	lreg("cp int status", GPU_REG(A5XX_CP_INTERRUPT_STATUS));
+	lreg("cp protect status", GPU_REG(A5XX_CP_PROTECT_STATUS));
+	lreg("rbbm int 0 status", GPU_REG(A5XX_RBBM_INT_0_STATUS));
+	lreg("rbbm status", GPU_REG(A5XX_RBBM_STATUS));
+	lreg("rbbm status3", GPU_REG(A5XX_RBBM_STATUS3));
+	lreg("rbbm ahb error", GPU_REG(A5XX_RBBM_AHB_ERROR_STATUS));
+	lreg("cp rb rptr", GPU_REG(A5XX_CP_RB_RPTR));
+	lv("ring write dword", g->ring_w);
+	lreg("smmu cb0 fsr", SMMU_CB0 + SMMU_CB_FSR);
+	lreg("smmu cb0 far lo", SMMU_CB0 + SMMU_CB_FAR);
+	lreg("smmu cb0 far hi", SMMU_CB0 + SMMU_CB_FAR + 4);
+	lreg("smmu cb0 ttbr0 lo", SMMU_CB0 + SMMU_CB_TTBR0);
+	lreg("smmu cb0 ttbr0 hi", SMMU_CB0 + SMMU_CB_TTBR0 + 4);
+	const volatile uint32_t *si = (const volatile uint32_t *)g->smmu_info.va;
+	lv("pt info ttbr0 lo (written by the switch)", si[0x800 / 4]);
+	lv("pt info ttbr0 hi", si[0x800 / 4 + 1]);
+	/* the ring around the read pointer */
+	uint32_t r = rd(GPU_REG(A5XX_CP_RB_RPTR));
+	const volatile uint32_t *ring = (const volatile uint32_t *)g->ring.va;
+	for (uint32_t i = (r >= 8 ? r - 8 : 0); i < r + 4 && i < DRGPU_RING_DWORDS; i++) {
+		put("ring ");
+		puthex(i);
+		put(" ");
+		puthex(ring[i]);
+		put("\n");
+	}
+	/* a hung GPU keeps hang detect asserted: no GPU interrupts from here on */
+	wr(GPU_REG(A5XX_RBBM_INT_0_MASK), 0);
+	flush();
+}
 
 static void g4_core(void)
 {
@@ -2106,13 +2143,25 @@ static void g4_core(void)
 			pass = 0;
 	}
 
-	step("G4 3 cap1 replay through the core");
+	step("G4 3 cap1 replay through the core, in process space A");
+	lv("space a create", (uint32_t)drgpu_space_create(g, &space_a));
+	lv("space a asid", space_a.asid);
 	const uint8_t *p = drg_cap, *end = drg_cap_end;
-	struct cobj { uint32_t id, live; uint64_t va, len, pa, h0; } objs[64];
+	struct cobj { uint32_t id, live, stale; uint64_t va, len, pa, h0; } objs[64];
 	for (int i = 0; i < 64; i++)
 		objs[i].live = 0;
 	int dirty = 0, executed = 0, bad = 0;
 	uint32_t compared = 0, matched = 0, gpuw = 0, gpuw_ok = 0;
+	/*
+	 * After the last draw only its results are compared: the capture's later
+	 * frees, maps and uploads are not applied, so that draw's memory stays as
+	 * it ran for the G4 5 redraw.
+	 */
+	const uint8_t *last_draw = 0;
+	for (const uint8_t *q = p; q + 16 <= end && cle32(q) == 0x43475244 && q + 16 + cle32(q + 8) <= end;
+	     q += 16 + cle32(q + 8))
+		if (cle32(q + 4) == 4 && !(cle64(q + 20) & KGSL_CMDBATCH_MARKER))
+			last_draw = q;
 	while (p + 16 <= end && !bad) {
 		uint32_t type = cle32(p + 4), len = cle32(p + 8);
 		const uint8_t *d = p + 16;
@@ -2120,11 +2169,14 @@ static void g4_core(void)
 			bad = 1;
 			break;
 		}
+		int after = last_draw && p > last_draw;	/* p: this record */
 		p = d + len;
+		if (after && type != 5)
+			continue;
 		if (type == 1) {
 			for (int i = 0; i < 64; i++)
 				if (!objs[i].live) {
-					objs[i] = (struct cobj){ cle32(d + 32), 1, 0, cle64(d + 24), 0, 0 };
+					objs[i] = (struct cobj){ cle32(d + 32), 1, 0, 0, cle64(d + 24), 0, 0 };
 					break;
 				}
 		} else if (type == 2 || type == 3 || type == 5) {
@@ -2138,7 +2190,7 @@ static void g4_core(void)
 			if (type == 2 && (cle32(d + 24) & 1) && !o->pa) {
 				struct drgpu_mem m;
 				uint64_t n = (cle64(d + 16) + 0xfff) & ~0xfffULL;
-				if (c_alloc(0, n, 0x1000, &m) || drgpu_map(g, cle64(d + 8), m.pa, n, 0)) {
+				if (c_alloc(0, n, 0x1000, &m) || drgpu_map(g, &space_a, cle64(d + 8), m.pa, n, 0)) {
 					put("map failed\n");
 					bad = 1;
 					break;
@@ -2149,19 +2201,22 @@ static void g4_core(void)
 				dirty = 1;
 			} else if (type == 3) {
 				if (o->pa)
-					drgpu_unmap(g, o->va, (o->len + 0xfff) & ~0xfffULL);
+					drgpu_unmap(g, &space_a, o->va, (o->len + 0xfff) & ~0xfffULL);
 				o->live = 0;
 				dirty = 1;
 			} else if (type == 5 && o->pa) {
 				uint32_t phase = cle32(d + 4), has = cle32(d + 12);
 				uint64_t n = cle64(d + 24), h = cle64(d + 32);
-				if (phase == 0) {
+				if (phase == 0 && after) {
+					if (fnv_mem(o->pa, n) != h)
+						o->stale = 1;	/* Linux changed it after the last draw: not comparable */
+				} else if (phase == 0) {
 					volatile uint8_t *dst = (volatile uint8_t *)(uintptr_t)o->pa;
 					if (has)
 						for (uint64_t i = 0; i < n; i++)
 							dst[i] = d[40 + i];
 					o->h0 = h;
-				} else {
+				} else if (!o->stale) {
 					uint64_t mine = fnv_mem(o->pa, n);
 					compared++;
 					gpuw += h != o->h0;
@@ -2204,7 +2259,7 @@ static void g4_core(void)
 			last_ctx = ctx;
 			last_ts = ts;
 			uint64_t s0 = ticks();
-			uint32_t got = drgpu_submit(g, ctx, ibs, n, ts);
+			uint32_t got = drgpu_submit(g, &space_a, ctx, ibs, n, ts);
 			int w = got ? drgpu_wait(g, ctx, ts, 2000000) : -1;
 			put("submit ctx ");
 			puthex(ctx);
@@ -2224,7 +2279,9 @@ static void g4_core(void)
 			if (w || rd(GPU_REG(A5XX_CP_HW_FAULT))) {
 				put(drgpu_err(g));
 				put("\n");
+				gpu_fail_dump(g);
 				bad = 1;
+				break;
 			}
 		}
 	}
@@ -2236,6 +2293,12 @@ static void g4_core(void)
 	lv("pool used", (uint32_t)core_pool_used);
 	if (bad || executed != 3 || !compared || matched != compared || !gpuw || gpuw_ok != gpuw)
 		pass = 0;
+	if (bad) {	/* the GPU is stuck: the later stages would only hang the phone */
+		put("G4 RESULT: FAIL (replay; later stages skipped)\n");
+		con_str("G4", "FAIL");
+		flush();
+		return;
+	}
 
 	/*
 	 * GPU interrupt to this core: kgsl-3d0 "interrupts = <0 0x12c 0>" =
@@ -2257,7 +2320,7 @@ static void g4_core(void)
 	for (uint32_t k = 1; k <= 5; k++) {
 		uint32_t before = gpu_irqs;
 		uint64_t s0 = ticks();
-		if (!drgpu_submit(g, 3, 0, 0, k))
+		if (!drgpu_submit(g, 0, 3, 0, 0, k))	/* kernel space: switches back from A */
 			break;
 		uint64_t end2 = s0 + freq() / 10;
 		while (gpu_irqs == before && ticks() < end2)
@@ -2288,6 +2351,7 @@ static void g4_core(void)
 	 * cleared render target: it must come back identical to Linux's.
 	 */
 	step("G4 5 power collapse / restore x3 (last draw re-run each time)");
+	wr(SMMU_CB0 + SMMU_CB_FSR, rd(SMMU_CB0 + SMMU_CB_FSR));	/* fresh fault state */
 	for (int cyc = 0; cyc < 3 && last_n && last_rt_pa; cyc++) {
 		uint64_t c0 = ticks();
 		int orc = drgpu_power_off(g);
@@ -2302,7 +2366,7 @@ static void g4_core(void)
 		uint32_t on_us = (uint32_t)((ticks() - c0) * 1000000 / freq());
 		uint32_t khz = drgpu_gpu_khz(g);
 		last_ts += 0x100;
-		uint32_t got = rrc ? 0 : drgpu_submit(g, last_ctx, last_ibs, last_n, last_ts);
+		uint32_t got = rrc ? 0 : drgpu_submit(g, &space_a, last_ctx, last_ibs, last_n, last_ts);
 		int w = got ? drgpu_wait(g, last_ctx, last_ts, 2000000) : -1;
 		int same = fnv_mem(last_rt_pa, last_rt_len) == last_rt_hash;
 		put("cycle ");
@@ -2327,15 +2391,86 @@ static void g4_core(void)
 		puthex((uint32_t)w);
 		put(" identical ");
 		puthex((uint32_t)same);
+		put(" | ttbr0 hi ");
+		puthex(rd(SMMU_CB0 + SMMU_CB_TTBR0 + 4));
 		put("\n");
 		if (rrc)
 			put(drgpu_err(g)), put("\n");
 		flush();
+		if (w) {	/* stuck GPU: dump and stop collapsing it */
+			gpu_fail_dump(g);
+			pass = 0;
+			break;
+		}
 		if (orc || rrc || w || !same || (gx & GDSC_PWR_ON) || !(clk & CBCR_CLK_OFF) || khz < 260000 || khz > 272000)
 			pass = 0;
 	}
 	if (!last_n || !last_rt_pa)
 		pass = 0;
+
+	/*
+	 * Per-process address spaces: A and B map the same GPU address X to
+	 * different pages and the same IB address Y to different IBs. Queued
+	 * A B A B; then B, the CP's current space, is destroyed (CPU path back
+	 * to the kernel's space) and A runs again.
+	 */
+	step("G4 6 per-process address spaces (same GPU address, different pages)");
+	const uint64_t X = 0x700000000ULL, Y = 0x700010000ULL;
+	struct drgpu_mem pa1, pa2, iba, ibb;
+	int irc = drgpu_space_create(g, &space_b);
+	irc |= c_alloc(0, 0x1000, 0x1000, &pa1) | c_alloc(0, 0x1000, 0x1000, &pa2) |
+	       c_alloc(0, 0x1000, 0x1000, &iba) | c_alloc(0, 0x1000, 0x1000, &ibb);
+	if (!irc) {
+		irc |= drgpu_map(g, &space_a, X, pa1.pa, 0x1000, 0) | drgpu_map(g, &space_a, Y, iba.pa, 0x1000, 1);
+		irc |= drgpu_map(g, &space_b, X, pa2.pa, 0x1000, 0) | drgpu_map(g, &space_b, Y, ibb.pa, 0x1000, 1);
+		irc |= drgpu_tlb_flush(g);
+	}
+	lv("setup rc", (uint32_t)irc);
+	lv("space b asid", space_b.asid);
+	if (!irc) {
+		volatile uint32_t *ia = iba.va, *ib = ibb.va, *p1 = pa1.va, *p2 = pa2.va;
+		ia[0] = pkt7(CP_MEM_WRITE, 3), ia[1] = (uint32_t)X, ia[2] = (uint32_t)(X >> 32), ia[3] = 0xaaaa0001;
+		ib[0] = pkt7(CP_MEM_WRITE, 3), ib[1] = (uint32_t)X, ib[2] = (uint32_t)(X >> 32), ib[3] = 0xbbbb0001;
+		p1[0] = 0, p2[0] = 0;
+		__asm__ volatile("dsb sy" ::: "memory");
+		struct drgpu_ib one = { Y, 4 };
+		uint32_t ok = 0;
+		ok += !!drgpu_submit(g, &space_a, 4, &one, 1, 1);
+		ok += !!drgpu_submit(g, &space_b, 5, &one, 1, 1);
+		ok += !!drgpu_submit(g, &space_a, 4, &one, 1, 2);
+		ok += !!drgpu_submit(g, &space_b, 5, &one, 1, 2);
+		int wa = drgpu_wait(g, 4, 2, 2000000), wb = drgpu_wait(g, 5, 2, 2000000);
+		lv("queued", ok);
+		lv("wait a", (uint32_t)wa);
+		lv("wait b", (uint32_t)wb);
+		lv("page under X in A (want aaaa0001)", p1[0]);
+		lv("page under X in B (want bbbb0001)", p2[0]);
+		lv("cb0 ttbr0 hi (asid of the current space)", rd(SMMU_CB0 + SMMU_CB_TTBR0 + 4));
+		lv("cp hw fault", rd(GPU_REG(A5XX_CP_HW_FAULT)));
+		int iso_ok = ok == 4 && !wa && !wb && p1[0] == 0xaaaa0001 && p2[0] == 0xbbbb0001;
+		/* destroy B while it is current, then A again */
+		p1[0] = 0;
+		int drc = drgpu_space_destroy(g, &space_b);
+		uint32_t ttbr_after = rd(SMMU_CB0 + SMMU_CB_TTBR0 + 4);
+		uint32_t got3 = drgpu_submit(g, &space_a, 4, &one, 1, 3);
+		int w3 = got3 ? drgpu_wait(g, 4, 3, 2000000) : -1;
+		lv("destroy b rc", (uint32_t)drc);
+		lv("ttbr0 hi after destroy (kernel asid 1 << 16)", ttbr_after);
+		lv("a again: wait", (uint32_t)w3);
+		lv("a again: page (want aaaa0001)", p1[0]);
+		lv("b's page untouched (want bbbb0001)", p2[0]);
+		lv("cp hw fault", rd(GPU_REG(A5XX_CP_HW_FAULT)));
+		lv("smmu cb0 fsr", rd(SMMU_CB0 + SMMU_CB_FSR));
+		iso_ok &= !drc && !w3 && p1[0] == 0xaaaa0001 && p2[0] == 0xbbbb0001 && (ttbr_after >> 16) == 1;
+		put(iso_ok ? "per-process spaces: isolated and switched correctly\n" : "per-process spaces: FAILED\n");
+		flush();
+		if (!iso_ok) {
+			gpu_fail_dump(g);
+			pass = 0;
+		}
+	} else {
+		pass = 0;
+	}
 	put(pass ? "G4 RESULT: PASS (portable core: bring-up, all levels, Nokia work identical to Linux)\n"
 		 : "G4 RESULT: FAIL (see above)\n");
 	con_str("G4", pass ? "PASS" : "FAIL");
@@ -2347,7 +2482,7 @@ void drg_gpu_bringup(void)
 	con_skip();
 	int rc = drg_emmc_log_open();
 	con_hex2("GPU LOG", "rc=", (uint32_t)rc, "lba=", (uint32_t)drg_emmc_log_lba());
-	put("DRGGPULOG v14 G1 + G4 portable core (bring-up, levels, cap1 replay)\n");
+	put("DRGGPULOG v15 G1 + G4 portable core (bring-up, levels, replay, irq, collapse, spaces)\n");
 	lv("log open rc", (uint32_t)rc);
 	core_states();
 	g1_snapshot("G1 as ABL left it");

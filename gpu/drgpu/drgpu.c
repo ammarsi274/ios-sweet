@@ -86,7 +86,14 @@
 #define CP_EVENT_WRITE		0x46
 #define CP_ME_INIT		0x48
 #define CP_SET_SECURE_MODE	0x66
+#define CP_WAIT_FOR_ME		0x13
+#define CP_WAIT_FOR_IDLE	0x26
+#define CP_SET_DRAW_STATE	0x43
+#define CP_SMMU_TABLE_UPDATE	0x53
+#define CP_SET_PROTECTED_MODE	0x5f
 #define CACHE_FLUSH_TS		4
+#define CP_CNTL			0x831	/* a5xx_reg.h: APRIV */
+#define UCHE_INVALIDATE0	0xe95
 
 /* SMMU (arm-smmu.c, measured IDs: 4 KiB pages, CBs at +0x8000) */
 #define SMMU_SGFSR(g)		((g)->smmu + 0x048)
@@ -107,6 +114,7 @@
 #define CB_TTBR0		0x20
 #define CB_TTBR1		0x28
 #define CB_TCR			0x30
+#define CB_CONTEXTIDR		0x34
 #define CB_MAIR0		0x38
 #define CB_MAIR1		0x3c
 #define CB_TLBIALL		0x618
@@ -150,6 +158,14 @@ static void logx(struct drgpu *g, const char *label, uint64_t v)
 	g->os.log(g->os.ctx, b);
 }
 
+static uint32_t pkt4(uint32_t reg, uint32_t cnt)	/* cp_type4_packet() */
+{
+	uint32_t p1 = cnt ^ cnt >> 4 ^ cnt >> 8 ^ cnt >> 12;
+	uint32_t p2 = reg ^ reg >> 4 ^ reg >> 8 ^ reg >> 12 ^ reg >> 16;
+	return 4U << 28 | cnt | ((0x9669 >> (p1 & 15)) & 1) << 7 | (reg & 0x3ffff) << 8 |
+	       ((0x9669 >> (p2 & 15)) & 1) << 27;
+}
+
 static uint32_t pkt7(uint32_t op, uint32_t cnt)	/* cp_type7_packet() */
 {
 	uint32_t p1 = cnt ^ cnt >> 4 ^ cnt >> 8 ^ cnt >> 12, p2 = op ^ op >> 4;
@@ -185,6 +201,9 @@ static void pt_publish(void *ctx)
 	(void)ctx;
 	__asm__ volatile("dsb sy" ::: "memory");
 }
+
+static int space_init(struct drgpu *g, struct drgpu_space *s, uint32_t asid);
+static int ring_wait_idle(struct drgpu *g, uint32_t timeout_us);
 
 /* ---- init ---- */
 static int alloc_fw(struct drgpu *g, const uint8_t *src, uint32_t len, struct drgpu_mem *m)
@@ -234,11 +253,30 @@ int drgpu_init(struct drgpu *g, const struct drgpu_os *os, const struct drgpu_fw
 	if (os->alloc(os->ctx, 4 * DRGPU_RING_DWORDS, 0x1000, &g->ring) ||
 	    os->alloc(os->ctx, DRGPU_MEMSTORE_SIZE, 0x1000, &g->memstore) ||
 	    os->alloc(os->ctx, 0x1000, 0x1000, &g->scratch) ||
-	    os->alloc(os->ctx, 0x1000, 0x1000, &g->l1) ||
+	    os->alloc(os->ctx, 0x1000, 0x1000, &g->setstate) ||
+	    os->alloc(os->ctx, 0x1000, 0x1000, &g->smmu_info) ||
 	    alloc_fw(g, fw->pm4, fw->pm4_len, &g->pm4) || alloc_fw(g, fw->pfp, fw->pfp_len, &g->pfp))
 		return fail(g, "drgpu: memory");
-	g->pt = (struct drgpu_pt){ { g->l1.pa, g->l1.va }, pt_alloc, pt_va, pt_publish, g };
+	/* the NOP IB the pagetable switch runs to stall prefetch (adreno_iommu.c) */
+	((volatile uint32_t *)g->setstate.va)[256] = pkt7(CP_NOP, 1);
+	((volatile uint32_t *)g->setstate.va)[257] = 0;
+	g->asid_used[0] = g->asid_used[1] = 1;	/* ASID 1: the kernel's space (CB0 attach) */
+	if (space_init(g, &g->kspace, 1))
+		return fail(g, "drgpu: memory");
+	g->cur_space = &g->kspace;
 	return 0;
+}
+
+/*
+ * gfx3d RCG onto the crystal: source 0, divider field 1. A glitch-free
+ * switch needs the old and the new source running, so this is done while
+ * the PLL is still up (power off) and is a no-op switch at power on.
+ */
+static int gfx3d_to_xo(struct drgpu *g)
+{
+	drgpu_wr(GFX3D_CFG(g), (drgpu_rd(GFX3D_CFG(g)) & ~0x71fU) | 0x001);
+	drgpu_wr(GFX3D_CMD(g), drgpu_rd(GFX3D_CMD(g)) | RCG_UPDATE);
+	return drgpu_poll(GFX3D_CMD(g), RCG_UPDATE, 0, 2000) < 0 ? fail(g, "drgpu: gfx3d rcg update") : 0;
 }
 
 /* ---- power (G2a: gdsc-regulator.c gdsc_enable, msm_gfx_ldo.c enable_bhs_mode) ---- */
@@ -264,11 +302,8 @@ int drgpu_power_on(struct drgpu *g)
 	drgpu_wr(LDO_PWRSWITCH_CTRL(g), ctl);
 	ctl &= ~(1U << 0);	/* BHS under GDSC control */
 	drgpu_wr(LDO_PWRSWITCH_CTRL(g), ctl);
-	/* gfx3d on the crystal: source 0, divider field 1 */
-	drgpu_wr(GFX3D_CFG(g), (drgpu_rd(GFX3D_CFG(g)) & ~0x71fU) | 0x001);
-	drgpu_wr(GFX3D_CMD(g), drgpu_rd(GFX3D_CMD(g)) | RCG_UPDATE);
-	if (drgpu_poll(GFX3D_CMD(g), RCG_UPDATE, 0, 2000) < 0)
-		return fail(g, "drgpu: gfx3d rcg update");
+	if (gfx3d_to_xo(g))
+		return -1;
 	drgpu_wr(GFX3D_CMD(g), (drgpu_rd(GFX3D_CMD(g)) & ~RCG_UPDATE) | RCG_ROOT_EN);
 	if (drgpu_rd(GDSC_GX(g)) & GDSC_HW_CONTROL)
 		return fail(g, "drgpu: gx gdsc under hw control");
@@ -294,6 +329,75 @@ int drgpu_power_on(struct drgpu *g)
 	return 0;
 }
 
+/* ---- address spaces ---- */
+static int map_globals(struct drgpu *g, struct drgpu_pt *pt)
+{
+	return drgpu_pt_map(pt, DRGPU_VA_SETSTATE, g->setstate.pa, 0x1000, DRGPU_PT_RO) ||
+	       drgpu_pt_map(pt, DRGPU_VA_MEMSTORE, g->memstore.pa, DRGPU_MEMSTORE_SIZE, DRGPU_PT_RW) ||
+	       drgpu_pt_map(pt, DRGPU_VA_SCRATCH, g->scratch.pa, 0x1000, DRGPU_PT_RW) ||
+	       drgpu_pt_map(pt, DRGPU_VA_RING, g->ring.pa, 4 * DRGPU_RING_DWORDS, DRGPU_PT_RO) ||
+	       drgpu_pt_map(pt, DRGPU_VA_PM4, g->pm4.pa, g->pm4.size, DRGPU_PT_RO) ||
+	       drgpu_pt_map(pt, DRGPU_VA_PFP, g->pfp.pa, g->pfp.size, DRGPU_PT_RO) ||
+	       drgpu_pt_map(pt, DRGPU_VA_SMMU_INFO, g->smmu_info.pa, 0x1000, DRGPU_PT_RW) ? -1 : 0;
+}
+
+static int space_init(struct drgpu *g, struct drgpu_space *s, uint32_t asid)
+{
+	if (g->os.alloc(g->os.ctx, 0x1000, 0x1000, &s->l1))
+		return -1;
+	s->pt = (struct drgpu_pt){ { s->l1.pa, s->l1.va }, pt_alloc, pt_va, pt_publish, g };
+	s->asid = asid;
+	if (map_globals(g, &s->pt))
+		return -1;
+	s->live = 1;
+	return 0;
+}
+
+static void pt_free(void *ctx, uint64_t pa)
+{
+	struct drgpu *g = ctx;
+	struct drgpu_mem m = { pa, g->os.ptov(g->os.ctx, pa), 0x1000 };
+	g->os.free(g->os.ctx, &m);
+}
+
+int drgpu_space_create(struct drgpu *g, struct drgpu_space *s)
+{
+	uint32_t asid = 2;
+	while (asid < 256 && g->asid_used[asid])
+		asid++;
+	if (asid == 256)
+		return fail(g, "drgpu: no free ASID");
+	if (space_init(g, s, asid))
+		return fail(g, "drgpu: memory for a space");
+	g->asid_used[asid] = 1;
+	return 0;
+}
+
+/*
+ * The caller makes sure no submission of this space is still queued. If the
+ * CP has it selected, the kernel's space is put back from the CPU first
+ * (KGSL's _set_pagetable_cpu path; GPU idle), so the SMMU never walks freed
+ * tables.
+ */
+int drgpu_space_destroy(struct drgpu *g, struct drgpu_space *s)
+{
+	if (!s->live || s == &g->kspace)
+		return 0;
+	if (g->cur_space == s) {
+		if (g->cp_running && ring_wait_idle(g, 1000000))
+			return fail(g, "drgpu: space busy at destroy");
+		drgpu_wr64(CB0(g, CB_TTBR0), g->kspace.l1.pa | (uint64_t)g->kspace.asid << 48);
+		g->cur_space = &g->kspace;
+	}
+	drgpu_pt_destroy(&s->pt, pt_free);
+	if (drgpu_tlb_flush(g))
+		return -1;
+	g->os.free(g->os.ctx, &s->l1);
+	g->asid_used[s->asid] = 0;
+	s->live = 0;
+	return 0;
+}
+
 /* ---- SMMU (G2b: arm-smmu.c device_reset, impl_def_programming, init_context_bank, add_master) ---- */
 static const uint32_t impl_defs[][2] = {	/* arm,smmu-kgsl@5040000 attach-impl-defs */
 	{ 0x6000, 0x2378 }, { 0x6060, 0x1055 }, { 0x678c, 0x8 }, { 0x6794, 0x28 },
@@ -308,24 +412,23 @@ int drgpu_tlb_flush(struct drgpu *g)
 	return drgpu_poll(CB0(g, CB_TLBSTATUS), 1, 0, 30000) < 0 ? fail(g, "drgpu: tlb sync") : 0;
 }
 
-int drgpu_map(struct drgpu *g, uint64_t gpuaddr, uint64_t pa, uint64_t len, int ro)
+int drgpu_map(struct drgpu *g, struct drgpu_space *s, uint64_t gpuaddr, uint64_t pa, uint64_t len, int ro)
 {
-	return drgpu_pt_map(&g->pt, gpuaddr, pa, len, ro ? DRGPU_PT_RO : DRGPU_PT_RW);
+	if (!s)
+		s = &g->kspace;
+	/* the global region belongs to the kernel in every space */
+	if (gpuaddr < DRGPU_VA_SMMU_INFO + 0x1000 && gpuaddr + len > DRGPU_VA_SETSTATE && s != &g->kspace)
+		return fail(g, "drgpu: mapping over the global region");
+	return drgpu_pt_map(&s->pt, gpuaddr, pa, len, ro ? DRGPU_PT_RO : DRGPU_PT_RW);
 }
 
-void drgpu_unmap(struct drgpu *g, uint64_t gpuaddr, uint64_t len)
+void drgpu_unmap(struct drgpu *g, struct drgpu_space *s, uint64_t gpuaddr, uint64_t len)
 {
-	drgpu_pt_unmap(&g->pt, gpuaddr, len);
+	drgpu_pt_unmap(s ? &s->pt : &g->kspace.pt, gpuaddr, len);
 }
 
 int drgpu_smmu_attach(struct drgpu *g)
 {
-	if (drgpu_map(g, DRGPU_VA_MEMSTORE, g->memstore.pa, DRGPU_MEMSTORE_SIZE, 0) ||
-	    drgpu_map(g, DRGPU_VA_SCRATCH, g->scratch.pa, 0x1000, 0) ||
-	    drgpu_map(g, DRGPU_VA_RING, g->ring.pa, 4 * DRGPU_RING_DWORDS, 1) ||
-	    drgpu_map(g, DRGPU_VA_PM4, g->pm4.pa, g->pm4.size, 1) ||
-	    drgpu_map(g, DRGPU_VA_PFP, g->pfp.pa, g->pfp.size, 1))
-		return fail(g, "drgpu: global mappings");
 	/* device_reset */
 	drgpu_wr(SMMU_SGFSR(g), drgpu_rd(SMMU_SGFSR(g)));
 	drgpu_wr(SMMU_TLBIALLH(g), 0);
@@ -346,7 +449,7 @@ int drgpu_smmu_attach(struct drgpu *g)
 	/* CB0: S1 with S2 bypass, VMID 2, ASID 1; io-pgtable 39-bit/36-bit, 4 KiB, NC walks */
 	drgpu_wr(SMMU_CBA2R0(g), 1);
 	drgpu_wr(SMMU_CBAR0(g), 0x0001f302);
-	drgpu_wr64(CB0(g, CB_TTBR0), g->l1.pa | 1ULL << 48);
+	drgpu_wr64(CB0(g, CB_TTBR0), g->kspace.l1.pa | 1ULL << 48);
 	drgpu_wr64(CB0(g, CB_TTBR1), 1ULL << 48);
 	drgpu_wr(CB0(g, CB_TCR), 0x00802019);
 	drgpu_wr(CB0(g, CB_TCR2), 0x00038001);
@@ -514,6 +617,27 @@ static int ring_wait_idle(struct drgpu *g, uint32_t timeout_us)
 /* ---- CP start (G2b/G2c: a5xx_start, a5xx_rb_start, a5xx_send_me_init, secure mode) ---- */
 int drgpu_cp_start(struct drgpu *g)
 {
+	/*
+	 * kgsl_iommu_start -> kgsl_iommu_set_pt(default) from the CPU on every
+	 * start, and the ring forgets its active context (adreno_ringbuffer_start):
+	 * the CP starts in the kernel's space whatever it ran before.
+	 */
+	drgpu_wr64(CB0(g, CB_TTBR0), g->kspace.l1.pa | (uint64_t)g->kspace.asid << 48);
+	drgpu_wr(CB0(g, CB_CONTEXTIDR), 0);
+	if (drgpu_tlb_flush(g))
+		return -1;
+	g->cur_space = &g->kspace;
+	g->cur_ctx = 0;
+	/* struct a5xx_cp_smmu_info as a5xx_preemption_start fills it: magic,
+	 * the default pagetable's TTBR0 and CONTEXTIDR, asid poisoned */
+	volatile uint32_t *si = (volatile uint32_t *)g->smmu_info.va;
+	uint64_t ttbr0 = g->kspace.l1.pa | (uint64_t)g->kspace.asid << 48;
+	si[0] = 0x3618CDA3;	/* A5XX_CP_SMMU_INFO_MAGIC_REF */
+	si[2] = (uint32_t)ttbr0;
+	si[3] = (uint32_t)(ttbr0 >> 32);
+	si[4] = 0xDECAFBAD;
+	si[5] = 0;		/* CONTEXTIDR of the kernel's space (CB0 attach leaves it 0) */
+	__asm__ volatile("dsb sy" ::: "memory");
 	for (unsigned i = 0; i < sizeof(a5xx_start_seq) / sizeof(a5xx_start_seq[0]); i++)
 		drgpu_wr(R(g, a5xx_start_seq[i][0]), a5xx_start_seq[i][1]);
 	*(volatile uint32_t *)g->scratch.va = 0;
@@ -555,17 +679,79 @@ int drgpu_cp_start(struct drgpu *g)
 }
 
 /* ---- submissions (adreno_ringbuffer_addcmds / submitcmd framing) ---- */
-uint32_t drgpu_submit(struct drgpu *g, uint32_t ctx, const struct drgpu_ib *ibs, unsigned n, uint32_t ts)
+/*
+ * Select space s from the ring, adreno_iommu_set_pt_generate_cmds() for a5xx:
+ * APRIV on; stall prefetch with the setstate NOP IB; CP_SMMU_TABLE_UPDATE
+ * (TTBR0 with the space's ASID, CONTEXTIDR) between WAIT_FOR_ME/IDLE pairs,
+ * which also flushes the GPU's caches and the SMMU TLB; invalidate the
+ * draw state; APRIV off. The MEM_WRITE after the update records the new
+ * TTBR0/CONTEXTIDR as KGSL's rb->pagetable_desc does (here: smmu_info + PT_INFO).
+ * KGSL issues all of it with KGSL_CMD_FLAGS_PMODE: register protection off
+ * around it (CP_CNTL is in the protected 0x800-0x83f range).
+ */
+#define SWITCH_DWORDS	36
+#define PT_INFO		0x800	/* ttbr0 (u64), contextidr in the smmu_info page */
+
+static void emit_space_switch(struct drgpu *g, struct drgpu_space *s)
+{
+	uint64_t ttbr0 = s->l1.pa | (uint64_t)s->asid << 48;
+	emit(g, pkt7(CP_SET_PROTECTED_MODE, 1));
+	emit(g, 0);
+	emit(g, pkt7(CP_WAIT_FOR_IDLE, 0));
+	emit(g, pkt7(CP_WAIT_FOR_ME, 0));
+	emit(g, pkt4(CP_CNTL, 1));
+	emit(g, 1);
+	emit(g, pkt7(CP_WAIT_FOR_ME, 0));
+	emit(g, pkt7(CP_INDIRECT_BUFFER_PFE, 3));
+	emit(g, (uint32_t)(DRGPU_VA_SETSTATE + 1024));
+	emit(g, (uint32_t)((DRGPU_VA_SETSTATE + 1024) >> 32));
+	emit(g, 2);
+	emit(g, pkt7(CP_WAIT_FOR_IDLE, 0));
+	emit(g, pkt7(CP_WAIT_FOR_IDLE, 0));
+	emit(g, pkt7(CP_WAIT_FOR_ME, 0));
+	emit(g, pkt7(CP_SMMU_TABLE_UPDATE, 3));
+	emit(g, (uint32_t)ttbr0);
+	emit(g, (uint32_t)(ttbr0 >> 32));
+	emit(g, s->asid);	/* CONTEXTIDR: the space's id */
+	emit(g, pkt7(CP_MEM_WRITE, 5));
+	emit(g, (uint32_t)(DRGPU_VA_SMMU_INFO + PT_INFO));
+	emit(g, (uint32_t)((DRGPU_VA_SMMU_INFO + PT_INFO) >> 32));
+	emit(g, (uint32_t)ttbr0);
+	emit(g, (uint32_t)(ttbr0 >> 32));
+	emit(g, s->asid);
+	emit(g, pkt7(CP_WAIT_FOR_ME, 0));
+	emit(g, pkt7(CP_WAIT_FOR_IDLE, 0));
+	emit(g, pkt7(CP_SET_DRAW_STATE, 3));	/* cp_invalidate_state */
+	emit(g, 0x40000);
+	emit(g, 0);
+	emit(g, 0);
+	emit(g, pkt7(CP_WAIT_FOR_IDLE, 0));
+	emit(g, pkt7(CP_WAIT_FOR_ME, 0));
+	emit(g, pkt4(CP_CNTL, 1));
+	emit(g, 0);
+	emit(g, pkt7(CP_SET_PROTECTED_MODE, 1));
+	emit(g, 1);
+	g->cur_space = s;
+}
+
+uint32_t drgpu_submit(struct drgpu *g, struct drgpu_space *s, uint32_t ctx, const struct drgpu_ib *ibs, unsigned n,
+		      uint32_t ts)
 {
 	uint64_t msva = DRGPU_VA_MEMSTORE;
-	if (!g->cp_running || ctx == 0 || ctx >= DRGPU_MS_RB)
+	if (!s)
+		s = &g->kspace;
+	if (!g->cp_running || !s->live || ctx == 0 || ctx >= DRGPU_MS_RB)
 		return 0;
-	if (ring_space(g, 4 * n + 32))
+	if (ring_space(g, 4 * n + 32 + SWITCH_DWORDS + 2))
 		return 0;
 	g->rb_ts++;
-	if (ctx != g->cur_ctx) {	/* adreno_drawctxt_switch: current_context */
+	if (s != g->cur_space)
+		emit_space_switch(g, s);
+	if (ctx != g->cur_ctx) {	/* adreno_drawctxt_switch / __add_curr_ctxt_cmds */
 		emit_mem_write(g, msva + DRGPU_MS_RB * DRGPU_MS_ENTRY + DRGPU_MS_CURCTX, ctx);
 		emit_mem_write(g, msva + DRGPU_MS_CURCTX, ctx);
+		emit(g, pkt4(UCHE_INVALIDATE0, 1));	/* invalidate UCHE for the new context */
+		emit(g, 0x12);
 		g->cur_ctx = ctx;
 	}
 	emit_mem_write(g, msva + ctx * DRGPU_MS_ENTRY + DRGPU_MS_SOP, ts);
@@ -741,6 +927,9 @@ int drgpu_power_off(struct drgpu *g)
 	drgpu_wr(R(g, VBIF_XIN_HALT_CTRL0), 0);
 	g->cp_running = 0;
 	if (set_bw(g, BW_GPU_OFF))
+		return -1;
+	/* off the PLL while it and the gfx3d branch still run */
+	if (g->pll >= 0 && gfx3d_to_xo(g))
 		return -1;
 	drgpu_wr(RBCPR_CBCR(g), drgpu_rd(RBCPR_CBCR(g)) & ~1U);
 	drgpu_wr(RBBMTIMER_CBCR(g), drgpu_rd(RBBMTIMER_CBCR(g)) & ~1U);

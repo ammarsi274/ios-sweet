@@ -36,5 +36,7 @@ int drgpu_pt_map(struct drgpu_pt *pt, uint64_t va, uint64_t pa, uint64_t len, in
 uint64_t drgpu_pt_unmap(struct drgpu_pt *pt, uint64_t va, uint64_t len);
 /* physical address for va, or ~0 if not mapped (the SMMU walk done by the CPU, for checks) */
 uint64_t drgpu_pt_lookup(const struct drgpu_pt *pt, uint64_t va);
+/* hand every L2/L3 table page back through free_table (the L1 stays the caller's); entries are cleared */
+void drgpu_pt_destroy(struct drgpu_pt *pt, void (*free_table)(void *os, uint64_t pa));
 
 #endif

@@ -74,6 +74,24 @@ uint64_t drgpu_pt_unmap(struct drgpu_pt *pt, uint64_t va, uint64_t len)
 	return n;
 }
 
+void drgpu_pt_destroy(struct drgpu_pt *pt, void (*free_table)(void *os, uint64_t pa))
+{
+	for (int i = 0; i < 512; i++) {
+		uint64_t e1 = pt->l1.va[i];
+		if ((e1 & 3) != PTE_VALID_TABLE)
+			continue;
+		uint64_t *l2 = pt->table_va(pt->os, e1 & PTE_ADDR);
+		for (int j = 0; j < 512; j++)
+			if ((l2[j] & 3) == PTE_VALID_TABLE) {
+				free_table(pt->os, l2[j] & PTE_ADDR);
+				l2[j] = 0;
+			}
+		free_table(pt->os, e1 & PTE_ADDR);
+		pt->l1.va[i] = 0;
+	}
+	pt->publish(pt->os);
+}
+
 uint64_t drgpu_pt_lookup(const struct drgpu_pt *pt, uint64_t va)
 {
 	const uint64_t *t = pt->l1.va;

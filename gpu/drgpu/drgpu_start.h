@@ -2,8 +2,8 @@
  * a5xx start sequence as HMD's kernel wrote it on this phone (ftrace
  * kgsl_regwrite, research/vendor-adreno/trace/ftrace-cold.txt lines 272-483:
  * a5xx_hwcg_set + a5xx_start, second power-on). Generated, not hand-typed.
- * Left out: CP_CONTEXT_SWITCH_SMMU_INFO_LO/HI (0x840/0x841), a preemption
- * buffer address in the kernel's GPU address space.
+ * CP_CONTEXT_SWITCH_SMMU_INFO_LO/HI (0x840/0x841) point at the global
+ * smmu_info page (a5xx_preemption_start), filled by drgpu_cp_start.
  */
 static const uint32_t a5xx_start_seq[][2] = {
 	{ 0x67, 0x55 },	/* RBBM_CLOCK_CNTL */
@@ -133,6 +133,8 @@ static const uint32_t a5xx_start_seq[][2] = {
 	{ 0xe60, 0x400 },	/* VPC_DBG_ECO_CNTL */
 	{ 0xe60, 0x800400 },	/* VPC_DBG_ECO_CNTL */
 	{ 0xe04, 0x0 },	/* HLSQ_DBG_ECO_CNTL */
+	{ 0x840, (uint32_t)DRGPU_VA_SMMU_INFO },	/* CP_CONTEXT_SWITCH_SMMU_INFO_LO */
+	{ 0x841, (uint32_t)(DRGPU_VA_SMMU_INFO >> 32) },	/* CP_CONTEXT_SWITCH_SMMU_INFO_HI */
 	{ 0x8a0, 0x7 },	/* CP_PROTECT_CNTL */
 	{ 0x880, 0x62000010 },	/* CP_PROTECT_REG_0 */
 	{ 0x881, 0x63000020 },

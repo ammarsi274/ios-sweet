@@ -26,11 +26,13 @@ struct drgpu_fw {
 };
 
 /* KGSL's global GPU addresses on this phone (ftrace map_sg, TWRP) */
+#define DRGPU_VA_SETSTATE	0xf8000000ULL	/* 4 KiB, a NOP IB at +1024 (KGSL_IOMMU_SETSTATE_NOP_OFFSET) */
 #define DRGPU_VA_MEMSTORE	0xf8001000ULL	/* 8 KiB, DEVICE_SHADOW */
 #define DRGPU_VA_SCRATCH	0xf8003000ULL	/* RPTR shadow at +0 */
 #define DRGPU_VA_RING		0xf8005000ULL	/* 32 KiB */
 #define DRGPU_VA_PM4		0xf8058000ULL
 #define DRGPU_VA_PFP		0xf805d000ULL
+#define DRGPU_VA_SMMU_INFO	0xf80e8000ULL	/* 4 KiB, struct a5xx_cp_smmu_info (0x840) */
 #define DRGPU_MEMSTORE_SIZE	0x2000
 #define DRGPU_RING_DWORDS	8192		/* RB_CNTL 0x20c */
 
@@ -44,12 +46,28 @@ struct drgpu_fw {
 
 #define DRGPU_LEVELS		4	/* 0 = 430, 1 = 370, 2 = 266, 3 = 160 MHz */
 
+/*
+ * A GPU address space: one per process (KGSL's per-process pagetable),
+ * plus the kernel's own. Every space carries the global buffers, so the CP,
+ * ring and memstore work whichever one is current. The CP switches spaces
+ * in the ring (CP_SMMU_TABLE_UPDATE, adreno_iommu.c a5xx path); each has
+ * its own ASID in TTBR0, so TLB entries never mix.
+ */
+struct drgpu_space {
+	struct drgpu_pt pt;
+	struct drgpu_mem l1;
+	uint32_t asid;
+	int live;
+};
+
 struct drgpu {
 	struct drgpu_os os;
 	struct drgpu_fw fw;
 	uintptr_t gcc, gpucc, gpu, smmu, ldo, tcsr, rpm_ram, rpm_ipc;
-	struct drgpu_mem ring, memstore, scratch, pm4, pfp, l1;
-	struct drgpu_pt pt;
+	struct drgpu_mem ring, memstore, scratch, pm4, pfp, setstate, smmu_info;
+	struct drgpu_space kspace;	/* the kernel's: CB0's TTBR0 after attach */
+	struct drgpu_space *cur_space;	/* the one the CP has selected */
+	uint8_t asid_used[256];
 	uint32_t ring_w;		/* next free dword */
 	uint32_t rb_ts;			/* ring 0 timestamp */
 	int zap_loaded, cp_running, powered;
@@ -74,16 +92,24 @@ int drgpu_power_off(struct drgpu *g);
 int drgpu_resume(struct drgpu *g, int level);	/* power on, CP restart (zap retained), level */
 uint32_t drgpu_gpu_khz(struct drgpu *g);	/* measured with an RBBM counter */
 
-/* one IB list submission for context ctx (KGSL framing); returns its timestamp, 0 on error */
+/*
+ * One IB list for context ctx in space s (NULL: the kernel's), KGSL framing;
+ * n = 0 is a marker (timestamp only). Returns ts, 0 on error.
+ */
 struct drgpu_ib { uint64_t gpuaddr; uint32_t dwords; };
-uint32_t drgpu_submit(struct drgpu *g, uint32_t ctx, const struct drgpu_ib *ibs, unsigned n, uint32_t ts);
+uint32_t drgpu_submit(struct drgpu *g, struct drgpu_space *s, uint32_t ctx, const struct drgpu_ib *ibs, unsigned n,
+		      uint32_t ts);
 uint32_t drgpu_retired(struct drgpu *g, uint32_t ctx);	/* memstore eoptimestamp */
 int drgpu_wait(struct drgpu *g, uint32_t ctx, uint32_t ts, uint32_t timeout_us);	/* 0 or -1 */
 uint32_t drgpu_irq(struct drgpu *g);		/* reads and clears RBBM_INT_0_STATUS */
 
-/* GPU memory: map caller pages at a GPU address; flush after a batch of changes */
-int drgpu_map(struct drgpu *g, uint64_t gpuaddr, uint64_t pa, uint64_t len, int ro);
-void drgpu_unmap(struct drgpu *g, uint64_t gpuaddr, uint64_t len);
+/* address spaces (one per process) */
+int drgpu_space_create(struct drgpu *g, struct drgpu_space *s);
+int drgpu_space_destroy(struct drgpu *g, struct drgpu_space *s);	/* GPU must be done with it */
+
+/* GPU memory in space s (NULL: the kernel's); flush the TLB after a batch of changes */
+int drgpu_map(struct drgpu *g, struct drgpu_space *s, uint64_t gpuaddr, uint64_t pa, uint64_t len, int ro);
+void drgpu_unmap(struct drgpu *g, struct drgpu_space *s, uint64_t gpuaddr, uint64_t len);
 int drgpu_tlb_flush(struct drgpu *g);
 
 /* RPM requests (drgpu_rpm.c) */
