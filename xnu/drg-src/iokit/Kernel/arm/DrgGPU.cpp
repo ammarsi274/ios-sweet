@@ -376,6 +376,25 @@ drg_gpu_os_sleep(void *ctx __unused, uint32_t us)
 	}
 }
 
+/* The core's clock under XNU (drgpu_os.h): the kernel's, not the raw counter registers. */
+extern "C" uint64_t
+drgpu_os_ticks(void)
+{
+	return mach_absolute_time();
+}
+
+extern "C" uint64_t
+drgpu_os_freq(void)
+{
+	static uint64_t hz;
+	if (hz == 0) {
+		uint64_t abs;
+		nanoseconds_to_absolutetime(NSEC_PER_SEC, &abs);
+		hz = abs;
+	}
+	return hz;
+}
+
 /* Device memory (nGnRE), mapped the way the other DRG drivers map theirs; never unmapped. */
 uintptr_t
 DrgGPU::osMmio(uint64_t pa, uint64_t len)
@@ -708,6 +727,9 @@ DrgGPU::start(IOService *provider)
 	if (!loadFirmware(&fw)) {
 		return false;
 	}
+	uint64_t cntfrq;
+	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(cntfrq));
+	IOLog("DRG GPU: clock %llu Hz (kernel timebase); cntfrq_el0 reads %llu\n", drgpu_os_freq(), cntfrq);
 	os.ctx = this;
 	os.mmio = drg_gpu_os_mmio;
 	os.alloc = drg_gpu_os_alloc;

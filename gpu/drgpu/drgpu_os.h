@@ -48,6 +48,26 @@ static inline void drgpu_wr64(uintptr_t a, uint64_t v)
 	__asm__ volatile("str %x0, [%1]\n\tdsb sy" : : "r"(v), "r"(a) : "memory");
 }
 
+#ifdef KERNEL
+/*
+ * XNU: the kernel's clock (mach_absolute_time at its ADT timebase), as the
+ * rest of DrgGPU uses. Boot #35 with the raw counter registers: a 20 ms
+ * wait for gcc_bimc_gfx gave up within 13 us (CBCR 0x80000000 before,
+ * 0x1 = running right after), so every core timeout was ~0 under XNU.
+ */
+uint64_t drgpu_os_ticks(void);
+uint64_t drgpu_os_freq(void);
+
+static inline uint64_t drgpu_ticks(void)
+{
+	return drgpu_os_ticks();
+}
+
+static inline uint64_t drgpu_freq(void)
+{
+	return drgpu_os_freq();
+}
+#else
 static inline uint64_t drgpu_ticks(void)
 {
 	uint64_t v;
@@ -61,6 +81,7 @@ static inline uint64_t drgpu_freq(void)
 	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v));
 	return v;
 }
+#endif
 
 static inline void drgpu_udelay(uint32_t us)
 {
@@ -69,14 +90,18 @@ static inline void drgpu_udelay(uint32_t us)
 		;
 }
 
-/* poll until (rd(a) & mask) == want: microseconds taken, or -1 after timeout_us */
+/*
+ * poll until (rd(a) & mask) == want: microseconds taken, or -1 after timeout_us.
+ * A success is never negative (the old (int) cast of a large count could be).
+ */
 static inline int drgpu_poll(uintptr_t a, uint32_t mask, uint32_t want, uint32_t timeout_us)
 {
-	uint64_t t0 = drgpu_ticks(), end = t0 + drgpu_freq() / 1000000 * timeout_us;
+	uint64_t f = drgpu_freq(), t0 = drgpu_ticks(), end = t0 + f / 1000000 * timeout_us;
 	while ((drgpu_rd(a) & mask) != want)
 		if (drgpu_ticks() > end)
 			return -1;
-	return (int)((drgpu_ticks() - t0) * 1000000 / drgpu_freq());
+	uint64_t us = f >= 1000000 ? (drgpu_ticks() - t0) / (f / 1000000) : 0;
+	return us > 0x7fffffff ? 0x7fffffff : (int)us;
 }
 
 #endif

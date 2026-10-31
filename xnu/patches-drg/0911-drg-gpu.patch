@@ -1286,10 +1286,10 @@ index 0000000..f70322e
 +#endif
 diff --git a/bsd/dev/drgpu/drgpu_os.h b/bsd/dev/drgpu/drgpu_os.h
 new file mode 100755
-index 0000000..2eebc9e
+index 0000000..cab06bf
 --- /dev/null
 +++ b/bsd/dev/drgpu/drgpu_os.h
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,107 @@
 +/*
 + * drgpu: what the portable GPU core needs from its OS (shim or XNU), and
 + * the register accessors every MMIO access goes through.
@@ -1340,6 +1340,26 @@ index 0000000..2eebc9e
 +	__asm__ volatile("str %x0, [%1]\n\tdsb sy" : : "r"(v), "r"(a) : "memory");
 +}
 +
++#ifdef KERNEL
++/*
++ * XNU: the kernel's clock (mach_absolute_time at its ADT timebase), as the
++ * rest of DrgGPU uses. Boot #35 with the raw counter registers: a 20 ms
++ * wait for gcc_bimc_gfx gave up within 13 us (CBCR 0x80000000 before,
++ * 0x1 = running right after), so every core timeout was ~0 under XNU.
++ */
++uint64_t drgpu_os_ticks(void);
++uint64_t drgpu_os_freq(void);
++
++static inline uint64_t drgpu_ticks(void)
++{
++	return drgpu_os_ticks();
++}
++
++static inline uint64_t drgpu_freq(void)
++{
++	return drgpu_os_freq();
++}
++#else
 +static inline uint64_t drgpu_ticks(void)
 +{
 +	uint64_t v;
@@ -1353,6 +1373,7 @@ index 0000000..2eebc9e
 +	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v));
 +	return v;
 +}
++#endif
 +
 +static inline void drgpu_udelay(uint32_t us)
 +{
@@ -1361,14 +1382,18 @@ index 0000000..2eebc9e
 +		;
 +}
 +
-+/* poll until (rd(a) & mask) == want: microseconds taken, or -1 after timeout_us */
++/*
++ * poll until (rd(a) & mask) == want: microseconds taken, or -1 after timeout_us.
++ * A success is never negative (the old (int) cast of a large count could be).
++ */
 +static inline int drgpu_poll(uintptr_t a, uint32_t mask, uint32_t want, uint32_t timeout_us)
 +{
-+	uint64_t t0 = drgpu_ticks(), end = t0 + drgpu_freq() / 1000000 * timeout_us;
++	uint64_t f = drgpu_freq(), t0 = drgpu_ticks(), end = t0 + f / 1000000 * timeout_us;
 +	while ((drgpu_rd(a) & mask) != want)
 +		if (drgpu_ticks() > end)
 +			return -1;
-+	return (int)((drgpu_ticks() - t0) * 1000000 / drgpu_freq());
++	uint64_t us = f >= 1000000 ? (drgpu_ticks() - t0) / (f / 1000000) : 0;
++	return us > 0x7fffffff ? 0x7fffffff : (int)us;
 +}
 +
 +#endif
@@ -1995,10 +2020,10 @@ index 0000000..f24ec61
 +#endif
 diff --git a/iokit/Kernel/arm/DrgGPU.cpp b/iokit/Kernel/arm/DrgGPU.cpp
 new file mode 100755
-index 0000000..db45bec
+index 0000000..6cb3170
 --- /dev/null
 +++ b/iokit/Kernel/arm/DrgGPU.cpp
-@@ -0,0 +1,1532 @@
+@@ -0,0 +1,1554 @@
 +/*
 + * DRG (Nokia 6.1 Plus) GPU: the Adreno 512 for iOS userland.
 + *
@@ -2377,6 +2402,25 @@ index 0000000..db45bec
 +	}
 +}
 +
++/* The core's clock under XNU (drgpu_os.h): the kernel's, not the raw counter registers. */
++extern "C" uint64_t
++drgpu_os_ticks(void)
++{
++	return mach_absolute_time();
++}
++
++extern "C" uint64_t
++drgpu_os_freq(void)
++{
++	static uint64_t hz;
++	if (hz == 0) {
++		uint64_t abs;
++		nanoseconds_to_absolutetime(NSEC_PER_SEC, &abs);
++		hz = abs;
++	}
++	return hz;
++}
++
 +/* Device memory (nGnRE), mapped the way the other DRG drivers map theirs; never unmapped. */
 +uintptr_t
 +DrgGPU::osMmio(uint64_t pa, uint64_t len)
@@ -2709,6 +2753,9 @@ index 0000000..db45bec
 +	if (!loadFirmware(&fw)) {
 +		return false;
 +	}
++	uint64_t cntfrq;
++	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(cntfrq));
++	IOLog("DRG GPU: clock %llu Hz (kernel timebase); cntfrq_el0 reads %llu\n", drgpu_os_freq(), cntfrq);
 +	os.ctx = this;
 +	os.mmio = drg_gpu_os_mmio;
 +	os.alloc = drg_gpu_os_alloc;
