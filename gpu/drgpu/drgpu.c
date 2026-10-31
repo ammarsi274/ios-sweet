@@ -251,7 +251,7 @@ int drgpu_init(struct drgpu *g, const struct drgpu_os *os, const struct drgpu_fw
 		return fail(g, "drgpu: mmio map failed");
 	g->memacc = (drgpu_rd(MEM_ACC_SEL(g)) & 1) ? 1 : 2;	/* corner-acc-map <1 0> */
 	if (os->alloc(os->ctx, 4 * DRGPU_RING_DWORDS, 0x1000, &g->ring) ||
-	    os->alloc(os->ctx, DRGPU_MEMSTORE_SIZE, 0x1000, &g->memstore) ||
+	    os->alloc(os->ctx, 0x4000, 0x4000, &g->memstore) ||	/* alone in a 16 KiB page: mapped into processes */
 	    os->alloc(os->ctx, 0x1000, 0x1000, &g->scratch) ||
 	    os->alloc(os->ctx, 0x1000, 0x1000, &g->setstate) ||
 	    os->alloc(os->ctx, 0x1000, 0x1000, &g->smmu_info) ||
@@ -386,7 +386,8 @@ int drgpu_space_destroy(struct drgpu *g, struct drgpu_space *s)
 	if (g->cur_space == s) {
 		if (g->cp_running && ring_wait_idle(g, 1000000))
 			return fail(g, "drgpu: space busy at destroy");
-		drgpu_wr64(CB0(g, CB_TTBR0), g->kspace.l1.pa | (uint64_t)g->kspace.asid << 48);
+		if (g->powered)	/* else drgpu_cp_start puts the kernel's back */
+			drgpu_wr64(CB0(g, CB_TTBR0), g->kspace.l1.pa | (uint64_t)g->kspace.asid << 48);
 		g->cur_space = &g->kspace;
 	}
 	drgpu_pt_destroy(&s->pt, pt_free);
@@ -407,6 +408,9 @@ static const uint32_t impl_defs[][2] = {	/* arm,smmu-kgsl@5040000 attach-impl-de
 
 int drgpu_tlb_flush(struct drgpu *g)
 {
+	/* collapsed: no SMMU access; drgpu_cp_start flushes everything before the GPU runs again */
+	if (!g->powered)
+		return 0;
 	drgpu_wr(CB0(g, CB_TLBIALL), 0);
 	drgpu_wr(CB0(g, CB_TLBSYNC), 0);
 	return drgpu_poll(CB0(g, CB_TLBSTATUS), 1, 0, 30000) < 0 ? fail(g, "drgpu: tlb sync") : 0;

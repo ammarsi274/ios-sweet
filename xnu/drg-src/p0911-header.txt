@@ -1,0 +1,17 @@
+drg: DrgGPU, the Nokia's Adreno 512 for iOS userland (patch 0911)
+
+The portable drgpu core (bsd/dev/drgpu, copied from gpu/drgpu) is the code
+the shim ran on the phone: bring-up, all four levels, Nokia's captured
+draws replayed in a per-process GPU address space identical to Linux,
+GPU interrupt, GX collapse/restore (drg/GPU-IOS-DESIGN.md I2, I3).
+DrgGPU wraps it for XNU:
+- firmware from the shim's blob (boot-arg drgpufw), FNV-1a checked;
+- write-combined contiguous pools for rings, globals and page tables;
+- SPI 300 (INTID 332) routed to the boot CPU, handler on every CPU;
+- idle collapse after Nokia's 80 ms idle timeout, resume on submit;
+- DCVS over 430/370/266/160 MHz from GPU busy time;
+- fault recovery (CP_HW_ERROR, hang detect) by power cycling the GPU.
+DrgGPUUserClient offers Nokia's KGSL calls (gpu/drgpu/drgpu_uc.h): every
+object is mapped into the task and, at the same address, into the task's
+own GPU address space (KGSL USE_CPU_MAP), plus IOSurface import.
+Boot-args: drggpu=0, drggpu_level=0..3, drggpu_idle=<ms>.

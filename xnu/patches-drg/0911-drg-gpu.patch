@@ -1,0 +1,3534 @@
+drg: DrgGPU, the Nokia's Adreno 512 for iOS userland (patch 0911)
+
+The portable drgpu core (bsd/dev/drgpu, copied from gpu/drgpu) is the code
+the shim ran on the phone: bring-up, all four levels, Nokia's captured
+draws replayed in a per-process GPU address space identical to Linux,
+GPU interrupt, GX collapse/restore (drg/GPU-IOS-DESIGN.md I2, I3).
+DrgGPU wraps it for XNU:
+- firmware from the shim's blob (boot-arg drgpufw), FNV-1a checked;
+- write-combined contiguous pools for rings, globals and page tables;
+- SPI 300 (INTID 332) routed to the boot CPU, handler on every CPU;
+- idle collapse after Nokia's 80 ms idle timeout, resume on submit;
+- DCVS over 430/370/266/160 MHz from GPU busy time;
+- fault recovery (CP_HW_ERROR, hang detect) by power cycling the GPU.
+DrgGPUUserClient offers Nokia's KGSL calls (gpu/drgpu/drgpu_uc.h): every
+object is mapped into the task and, at the same address, into the task's
+own GPU address space (KGSL USE_CPU_MAP), plus IOSurface import.
+Boot-args: drggpu=0, drggpu_level=0..3, drggpu_idle=<ms>.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index a424bf1..80ccf68 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,9 @@ bsd/dev/drg_emmc.c			standard
+ bsd/dev/drg_ts.c			standard
+ bsd/kern/drg_perf.c			standard
+ bsd/dev/drg_keys.c			standard
++bsd/dev/drgpu/drgpu.c			standard
++bsd/dev/drgpu/drgpu_pt.c		standard
++bsd/dev/drgpu/drgpu_rpm.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/drgpu/drgpu.c b/bsd/dev/drgpu/drgpu.c
+new file mode 100755
+index 0000000..09ec24c
+--- /dev/null
++++ b/bsd/dev/drgpu/drgpu.c
+@@ -0,0 +1,1010 @@
++/*
++ * drgpu core, see drgpu.h. Each sequence is the one the shim proved on the
++ * phone (shim/drg_gpu.c G2a-G3r, drg/gpu-research/TWRP-MEASURED.md §6b-6g),
++ * whose sources are HMD's DRG kernel files named at each step.
++ */
++#include "drgpu.h"
++#include "drgpu_start.h"
++
++/* ---- addresses: this phone's device tree (device-info/fdt.dts) ---- */
++#define PA_GCC_GPU	0x171000ULL	/* GCC 0x100000: gpu_cfg_ahb +0x71004 .. bimc_gfx +0x7106c */
++#define PA_GPUCC	0x5065000ULL	/* clock-controller@5065000 .. GDSCs 0x5066004 / 0x5066094 */
++#define PA_LDO		0x506e000ULL	/* msm_gfx_ldo */
++#define PA_GPU		0x5000000ULL	/* kgsl-3d0, 0x40000 */
++#define PA_SMMU		0x5040000ULL	/* arm,smmu-kgsl */
++#define PA_TCSR_ACC	0x1fcf000ULL	/* gfx_mem_acc_corner acc-sel-l1 0x1fcf004 */
++#define PA_RPM_RAM	0x778000ULL	/* glink-rpm msgram, 0x7000 */
++#define PA_RPM_IPC	0x17911000ULL	/* IPC 0x17911008 */
++
++/* GCC branches (gcc-sdm660.c) */
++#define GCC_GPU_CFG_AHB(g)	((g)->gcc + 0x004)
++#define GCC_GPU_BIMC_GFX(g)	((g)->gcc + 0x010)
++#define GCC_BIMC_GFX(g)		((g)->gcc + 0x06c)
++/* GPUCC (gpucc-sdm660.c, gdsc DT nodes) */
++#define PLL(g, n)		((g)->gpucc + 0x40UL * (n))
++#define RBCPR_CBCR(g)		((g)->gpucc + 0x1054)
++#define CXO_CBCR(g)		((g)->gpucc + 0x1020)
++#define GFX3D_CMD(g)		((g)->gpucc + 0x1070)
++#define GFX3D_CFG(g)		((g)->gpucc + 0x1074)
++#define GFX3D_CBCR(g)		((g)->gpucc + 0x1098)
++#define RBBMTIMER_CBCR(g)	((g)->gpucc + 0x10d0)
++#define GX_DOMAIN(g)		((g)->gpucc + 0x130)
++#define GDSC_CX(g)		((g)->gpucc + 0x1004)
++#define GX_SW_RESET(g)		((g)->gpucc + 0x1090)
++#define GDSC_GX(g)		((g)->gpucc + 0x1094)
++#define LDO_PWRSWITCH_CTRL(g)	((g)->ldo + 0x1c)
++#define MEM_ACC_SEL(g)		((g)->tcsr + 0x004)
++
++#define CBCR_CLK_OFF		(1U << 31)
++#define RCG_UPDATE		(1U << 0)
++#define RCG_ROOT_EN		(1U << 1)
++#define GDSC_PWR_ON		(1U << 31)
++#define GDSC_SW_COLLAPSE	(1U << 0)
++#define GDSC_HW_CONTROL		(1U << 1)
++
++/* alpha PLL (clk-alpha-pll.c) */
++#define PLL_OUTCTRL		(1U << 0)
++#define PLL_BYPASSNL		(1U << 1)
++#define PLL_RESET_N		(1U << 2)
++#define PLL_VOTE_FSM_ENA	(1U << 20)
++#define PLL_LOCK_DET		(1U << 31)
++#define PLL_VCO_MASK		(3U << 20)
++#define PLL_VCO_500_1000	(2U << 20)
++#define PLL_POSTDIV_MASK	(0xfU << 8)
++#define GPU_PLL_CONFIG_CTL	0x4001055bu
++
++/* GPU registers (a5xx_reg.h), dword index */
++#define R(g, r)			((g)->gpu + 4UL * (r))
++#define RBBM_CLOCK_CNTL		0x67
++#define RBBM_INT_CLEAR_CMD	0x37
++#define RBBM_PERFCTR_RBBM_1_LO	0x3b2
++#define RBBM_PERFCTR_RBBM_1_HI	0x3b3
++#define RBBM_PERFCTR_RBBM_SEL_1	0x46c
++#define RBBM_INT_0_STATUS	0x4e1
++#define RBBM_STATUS		0x4f5
++#define RBBM_ISDB_CNT		0x533
++#define CP_RB_BASE		0x800
++#define CP_RB_BASE_HI		0x801
++#define CP_RB_CNTL		0x802
++#define CP_RB_RPTR_ADDR_LO	0x804
++#define CP_RB_RPTR_ADDR_HI	0x805
++#define CP_RB_RPTR		0x806
++#define CP_RB_WPTR		0x807
++#define CP_ME_CNTL		0x832
++#define CP_PFP_INSTR_BASE_LO	0x835
++#define CP_PFP_INSTR_BASE_HI	0x836
++#define CP_PM4_INSTR_BASE_LO	0x838
++#define CP_PM4_INSTR_BASE_HI	0x839
++#define CP_HW_FAULT		0xb1a
++#define RBBM_SECVID_TRUST_CNTL	0xf400
++#define A5XX_CP_RB_CNTL_DEFAULT	0x20c	/* measured */
++
++/* PM4 (adreno_pm4types.h, a3xx_reg.h) */
++#define CP_NOP			0x10
++#define CP_MEM_WRITE		0x3d
++#define CP_INDIRECT_BUFFER_PFE	0x3f
++#define CP_EVENT_WRITE		0x46
++#define CP_ME_INIT		0x48
++#define CP_SET_SECURE_MODE	0x66
++#define CP_WAIT_FOR_ME		0x13
++#define CP_WAIT_FOR_IDLE	0x26
++#define CP_SET_DRAW_STATE	0x43
++#define CP_SMMU_TABLE_UPDATE	0x53
++#define CP_SET_PROTECTED_MODE	0x5f
++#define CACHE_FLUSH_TS		4
++#define CP_CNTL			0x831	/* a5xx_reg.h: APRIV */
++#define UCHE_INVALIDATE0	0xe95
++
++/* SMMU (arm-smmu.c, measured IDs: 4 KiB pages, CBs at +0x8000) */
++#define SMMU_SGFSR(g)		((g)->smmu + 0x048)
++#define SMMU_TLBIALLNSNH(g)	((g)->smmu + 0x068)
++#define SMMU_TLBIALLH(g)	((g)->smmu + 0x06c)
++#define SMMU_STLBGSYNC(g)	((g)->smmu + 0x070)
++#define SMMU_STLBGSTATUS(g)	((g)->smmu + 0x074)
++#define SMMU_SCR0(g)		((g)->smmu + 0x000)
++#define SMMU_SMR0(g)		((g)->smmu + 0x800)
++#define SMMU_S2CR0(g)		((g)->smmu + 0xc00)
++#define SMMU_CBAR0(g)		((g)->smmu + 0x1000)
++#define SMMU_CBA2R0(g)		((g)->smmu + 0x1800)
++#define SMMU_MICRO_MMU_CTRL(g)	((g)->smmu + 0x6000)
++#define CB0(g, o)		((g)->smmu + 0x8000 + (o))
++#define CB_SCTLR		0x00
++#define CB_ACTLR		0x04
++#define CB_TCR2			0x10
++#define CB_TTBR0		0x20
++#define CB_TTBR1		0x28
++#define CB_TCR			0x30
++#define CB_CONTEXTIDR		0x34
++#define CB_MAIR0		0x38
++#define CB_MAIR1		0x3c
++#define CB_TLBIALL		0x618
++#define CB_TLBSYNC		0x7f0
++#define CB_TLBSTATUS		0x7f4
++
++/* RPM resources and keys (rpm-smd-regulator.c, msm-bus-board.h) */
++#define RPM_RES_RWCX		0x78637772u
++#define RPM_RES_RWMX		0x786d7772u
++#define RPM_RES_BSLV		0x766c7362u
++#define RPM_KEY_SWEN		0x6e657773u
++#define RPM_KEY_VLVL		0x6c766c76u
++#define RPM_KEY_BW		0x00007762u
++
++/* ---- helpers ---- */
++static int fail(struct drgpu *g, const char *msg)
++{
++	g->errmsg = msg;
++	g->os.log(g->os.ctx, msg);
++	return -1;
++}
++
++static void logx(struct drgpu *g, const char *label, uint64_t v)
++{
++	char b[96];
++	unsigned n = 0;
++	while (*label && n < 60)
++		b[n++] = *label++;
++	b[n++] = ' ';
++	b[n++] = '0';
++	b[n++] = 'x';
++	int started = 0;
++	for (int i = 15; i >= 0; i--) {
++		unsigned d = (unsigned)(v >> (4 * i)) & 15;
++		if (d || started || i == 0) {
++			b[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
++			started = 1;
++		}
++	}
++	b[n] = 0;
++	g->os.log(g->os.ctx, b);
++}
++
++static uint32_t pkt4(uint32_t reg, uint32_t cnt)	/* cp_type4_packet() */
++{
++	uint32_t p1 = cnt ^ cnt >> 4 ^ cnt >> 8 ^ cnt >> 12;
++	uint32_t p2 = reg ^ reg >> 4 ^ reg >> 8 ^ reg >> 12 ^ reg >> 16;
++	return 4U << 28 | cnt | ((0x9669 >> (p1 & 15)) & 1) << 7 | (reg & 0x3ffff) << 8 |
++	       ((0x9669 >> (p2 & 15)) & 1) << 27;
++}
++
++static uint32_t pkt7(uint32_t op, uint32_t cnt)	/* cp_type7_packet() */
++{
++	uint32_t p1 = cnt ^ cnt >> 4 ^ cnt >> 8 ^ cnt >> 12, p2 = op ^ op >> 4;
++	return 7U << 28 | cnt | ((0x9669 >> (p1 & 15)) & 1) << 15 | (op & 0x7f) << 16 |
++	       ((0x9669 >> (p2 & 15)) & 1) << 23;
++}
++
++static int branch_on(uintptr_t cbcr)
++{
++	drgpu_wr(cbcr, drgpu_rd(cbcr) | 1);
++	return drgpu_poll(cbcr, CBCR_CLK_OFF, 0, 2000) < 0 ? -1 : 0;
++}
++
++static int pt_alloc(void *ctx, struct drgpu_page *p)
++{
++	struct drgpu *g = ctx;
++	struct drgpu_mem m;
++	if (g->os.alloc(g->os.ctx, 0x1000, 0x1000, &m))
++		return -1;
++	p->pa = m.pa;
++	p->va = m.va;
++	return 0;
++}
++
++static uint64_t *pt_va(void *ctx, uint64_t pa)
++{
++	struct drgpu *g = ctx;
++	return g->os.ptov(g->os.ctx, pa);
++}
++
++static void pt_publish(void *ctx)
++{
++	(void)ctx;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static int space_init(struct drgpu *g, struct drgpu_space *s, uint32_t asid);
++static int ring_wait_idle(struct drgpu *g, uint32_t timeout_us);
++
++/* ---- init ---- */
++static int alloc_fw(struct drgpu *g, const uint8_t *src, uint32_t len, struct drgpu_mem *m)
++{
++	/* _load_firmware: the file without its first dword */
++	if (len < 8 || g->os.alloc(g->os.ctx, (len - 4 + 0xfff) & ~0xfffU, 0x1000, m))
++		return -1;
++	volatile uint8_t *d = m->va;
++	for (uint32_t i = 4; i < len; i++)
++		d[i - 4] = src[i];
++	return 0;
++}
++
++int drgpu_init(struct drgpu *g, const struct drgpu_os *os, const struct drgpu_fw *fw)
++{
++	/* field by field: no memcpy needed (the shim has no C library) */
++	g->os.ctx = os->ctx;
++	g->os.mmio = os->mmio;
++	g->os.alloc = os->alloc;
++	g->os.free = os->free;
++	g->os.ptov = os->ptov;
++	g->os.log = os->log;
++	g->os.sleep_us = os->sleep_us;
++	g->fw.pm4 = fw->pm4;
++	g->fw.pm4_len = fw->pm4_len;
++	g->fw.pfp = fw->pfp;
++	g->fw.pfp_len = fw->pfp_len;
++	g->fw.zap_mdt = fw->zap_mdt;
++	g->fw.zap_mdt_len = fw->zap_mdt_len;
++	g->fw.zap_b02 = fw->zap_b02;
++	g->fw.zap_b02_len = fw->zap_b02_len;
++	g->level = -1;
++	g->pll = -1;
++	g->cx = 128;	/* Linux's APPS CX vote with the GPU on (§6g) */
++	g->memacc = 0;	/* read from the hardware below */
++	g->gcc = os->mmio(os->ctx, PA_GCC_GPU, 0x1000);
++	g->gpucc = os->mmio(os->ctx, PA_GPUCC, 0x9000);
++	g->ldo = os->mmio(os->ctx, PA_LDO, 0x1000);
++	g->gpu = os->mmio(os->ctx, PA_GPU, 0x40000);
++	g->smmu = os->mmio(os->ctx, PA_SMMU, 0x10000);
++	g->tcsr = os->mmio(os->ctx, PA_TCSR_ACC, 0x1000);
++	g->rpm_ram = os->mmio(os->ctx, PA_RPM_RAM, 0x7000);
++	g->rpm_ipc = os->mmio(os->ctx, PA_RPM_IPC, 0x1000);
++	if (!g->gcc || !g->gpucc || !g->ldo || !g->gpu || !g->smmu || !g->tcsr || !g->rpm_ram || !g->rpm_ipc)
++		return fail(g, "drgpu: mmio map failed");
++	g->memacc = (drgpu_rd(MEM_ACC_SEL(g)) & 1) ? 1 : 2;	/* corner-acc-map <1 0> */
++	if (os->alloc(os->ctx, 4 * DRGPU_RING_DWORDS, 0x1000, &g->ring) ||
++	    os->alloc(os->ctx, 0x4000, 0x4000, &g->memstore) ||	/* alone in a 16 KiB page: mapped into processes */
++	    os->alloc(os->ctx, 0x1000, 0x1000, &g->scratch) ||
++	    os->alloc(os->ctx, 0x1000, 0x1000, &g->setstate) ||
++	    os->alloc(os->ctx, 0x1000, 0x1000, &g->smmu_info) ||
++	    alloc_fw(g, fw->pm4, fw->pm4_len, &g->pm4) || alloc_fw(g, fw->pfp, fw->pfp_len, &g->pfp))
++		return fail(g, "drgpu: memory");
++	/* the NOP IB the pagetable switch runs to stall prefetch (adreno_iommu.c) */
++	((volatile uint32_t *)g->setstate.va)[256] = pkt7(CP_NOP, 1);
++	((volatile uint32_t *)g->setstate.va)[257] = 0;
++	g->asid_used[0] = g->asid_used[1] = 1;	/* ASID 1: the kernel's space (CB0 attach) */
++	if (space_init(g, &g->kspace, 1))
++		return fail(g, "drgpu: memory");
++	g->cur_space = &g->kspace;
++	return 0;
++}
++
++/*
++ * gfx3d RCG onto the crystal: source 0, divider field 1. A glitch-free
++ * switch needs the old and the new source running, so this is done while
++ * the PLL is still up (power off) and is a no-op switch at power on.
++ */
++static int gfx3d_to_xo(struct drgpu *g)
++{
++	drgpu_wr(GFX3D_CFG(g), (drgpu_rd(GFX3D_CFG(g)) & ~0x71fU) | 0x001);
++	drgpu_wr(GFX3D_CMD(g), drgpu_rd(GFX3D_CMD(g)) | RCG_UPDATE);
++	return drgpu_poll(GFX3D_CMD(g), RCG_UPDATE, 0, 2000) < 0 ? fail(g, "drgpu: gfx3d rcg update") : 0;
++}
++
++/* ---- power (G2a: gdsc-regulator.c gdsc_enable, msm_gfx_ldo.c enable_bhs_mode) ---- */
++int drgpu_power_on(struct drgpu *g)
++{
++	if (branch_on(GCC_GPU_CFG_AHB(g)) || branch_on(GCC_BIMC_GFX(g)) || branch_on(GCC_GPU_BIMC_GFX(g)) ||
++	    branch_on(CXO_CBCR(g)))
++		return fail(g, "drgpu: gcc/cxo branch did not start");
++	if (drgpu_rd(GDSC_CX(g)) & GDSC_HW_CONTROL)
++		return fail(g, "drgpu: cx gdsc under hw control");
++	drgpu_wr(GDSC_CX(g), drgpu_rd(GDSC_CX(g)) & ~GDSC_SW_COLLAPSE);
++	drgpu_udelay(1);
++	if (drgpu_poll(GDSC_CX(g), GDSC_PWR_ON, GDSC_PWR_ON, 2000) < 0)
++		return fail(g, "drgpu: cx gdsc did not power on");
++	uint32_t ctl = drgpu_rd(LDO_PWRSWITCH_CTRL(g));
++	ctl |= 1U << 4;		/* LDO under SW control */
++	drgpu_wr(LDO_PWRSWITCH_CTRL(g), ctl);
++	ctl &= ~(1U << 9);	/* power source BHS */
++	drgpu_wr(LDO_PWRSWITCH_CTRL(g), ctl);
++	ctl &= ~(1U << 1);	/* BHS_EN_FEW to gdsc */
++	drgpu_wr(LDO_PWRSWITCH_CTRL(g), ctl);
++	ctl &= ~(1U << 2);	/* BHS_EN_REST to gdsc */
++	drgpu_wr(LDO_PWRSWITCH_CTRL(g), ctl);
++	ctl &= ~(1U << 0);	/* BHS under GDSC control */
++	drgpu_wr(LDO_PWRSWITCH_CTRL(g), ctl);
++	if (gfx3d_to_xo(g))
++		return -1;
++	drgpu_wr(GFX3D_CMD(g), (drgpu_rd(GFX3D_CMD(g)) & ~RCG_UPDATE) | RCG_ROOT_EN);
++	if (drgpu_rd(GDSC_GX(g)) & GDSC_HW_CONTROL)
++		return fail(g, "drgpu: gx gdsc under hw control");
++	drgpu_wr(GX_SW_RESET(g), drgpu_rd(GX_SW_RESET(g)) | 1);
++	drgpu_udelay(1);
++	drgpu_wr(GX_SW_RESET(g), drgpu_rd(GX_SW_RESET(g)) & ~1U);
++	drgpu_wr(GX_DOMAIN(g), drgpu_rd(GX_DOMAIN(g)) | (1U << 4));	/* GMEM_RESET */
++	drgpu_udelay(1);
++	drgpu_wr(GX_DOMAIN(g), drgpu_rd(GX_DOMAIN(g)) & ~(1U << 4));
++	drgpu_wr(GX_DOMAIN(g), drgpu_rd(GX_DOMAIN(g)) & ~1U);	/* CLAMP_IO off */
++	drgpu_wr(GDSC_GX(g), drgpu_rd(GDSC_GX(g)) & ~GDSC_SW_COLLAPSE);
++	drgpu_udelay(1);
++	int us = drgpu_poll(GDSC_GX(g), GDSC_PWR_ON, GDSC_PWR_ON, 2000);
++	drgpu_udelay(2);
++	drgpu_wr(GFX3D_CMD(g), drgpu_rd(GFX3D_CMD(g)) & ~(RCG_ROOT_EN | RCG_UPDATE));
++	if (us < 0)
++		return fail(g, "drgpu: gx gdsc did not power on");
++	if (branch_on(GFX3D_CBCR(g)) || branch_on(RBBMTIMER_CBCR(g)) || branch_on(RBCPR_CBCR(g)))
++		return fail(g, "drgpu: gpu branch did not start");
++	g->powered = 1;
++	g->level = -1;
++	g->pll = -1;
++	return 0;
++}
++
++/* ---- address spaces ---- */
++static int map_globals(struct drgpu *g, struct drgpu_pt *pt)
++{
++	return drgpu_pt_map(pt, DRGPU_VA_SETSTATE, g->setstate.pa, 0x1000, DRGPU_PT_RO) ||
++	       drgpu_pt_map(pt, DRGPU_VA_MEMSTORE, g->memstore.pa, DRGPU_MEMSTORE_SIZE, DRGPU_PT_RW) ||
++	       drgpu_pt_map(pt, DRGPU_VA_SCRATCH, g->scratch.pa, 0x1000, DRGPU_PT_RW) ||
++	       drgpu_pt_map(pt, DRGPU_VA_RING, g->ring.pa, 4 * DRGPU_RING_DWORDS, DRGPU_PT_RO) ||
++	       drgpu_pt_map(pt, DRGPU_VA_PM4, g->pm4.pa, g->pm4.size, DRGPU_PT_RO) ||
++	       drgpu_pt_map(pt, DRGPU_VA_PFP, g->pfp.pa, g->pfp.size, DRGPU_PT_RO) ||
++	       drgpu_pt_map(pt, DRGPU_VA_SMMU_INFO, g->smmu_info.pa, 0x1000, DRGPU_PT_RW) ? -1 : 0;
++}
++
++static int space_init(struct drgpu *g, struct drgpu_space *s, uint32_t asid)
++{
++	if (g->os.alloc(g->os.ctx, 0x1000, 0x1000, &s->l1))
++		return -1;
++	s->pt = (struct drgpu_pt){ { s->l1.pa, s->l1.va }, pt_alloc, pt_va, pt_publish, g };
++	s->asid = asid;
++	if (map_globals(g, &s->pt))
++		return -1;
++	s->live = 1;
++	return 0;
++}
++
++static void pt_free(void *ctx, uint64_t pa)
++{
++	struct drgpu *g = ctx;
++	struct drgpu_mem m = { pa, g->os.ptov(g->os.ctx, pa), 0x1000 };
++	g->os.free(g->os.ctx, &m);
++}
++
++int drgpu_space_create(struct drgpu *g, struct drgpu_space *s)
++{
++	uint32_t asid = 2;
++	while (asid < 256 && g->asid_used[asid])
++		asid++;
++	if (asid == 256)
++		return fail(g, "drgpu: no free ASID");
++	if (space_init(g, s, asid))
++		return fail(g, "drgpu: memory for a space");
++	g->asid_used[asid] = 1;
++	return 0;
++}
++
++/*
++ * The caller makes sure no submission of this space is still queued. If the
++ * CP has it selected, the kernel's space is put back from the CPU first
++ * (KGSL's _set_pagetable_cpu path; GPU idle), so the SMMU never walks freed
++ * tables.
++ */
++int drgpu_space_destroy(struct drgpu *g, struct drgpu_space *s)
++{
++	if (!s->live || s == &g->kspace)
++		return 0;
++	if (g->cur_space == s) {
++		if (g->cp_running && ring_wait_idle(g, 1000000))
++			return fail(g, "drgpu: space busy at destroy");
++		if (g->powered)	/* else drgpu_cp_start puts the kernel's back */
++			drgpu_wr64(CB0(g, CB_TTBR0), g->kspace.l1.pa | (uint64_t)g->kspace.asid << 48);
++		g->cur_space = &g->kspace;
++	}
++	drgpu_pt_destroy(&s->pt, pt_free);
++	if (drgpu_tlb_flush(g))
++		return -1;
++	g->os.free(g->os.ctx, &s->l1);
++	g->asid_used[s->asid] = 0;
++	s->live = 0;
++	return 0;
++}
++
++/* ---- SMMU (G2b: arm-smmu.c device_reset, impl_def_programming, init_context_bank, add_master) ---- */
++static const uint32_t impl_defs[][2] = {	/* arm,smmu-kgsl@5040000 attach-impl-defs */
++	{ 0x6000, 0x2378 }, { 0x6060, 0x1055 }, { 0x678c, 0x8 }, { 0x6794, 0x28 },
++	{ 0x6800, 0x6 }, { 0x6900, 0x3ff }, { 0x6924, 0x204 }, { 0x6928, 0x11000 },
++	{ 0x6930, 0x800 }, { 0x6960, 0xffffffff }, { 0x6b64, 0x1a5551 }, { 0x6b68, 0x9a82a382 },
++};
++
++int drgpu_tlb_flush(struct drgpu *g)
++{
++	/* collapsed: no SMMU access; drgpu_cp_start flushes everything before the GPU runs again */
++	if (!g->powered)
++		return 0;
++	drgpu_wr(CB0(g, CB_TLBIALL), 0);
++	drgpu_wr(CB0(g, CB_TLBSYNC), 0);
++	return drgpu_poll(CB0(g, CB_TLBSTATUS), 1, 0, 30000) < 0 ? fail(g, "drgpu: tlb sync") : 0;
++}
++
++int drgpu_map(struct drgpu *g, struct drgpu_space *s, uint64_t gpuaddr, uint64_t pa, uint64_t len, int ro)
++{
++	if (!s)
++		s = &g->kspace;
++	/* the global region belongs to the kernel in every space */
++	if (gpuaddr < DRGPU_VA_SMMU_INFO + 0x1000 && gpuaddr + len > DRGPU_VA_SETSTATE && s != &g->kspace)
++		return fail(g, "drgpu: mapping over the global region");
++	return drgpu_pt_map(&s->pt, gpuaddr, pa, len, ro ? DRGPU_PT_RO : DRGPU_PT_RW);
++}
++
++void drgpu_unmap(struct drgpu *g, struct drgpu_space *s, uint64_t gpuaddr, uint64_t len)
++{
++	drgpu_pt_unmap(s ? &s->pt : &g->kspace.pt, gpuaddr, len);
++}
++
++int drgpu_smmu_attach(struct drgpu *g)
++{
++	/* device_reset */
++	drgpu_wr(SMMU_SGFSR(g), drgpu_rd(SMMU_SGFSR(g)));
++	drgpu_wr(SMMU_TLBIALLH(g), 0);
++	drgpu_wr(SMMU_TLBIALLNSNH(g), 0);
++	drgpu_wr(SMMU_STLBGSYNC(g), 0);
++	if (drgpu_poll(SMMU_STLBGSTATUS(g), 1, 0, 30000) < 0)
++		return fail(g, "drgpu: smmu global tlb sync");
++	uint32_t v = drgpu_rd(SMMU_SCR0(g));
++	v |= 0x2 | 0x4 | 0x10 | 0x20 | 0x400 | 0x800 | 0x1000;	/* GFRE GFIE GCFGFRE GCFGFIE USFCFG VMIDPNE PTM */
++	v &= ~(0x1U | 0x2000 | 0xc000);				/* CLIENTPD FB BSU */
++	drgpu_wr(SMMU_SCR0(g), v);
++	/* impl_def_programming: halt, values, resume */
++	drgpu_wr(SMMU_MICRO_MMU_CTRL(g), drgpu_rd(SMMU_MICRO_MMU_CTRL(g)) | 0x4);
++	(void)drgpu_poll(SMMU_MICRO_MMU_CTRL(g), 0x8, 0x8, 30000);
++	for (unsigned i = 0; i < sizeof(impl_defs) / sizeof(impl_defs[0]); i++)
++		drgpu_wr(g->smmu + impl_defs[i][0], impl_defs[i][1]);
++	drgpu_wr(SMMU_MICRO_MMU_CTRL(g), drgpu_rd(SMMU_MICRO_MMU_CTRL(g)) & ~0x4U);
++	/* CB0: S1 with S2 bypass, VMID 2, ASID 1; io-pgtable 39-bit/36-bit, 4 KiB, NC walks */
++	drgpu_wr(SMMU_CBA2R0(g), 1);
++	drgpu_wr(SMMU_CBAR0(g), 0x0001f302);
++	drgpu_wr64(CB0(g, CB_TTBR0), g->kspace.l1.pa | 1ULL << 48);
++	drgpu_wr64(CB0(g, CB_TTBR1), 1ULL << 48);
++	drgpu_wr(CB0(g, CB_TCR), 0x00802019);
++	drgpu_wr(CB0(g, CB_TCR2), 0x00038001);
++	drgpu_wr(CB0(g, CB_MAIR0), 0x0004ff44);
++	drgpu_wr(CB0(g, CB_MAIR1), 0);
++	drgpu_wr(CB0(g, CB_ACTLR), 0x70000000);
++	drgpu_wr(CB0(g, CB_SCTLR), 0x1167);	/* kgsl ft_pagefault_policy 0: HUPCF */
++	drgpu_wr(SMMU_SMR0(g), 0x80000000u);	/* stream 0 */
++	drgpu_wr(SMMU_S2CR0(g), 0);		/* translate, CB0 */
++	if (drgpu_tlb_flush(g))
++		return -1;
++	if (drgpu_rd(SMMU_SMR0(g)) != 0x80000000u || drgpu_rd(SMMU_CBAR0(g)) != 0x0001f302 ||
++	    drgpu_rd(CB0(g, CB_SCTLR)) != 0x1167 || (drgpu_rd(SMMU_SCR0(g)) & 1))
++		return fail(g, "drgpu: smmu readback differs");
++	return 0;
++}
++
++/* ---- zap shader (G2c: peripheral-loader.c pil_boot, subsys-pil-tz.c, scm.c) ---- */
++#define SCM_INTERRUPTED		1
++#define SCM_V2_EBUSY		(-12)
++
++static int64_t scm(uint32_t fn, uint64_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t *x1)
++{
++	for (unsigned tries = 0;; tries++) {
++		register uint64_t r0 __asm__("x0") = fn;
++		register uint64_t r1 __asm__("x1") = arginfo;
++		register uint64_t r2 __asm__("x2") = a0;
++		register uint64_t r3 __asm__("x3") = a1;
++		register uint64_t r4 __asm__("x4") = a2;
++		register uint64_t r5 __asm__("x5") = 0;
++		register uint64_t r6 __asm__("x6") = 0;
++		do {
++			__asm__ volatile("smc #0"
++					 : "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3), "+r"(r4), "+r"(r5), "+r"(r6)
++					 :
++					 : "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17",
++					   "memory");
++		} while (r0 == SCM_INTERRUPTED);
++		if ((int64_t)r0 == SCM_V2_EBUSY && tries < 67) {
++			drgpu_udelay(30000);
++			continue;
++		}
++		*x1 = r1;
++		return (int64_t)r0;
++	}
++}
++
++static uint32_t le32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
++
++static int zap_load(struct drgpu *g)
++{
++	const uint8_t *m = g->fw.zap_mdt;
++	uint32_t msz = g->fw.zap_mdt_len;
++	if (msz < 0x34 || le32(m) != 0x464c457f || m[4] != 1)
++		return fail(g, "drgpu: zap mdt is not ELF32");
++	uint32_t phoff = le32(m + 0x1c), phnum = m[0x2c] | m[0x2d] << 8;
++	if ((m[0x2a] | m[0x2b] << 8) != 32 || phoff + 32 * phnum > msz)
++		return fail(g, "drgpu: zap program headers");
++	uint32_t min_r = 0xffffffff, max_r = 0, seg_pa = 0, seg_f = 0, seg_m = 0, nload = 0, seg = 0;
++	for (uint32_t i = 0; i < phnum; i++) {
++		const uint8_t *ph = m + phoff + 32 * i;
++		uint32_t flags = le32(ph + 24);
++		if (!(le32(ph) == 1 && ((flags >> 24) & 7) != 2 && le32(ph + 20)))	/* segment_is_loadable */
++			continue;
++		if (!(flags & (1U << 27)))
++			return fail(g, "drgpu: zap segment not relocatable");
++		nload++, seg = i;
++		seg_pa = le32(ph + 12), seg_f = le32(ph + 16), seg_m = le32(ph + 20);
++		if (seg_pa < min_r)
++			min_r = seg_pa;
++		if (seg_pa + seg_m > max_r)
++			max_r = seg_pa + seg_m;
++	}
++	if (nload != 1 || seg != 2 || seg_f != g->fw.zap_b02_len || seg_m < seg_f)
++		return fail(g, "drgpu: zap layout is not mdt + b02");
++	uint32_t size = ((max_r + 0xfff) & ~0xfffU) - min_r;
++	struct drgpu_mem meta, region;
++	if (g->os.alloc(g->os.ctx, (msz + 0xfff) & ~0xfffU, 0x1000, &meta) ||
++	    g->os.alloc(g->os.ctx, size, 0x100000, &region))	/* pil_alloc_region: 1 MiB */
++		return fail(g, "drgpu: zap memory");
++	volatile uint8_t *d = meta.va;
++	for (uint32_t i = 0; i < msz; i++)
++		d[i] = m[i];
++	__asm__ volatile("dsb sy" ::: "memory");
++	uint64_t x1 = 0;
++	if (scm(0x42000201, 0x82, 0xd, meta.pa, 0, &x1) || x1)	/* PAS_INIT_IMAGE */
++		return fail(g, "drgpu: PAS_INIT_IMAGE");
++	if (scm(0x42000202, 0x3, 0xd, region.pa, size, &x1) || x1)	/* PAS_MEM_SETUP */
++		return fail(g, "drgpu: PAS_MEM_SETUP");
++	d = (volatile uint8_t *)region.va + (seg_pa - min_r);
++	for (uint32_t i = 0; i < seg_m; i++)
++		d[i] = i < seg_f ? g->fw.zap_b02[i] : 0;
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (scm(0x42000205, 0x1, 0xd, 0, 0, &x1) || x1)	/* PAS_AUTH_AND_RESET */
++		return fail(g, "drgpu: PAS_AUTH_AND_RESET");
++	g->os.free(g->os.ctx, &meta);
++	/* the region now belongs to TZ: never touched again, never freed */
++	logx(g, "drgpu: zap shader loaded by TZ at", region.pa);
++	g->zap_loaded = 1;
++	return 0;
++}
++
++/* ---- ringbuffer ---- */
++static uint32_t *ringp(struct drgpu *g) { return (uint32_t *)g->ring.va; }
++static volatile uint32_t *ms(struct drgpu *g, uint32_t id, uint32_t field)
++{
++	return (volatile uint32_t *)((uint8_t *)g->memstore.va + id * DRGPU_MS_ENTRY + field);
++}
++
++/*
++ * Room for n dwords at ring_w (adreno_ringbuffer_allocspace). Unread data is
++ * [rptr, ring_w) circularly; rptr comes from the RPTR shadow the CP writes.
++ * Without a wrap the new packets must end before rptr when rptr is ahead.
++ * A wrap pads the tail with one NOP once the GPU has left the tail, then
++ * needs [0, n) free: the GPU caught up, or past n.
++ */
++static int ring_space(struct drgpu *g, uint32_t n)
++{
++	volatile uint32_t *shadow = g->scratch.va;
++	uint64_t end = drgpu_ticks() + drgpu_freq() * 2;
++	if (g->ring_w + n + 1 > DRGPU_RING_DWORDS) {
++		for (;;) {
++			uint32_t r = *shadow;
++			if (r <= g->ring_w && (r == g->ring_w || r > n))
++				break;
++			if (drgpu_ticks() > end)
++				return fail(g, "drgpu: ring full (wrap)");
++		}
++		ringp(g)[g->ring_w] = pkt7(CP_NOP, DRGPU_RING_DWORDS - g->ring_w - 1);
++		g->ring_w = 0;
++		return 0;
++	}
++	for (;;) {
++		uint32_t r = *shadow;
++		if (r <= g->ring_w || g->ring_w + n < r)
++			return 0;
++		if (drgpu_ticks() > end)
++			return fail(g, "drgpu: ring full");
++	}
++}
++
++static void emit(struct drgpu *g, uint32_t v) { ringp(g)[g->ring_w++] = v; }
++
++static void emit_mem_write(struct drgpu *g, uint64_t gpuaddr, uint32_t v)	/* cp_mem_write */
++{
++	emit(g, pkt7(CP_MEM_WRITE, 3));
++	emit(g, (uint32_t)gpuaddr);
++	emit(g, (uint32_t)(gpuaddr >> 32));
++	emit(g, v);
++}
++
++static void kick(struct drgpu *g)
++{
++	__asm__ volatile("dsb sy" ::: "memory");
++	drgpu_wr(R(g, CP_RB_WPTR), g->ring_w);
++}
++
++static int ring_wait_idle(struct drgpu *g, uint32_t timeout_us)
++{
++	if (drgpu_poll(R(g, CP_RB_RPTR), 0xffffffff, g->ring_w, timeout_us) < 0)
++		return -1;
++	return drgpu_poll(R(g, RBBM_STATUS), 0xfffffffe, 0, timeout_us) < 0 ? -1 : 0;	/* a512 busy_mask */
++}
++
++/* ---- CP start (G2b/G2c: a5xx_start, a5xx_rb_start, a5xx_send_me_init, secure mode) ---- */
++int drgpu_cp_start(struct drgpu *g)
++{
++	/*
++	 * kgsl_iommu_start -> kgsl_iommu_set_pt(default) from the CPU on every
++	 * start, and the ring forgets its active context (adreno_ringbuffer_start):
++	 * the CP starts in the kernel's space whatever it ran before.
++	 */
++	drgpu_wr64(CB0(g, CB_TTBR0), g->kspace.l1.pa | (uint64_t)g->kspace.asid << 48);
++	drgpu_wr(CB0(g, CB_CONTEXTIDR), 0);
++	if (drgpu_tlb_flush(g))
++		return -1;
++	g->cur_space = &g->kspace;
++	g->cur_ctx = 0;
++	/* struct a5xx_cp_smmu_info as a5xx_preemption_start fills it: magic,
++	 * the default pagetable's TTBR0 and CONTEXTIDR, asid poisoned */
++	volatile uint32_t *si = (volatile uint32_t *)g->smmu_info.va;
++	uint64_t ttbr0 = g->kspace.l1.pa | (uint64_t)g->kspace.asid << 48;
++	si[0] = 0x3618CDA3;	/* A5XX_CP_SMMU_INFO_MAGIC_REF */
++	si[2] = (uint32_t)ttbr0;
++	si[3] = (uint32_t)(ttbr0 >> 32);
++	si[4] = 0xDECAFBAD;
++	si[5] = 0;		/* CONTEXTIDR of the kernel's space (CB0 attach leaves it 0) */
++	__asm__ volatile("dsb sy" ::: "memory");
++	for (unsigned i = 0; i < sizeof(a5xx_start_seq) / sizeof(a5xx_start_seq[0]); i++)
++		drgpu_wr(R(g, a5xx_start_seq[i][0]), a5xx_start_seq[i][1]);
++	*(volatile uint32_t *)g->scratch.va = 0;
++	g->ring_w = 0;
++	drgpu_wr(R(g, CP_RB_RPTR_ADDR_LO), (uint32_t)DRGPU_VA_SCRATCH);
++	drgpu_wr(R(g, CP_RB_RPTR_ADDR_HI), (uint32_t)(DRGPU_VA_SCRATCH >> 32));
++	drgpu_wr(R(g, CP_RB_CNTL), A5XX_CP_RB_CNTL_DEFAULT);
++	drgpu_wr(R(g, CP_RB_BASE), (uint32_t)DRGPU_VA_RING);
++	drgpu_wr(R(g, CP_RB_BASE_HI), (uint32_t)(DRGPU_VA_RING >> 32));
++	drgpu_wr(R(g, CP_PM4_INSTR_BASE_LO), (uint32_t)DRGPU_VA_PM4);
++	drgpu_wr(R(g, CP_PM4_INSTR_BASE_HI), (uint32_t)(DRGPU_VA_PM4 >> 32));
++	drgpu_wr(R(g, CP_PFP_INSTR_BASE_LO), (uint32_t)DRGPU_VA_PFP);
++	drgpu_wr(R(g, CP_PFP_INSTR_BASE_HI), (uint32_t)(DRGPU_VA_PFP >> 32));
++	if (!g->zap_loaded && zap_load(g))	/* once per boot; a512 has CPZ retention */
++		return -1;
++	drgpu_wr(R(g, CP_ME_CNTL), 0);
++	/* ME_INIT, _set_ordinals for a512 */
++	emit(g, pkt7(CP_ME_INIT, 8));
++	emit(g, 0x2f);
++	emit(g, 0x3);
++	emit(g, 0x20000000);
++	emit(g, 0);
++	emit(g, 0);
++	emit(g, 0);
++	emit(g, 0);
++	emit(g, 0);
++	kick(g);
++	if (drgpu_poll(R(g, CP_RB_RPTR), 0xffffffff, g->ring_w, 2000000) < 0)
++		return fail(g, "drgpu: CP did not consume ME_INIT");
++	emit(g, pkt7(CP_SET_SECURE_MODE, 1));	/* a5xx_switch_to_unsecure_mode */
++	emit(g, 0);
++	kick(g);
++	if (ring_wait_idle(g, 2000000) || drgpu_rd(R(g, RBBM_SECVID_TRUST_CNTL)) != 0)
++		return fail(g, "drgpu: secure mode exit");
++	if (drgpu_rd(R(g, CP_HW_FAULT)))
++		return fail(g, "drgpu: CP hw fault after start");
++	g->cp_running = 1;
++	return 0;
++}
++
++/* ---- submissions (adreno_ringbuffer_addcmds / submitcmd framing) ---- */
++/*
++ * Select space s from the ring, adreno_iommu_set_pt_generate_cmds() for a5xx:
++ * APRIV on; stall prefetch with the setstate NOP IB; CP_SMMU_TABLE_UPDATE
++ * (TTBR0 with the space's ASID, CONTEXTIDR) between WAIT_FOR_ME/IDLE pairs,
++ * which also flushes the GPU's caches and the SMMU TLB; invalidate the
++ * draw state; APRIV off. The MEM_WRITE after the update records the new
++ * TTBR0/CONTEXTIDR as KGSL's rb->pagetable_desc does (here: smmu_info + PT_INFO).
++ * KGSL issues all of it with KGSL_CMD_FLAGS_PMODE: register protection off
++ * around it (CP_CNTL is in the protected 0x800-0x83f range).
++ */
++#define SWITCH_DWORDS	36
++#define PT_INFO		0x800	/* ttbr0 (u64), contextidr in the smmu_info page */
++
++static void emit_space_switch(struct drgpu *g, struct drgpu_space *s)
++{
++	uint64_t ttbr0 = s->l1.pa | (uint64_t)s->asid << 48;
++	emit(g, pkt7(CP_SET_PROTECTED_MODE, 1));
++	emit(g, 0);
++	emit(g, pkt7(CP_WAIT_FOR_IDLE, 0));
++	emit(g, pkt7(CP_WAIT_FOR_ME, 0));
++	emit(g, pkt4(CP_CNTL, 1));
++	emit(g, 1);
++	emit(g, pkt7(CP_WAIT_FOR_ME, 0));
++	emit(g, pkt7(CP_INDIRECT_BUFFER_PFE, 3));
++	emit(g, (uint32_t)(DRGPU_VA_SETSTATE + 1024));
++	emit(g, (uint32_t)((DRGPU_VA_SETSTATE + 1024) >> 32));
++	emit(g, 2);
++	emit(g, pkt7(CP_WAIT_FOR_IDLE, 0));
++	emit(g, pkt7(CP_WAIT_FOR_IDLE, 0));
++	emit(g, pkt7(CP_WAIT_FOR_ME, 0));
++	emit(g, pkt7(CP_SMMU_TABLE_UPDATE, 3));
++	emit(g, (uint32_t)ttbr0);
++	emit(g, (uint32_t)(ttbr0 >> 32));
++	emit(g, s->asid);	/* CONTEXTIDR: the space's id */
++	emit(g, pkt7(CP_MEM_WRITE, 5));
++	emit(g, (uint32_t)(DRGPU_VA_SMMU_INFO + PT_INFO));
++	emit(g, (uint32_t)((DRGPU_VA_SMMU_INFO + PT_INFO) >> 32));
++	emit(g, (uint32_t)ttbr0);
++	emit(g, (uint32_t)(ttbr0 >> 32));
++	emit(g, s->asid);
++	emit(g, pkt7(CP_WAIT_FOR_ME, 0));
++	emit(g, pkt7(CP_WAIT_FOR_IDLE, 0));
++	emit(g, pkt7(CP_SET_DRAW_STATE, 3));	/* cp_invalidate_state */
++	emit(g, 0x40000);
++	emit(g, 0);
++	emit(g, 0);
++	emit(g, pkt7(CP_WAIT_FOR_IDLE, 0));
++	emit(g, pkt7(CP_WAIT_FOR_ME, 0));
++	emit(g, pkt4(CP_CNTL, 1));
++	emit(g, 0);
++	emit(g, pkt7(CP_SET_PROTECTED_MODE, 1));
++	emit(g, 1);
++	g->cur_space = s;
++}
++
++uint32_t drgpu_submit(struct drgpu *g, struct drgpu_space *s, uint32_t ctx, const struct drgpu_ib *ibs, unsigned n,
++		      uint32_t ts)
++{
++	uint64_t msva = DRGPU_VA_MEMSTORE;
++	if (!s)
++		s = &g->kspace;
++	if (!g->cp_running || !s->live || ctx == 0 || ctx >= DRGPU_MS_RB)
++		return 0;
++	if (ring_space(g, 4 * n + 32 + SWITCH_DWORDS + 2))
++		return 0;
++	g->rb_ts++;
++	if (s != g->cur_space)
++		emit_space_switch(g, s);
++	if (ctx != g->cur_ctx) {	/* adreno_drawctxt_switch / __add_curr_ctxt_cmds */
++		emit_mem_write(g, msva + DRGPU_MS_RB * DRGPU_MS_ENTRY + DRGPU_MS_CURCTX, ctx);
++		emit_mem_write(g, msva + DRGPU_MS_CURCTX, ctx);
++		emit(g, pkt4(UCHE_INVALIDATE0, 1));	/* invalidate UCHE for the new context */
++		emit(g, 0x12);
++		g->cur_ctx = ctx;
++	}
++	emit_mem_write(g, msva + ctx * DRGPU_MS_ENTRY + DRGPU_MS_SOP, ts);
++	emit_mem_write(g, msva + DRGPU_MS_RB * DRGPU_MS_ENTRY + DRGPU_MS_SOP, g->rb_ts);
++	for (unsigned i = 0; i < n; i++) {
++		emit(g, pkt7(CP_INDIRECT_BUFFER_PFE, 3));
++		emit(g, (uint32_t)ibs[i].gpuaddr);
++		emit(g, (uint32_t)(ibs[i].gpuaddr >> 32));
++		emit(g, ibs[i].dwords);
++	}
++	emit(g, pkt7(CP_EVENT_WRITE, 4));	/* end of pipe: per-context timestamp, interrupt */
++	emit(g, CACHE_FLUSH_TS | 1U << 31);
++	emit(g, (uint32_t)(msva + ctx * DRGPU_MS_ENTRY + DRGPU_MS_EOP));
++	emit(g, (uint32_t)((msva + ctx * DRGPU_MS_ENTRY + DRGPU_MS_EOP) >> 32));
++	emit(g, ts);
++	emit_mem_write(g, msva + DRGPU_MS_RB * DRGPU_MS_ENTRY + DRGPU_MS_EOP, g->rb_ts);
++	kick(g);
++	return ts;
++}
++
++uint32_t drgpu_retired(struct drgpu *g, uint32_t ctx)
++{
++	return *ms(g, ctx, DRGPU_MS_EOP);
++}
++
++int drgpu_wait(struct drgpu *g, uint32_t ctx, uint32_t ts, uint32_t timeout_us)
++{
++	uint64_t end = drgpu_ticks() + drgpu_freq() / 1000000 * timeout_us;
++	while ((int32_t)(drgpu_retired(g, ctx) - ts) < 0) {	/* KGSL_TIMESTAMP_WINDOW compare */
++		if (drgpu_ticks() > end)
++			return -1;
++	}
++	return 0;
++}
++
++uint32_t drgpu_irq(struct drgpu *g)
++{
++	uint32_t st = drgpu_rd(R(g, RBBM_INT_0_STATUS));
++	if (st)
++		drgpu_wr(R(g, RBBM_INT_CLEAR_CMD), st);
++	return st;
++}
++
++/* ---- levels (G2e: gpucc ping-pong, clk-alpha-pll.c, mem-acc, RPM votes) ---- */
++static const struct level {
++	uint32_t khz, l, alpha, alpha_u, postdiv, cx, memacc;
++	uint64_t bw;
++} levels[DRGPU_LEVELS] = {
++	{ 430000, 0x2c, 0xaaaaab00, 0xca, 0, 192, 2, 1592663040ULL },
++	{ 370000, 0x26, 0xaaaaab00, 0x8a, 0, 128, 1, 1007557632ULL },
++	{ 266000, 0x1b, 0x55555600, 0xb5, 0, 128, 1, 439229440ULL },
++	{ 160000, 0x21, 0x55555600, 0x55, 1, 128, 1, 439229440ULL },
++};
++
++static int set_bw(struct drgpu *g, uint64_t bw)
++{
++	if (bw == g->bw)
++		return 0;
++	if (drgpu_rpm_kvp64(g, RPM_RES_BSLV, 0, RPM_KEY_BW, bw))
++		return fail(g, "drgpu: rpm bus vote");
++	g->bw = bw;
++	return 0;
++}
++
++static int set_cx(struct drgpu *g, uint32_t lvl)
++{
++	if (lvl == g->cx)
++		return 0;
++	if (drgpu_rpm_kvp2(g, RPM_RES_RWCX, 0, RPM_KEY_SWEN, 1, RPM_KEY_VLVL, lvl))
++		return fail(g, "drgpu: rpm cx vote");
++	g->cx = lvl;
++	return 0;
++}
++
++static void set_memacc(struct drgpu *g, uint32_t corner)
++{
++	while (g->memacc != corner) {	/* one corner at a time, read-modify-write of bit 0 */
++		g->memacc += corner > g->memacc ? 1 : -1;
++		drgpu_wr(MEM_ACC_SEL(g), (drgpu_rd(MEM_ACC_SEL(g)) & ~1U) | (g->memacc == 1 ? 1U : 0U));
++	}
++}
++
++static int pll_on(struct drgpu *g, unsigned n, const struct level *lv)
++{
++	uintptr_t p = PLL(g, n);
++	if (drgpu_rd(p) & (PLL_VOTE_FSM_ENA | PLL_OUTCTRL | PLL_RESET_N | PLL_BYPASSNL))
++		return fail(g, "drgpu: pll busy");
++	drgpu_wr(p + 0x18, GPU_PLL_CONFIG_CTL);
++	drgpu_wr(p + 0x10, (drgpu_rd(p + 0x10) & ~(PLL_VCO_MASK | PLL_POSTDIV_MASK)) | PLL_VCO_500_1000 | lv->postdiv << 8);
++	drgpu_wr(p + 0x04, lv->l);
++	drgpu_wr(p + 0x08, lv->alpha);
++	drgpu_wr(p + 0x0c, lv->alpha_u);
++	drgpu_wr(p, drgpu_rd(p) | PLL_BYPASSNL);
++	drgpu_udelay(5);
++	drgpu_wr(p, drgpu_rd(p) | PLL_RESET_N);
++	if (drgpu_poll(p, PLL_LOCK_DET, PLL_LOCK_DET, 1000) < 0) {
++		drgpu_wr(p, drgpu_rd(p) & ~(PLL_RESET_N | PLL_BYPASSNL));
++		return fail(g, "drgpu: pll did not lock");
++	}
++	drgpu_wr(p, drgpu_rd(p) | PLL_OUTCTRL);
++	return 0;
++}
++
++static void pll_off(struct drgpu *g, unsigned n)
++{
++	uintptr_t p = PLL(g, n);
++	drgpu_wr(p, drgpu_rd(p) & ~PLL_OUTCTRL);
++	drgpu_wr(p, drgpu_rd(p) & ~(PLL_RESET_N | PLL_BYPASSNL));
++}
++
++int drgpu_set_level(struct drgpu *g, int lvl)
++{
++	if (lvl < 0 || lvl >= DRGPU_LEVELS || !g->powered)
++		return fail(g, "drgpu: bad level");
++	if (lvl == g->level)
++		return 0;
++	const struct level *lv = &levels[lvl];
++	uint32_t cur_khz = g->level < 0 ? 19200 : levels[g->level].khz;
++	int up = lv->khz > cur_khz;
++	unsigned n = g->pll < 0 ? 0 : (unsigned)(g->pll ^ 1);	/* from XO the first PLL is PLL0 */
++	if (g->level < 0) {	/* first PLL use: MX as Linux votes it while a GPU PLL runs */
++		if (drgpu_rpm_kvp2(g, RPM_RES_RWMX, 0, RPM_KEY_SWEN, 1, RPM_KEY_VLVL, 192))
++			return fail(g, "drgpu: rpm mx vote");
++	}
++	if (up) {	/* voltage, then mem-acc (the level's own corner, as Linux), and bus first */
++		if (set_bw(g, lv->bw) || set_cx(g, lv->cx > g->cx ? lv->cx : g->cx))
++			return -1;
++		set_memacc(g, lv->memacc);
++	}
++	if (pll_on(g, n, lv))
++		return -1;
++	drgpu_wr(GFX3D_CFG(g), (n ? 3U : 1U) << 8 | 3);	/* PLL1 source 3, PLL0 source 1; div 2 */
++	drgpu_wr(GFX3D_CMD(g), drgpu_rd(GFX3D_CMD(g)) | RCG_UPDATE);
++	if (drgpu_poll(GFX3D_CMD(g), RCG_UPDATE, 0, 2000) < 0) {
++		pll_off(g, n);
++		return fail(g, "drgpu: gfx3d rcg update");
++	}
++	if (g->pll >= 0)
++		pll_off(g, (unsigned)g->pll);
++	g->pll = (int)n;
++	g->level = lvl;
++	if (!up) {	/* down: only after the clock came down */
++		set_memacc(g, lv->memacc);
++		if (set_cx(g, lv->cx) || set_bw(g, lv->bw))
++			return -1;
++	}
++	logx(g, "drgpu: gpu level kHz", lv->khz);
++	return 0;
++}
++
++/*
++ * Idle power-off, Linux's slumber on this phone (ftrace 30.3119-30.3124):
++ * interrupt mask 0, VBIF halt and drain (XIN_HALT_CTRL0 0xf, wait for
++ * CTRL1, 0), bus vote down to the non-GPU APPS aggregate, rbcpr /
++ * rbbmtimer / gfx3d branches off, PLL off, MX vote vlvl 16 and swen 0,
++ * gpu_bimc_gfx off, GX GDSC collapse with the IO clamp (gdsc_disable with
++ * force-root). CX stays on: the SMMU in it keeps its configuration.
++ */
++#define RBBM_INT_0_MASK		0x38
++#define VBIF_XIN_HALT_CTRL0	0x3080
++#define VBIF_XIN_HALT_CTRL1	0x3081
++#define BW_GPU_OFF		240000000ULL	/* §6g: the APPS aggregate without the GPU's share */
++
++int drgpu_power_off(struct drgpu *g)
++{
++	if (!g->powered)
++		return 0;
++	if (g->cp_running && ring_wait_idle(g, 100000))
++		return fail(g, "drgpu: not idle at power off");
++	drgpu_wr(R(g, RBBM_INT_0_MASK), 0);
++	drgpu_wr(R(g, VBIF_XIN_HALT_CTRL0), 0xf);
++	(void)drgpu_poll(R(g, VBIF_XIN_HALT_CTRL1), 0xf, 0xf, 100);
++	drgpu_wr(R(g, VBIF_XIN_HALT_CTRL0), 0);
++	g->cp_running = 0;
++	if (set_bw(g, BW_GPU_OFF))
++		return -1;
++	/* off the PLL while it and the gfx3d branch still run */
++	if (g->pll >= 0 && gfx3d_to_xo(g))
++		return -1;
++	drgpu_wr(RBCPR_CBCR(g), drgpu_rd(RBCPR_CBCR(g)) & ~1U);
++	drgpu_wr(RBBMTIMER_CBCR(g), drgpu_rd(RBBMTIMER_CBCR(g)) & ~1U);
++	drgpu_wr(GFX3D_CBCR(g), drgpu_rd(GFX3D_CBCR(g)) & ~1U);
++	if (g->pll >= 0)
++		pll_off(g, (unsigned)g->pll);
++	if (g->level >= 0 && drgpu_rpm_kvp2(g, RPM_RES_RWMX, 0, RPM_KEY_VLVL, 16, RPM_KEY_SWEN, 0))
++		return fail(g, "drgpu: rpm mx vote off");
++	if (set_cx(g, 128))
++		return -1;
++	drgpu_wr(GCC_GPU_BIMC_GFX(g), drgpu_rd(GCC_GPU_BIMC_GFX(g)) & ~1U);
++	drgpu_wr(GFX3D_CMD(g), drgpu_rd(GFX3D_CMD(g)) | RCG_ROOT_EN);
++	drgpu_wr(GDSC_GX(g), drgpu_rd(GDSC_GX(g)) | GDSC_SW_COLLAPSE);
++	int us = drgpu_poll(GDSC_GX(g), GDSC_PWR_ON, 0, 2000);
++	drgpu_wr(GX_DOMAIN(g), drgpu_rd(GX_DOMAIN(g)) | 1);	/* CLAMP_IO */
++	drgpu_wr(GFX3D_CMD(g), drgpu_rd(GFX3D_CMD(g)) & ~(RCG_ROOT_EN | RCG_UPDATE));
++	g->powered = 0;
++	g->level = -1;
++	g->pll = -1;
++	g->cur_ctx = 0;
++	return us < 0 ? fail(g, "drgpu: gx gdsc did not collapse") : 0;
++}
++
++int drgpu_resume(struct drgpu *g, int level)
++{
++	if (drgpu_power_on(g) || drgpu_cp_start(g))
++		return -1;
++	return drgpu_set_level(g, level);
++}
++
++/* GPU clock in kHz: RBBM perf counter 1, countable 0, clock gating off (a5xx_hwcg_set) */
++static unsigned hwcg_end(void)
++{
++	for (unsigned i = 1; i < sizeof(a5xx_start_seq) / sizeof(a5xx_start_seq[0]); i++)
++		if (a5xx_start_seq[i][0] == RBBM_CLOCK_CNTL && a5xx_start_seq[i][1] == 0xaaa82a00)
++			return i + 1;
++	return 0;
++}
++
++static uint64_t cycles(struct drgpu *g)
++{
++	uint32_t hi, lo;
++	do {
++		hi = drgpu_rd(R(g, RBBM_PERFCTR_RBBM_1_HI));
++		lo = drgpu_rd(R(g, RBBM_PERFCTR_RBBM_1_LO));
++	} while (hi != drgpu_rd(R(g, RBBM_PERFCTR_RBBM_1_HI)));
++	return (uint64_t)hi << 32 | lo;
++}
++
++uint32_t drgpu_gpu_khz(struct drgpu *g)
++{
++	unsigned end = hwcg_end();
++	if (!end)
++		return 0;
++	for (unsigned i = 1; i < end; i++)
++		if (a5xx_start_seq[i][0] != RBBM_CLOCK_CNTL && a5xx_start_seq[i][0] != RBBM_ISDB_CNT)
++			drgpu_wr(R(g, a5xx_start_seq[i][0]), 0);
++	drgpu_wr(R(g, RBBM_CLOCK_CNTL), 0);
++	drgpu_wr(R(g, RBBM_ISDB_CNT), 0x180);
++	drgpu_wr(R(g, RBBM_PERFCTR_RBBM_SEL_1), 0);
++	drgpu_udelay(10);
++	uint64_t t0 = drgpu_ticks(), c0 = cycles(g);
++	drgpu_udelay(2000);
++	uint64_t t1 = drgpu_ticks(), c1 = cycles(g);
++	for (unsigned i = 1; i < end; i++)
++		drgpu_wr(R(g, a5xx_start_seq[i][0]), a5xx_start_seq[i][1]);
++	uint64_t us = (t1 - t0) * 1000000 / drgpu_freq();
++	return us ? (uint32_t)((c1 - c0) * 1000 / us) : 0;
++}
++
++const char *drgpu_err(const struct drgpu *g)
++{
++	return g->errmsg ? g->errmsg : "";
++}
+diff --git a/bsd/dev/drgpu/drgpu.h b/bsd/dev/drgpu/drgpu.h
+new file mode 100755
+index 0000000..f3403de
+--- /dev/null
++++ b/bsd/dev/drgpu/drgpu.h
+@@ -0,0 +1,123 @@
++/*
++ * drgpu: portable driver core for the DRG (Nokia 6.1 Plus) Adreno 512.
++ * Used by the shim (tests on the real GPU) and by XNU's DrgGPU. Every step
++ * is the one measured on this phone (drg/gpu-research/TWRP-MEASURED.md
++ * §6b-6g) or HMD's DRG kernel source at the place named in each function.
++ *
++ * Lifetime: drgpu_init (map, allocate) -> drgpu_power_on -> drgpu_smmu_attach
++ * -> drgpu_cp_start (microcode, zap shader once per boot, ME_INIT, secure
++ * mode off) -> drgpu_set_level / drgpu_submit / drgpu_retired ...
++ */
++#ifndef DRGPU_H
++#define DRGPU_H
++#include "drgpu_os.h"
++#include "drgpu_pt.h"
++
++/* Nokia firmware (vendor_b /vendor/firmware), handed in by the OS */
++struct drgpu_fw {
++	const uint8_t *pm4;	/* a530_pm4.fw, whole file */
++	uint32_t pm4_len;
++	const uint8_t *pfp;	/* a530_pfp.fw */
++	uint32_t pfp_len;
++	const uint8_t *zap_mdt;	/* a512_zap.mdt */
++	uint32_t zap_mdt_len;
++	const uint8_t *zap_b02;	/* a512_zap.b02, the one loadable segment */
++	uint32_t zap_b02_len;
++};
++
++/* KGSL's global GPU addresses on this phone (ftrace map_sg, TWRP) */
++#define DRGPU_VA_SETSTATE	0xf8000000ULL	/* 4 KiB, a NOP IB at +1024 (KGSL_IOMMU_SETSTATE_NOP_OFFSET) */
++#define DRGPU_VA_MEMSTORE	0xf8001000ULL	/* 8 KiB, DEVICE_SHADOW */
++#define DRGPU_VA_SCRATCH	0xf8003000ULL	/* RPTR shadow at +0 */
++#define DRGPU_VA_RING		0xf8005000ULL	/* 32 KiB */
++#define DRGPU_VA_PM4		0xf8058000ULL
++#define DRGPU_VA_PFP		0xf805d000ULL
++#define DRGPU_VA_SMMU_INFO	0xf80e8000ULL	/* 4 KiB, struct a5xx_cp_smmu_info (0x840) */
++#define DRGPU_MEMSTORE_SIZE	0x2000
++#define DRGPU_RING_DWORDS	8192		/* RB_CNTL 0x20c */
++
++/* struct kgsl_devmemstore (msm_kgsl.h): 40 bytes per context id */
++#define DRGPU_MS_SOP		0
++#define DRGPU_MS_EOP		8
++#define DRGPU_MS_REF_WAIT	24
++#define DRGPU_MS_CURCTX		32
++#define DRGPU_MS_ENTRY		40
++#define DRGPU_MS_RB		(DRGPU_MEMSTORE_SIZE / DRGPU_MS_ENTRY - 1 - 4)	/* KGSL_MEMSTORE_MAX: ring 0 */
++
++#define DRGPU_LEVELS		4	/* 0 = 430, 1 = 370, 2 = 266, 3 = 160 MHz */
++
++/*
++ * A GPU address space: one per process (KGSL's per-process pagetable),
++ * plus the kernel's own. Every space carries the global buffers, so the CP,
++ * ring and memstore work whichever one is current. The CP switches spaces
++ * in the ring (CP_SMMU_TABLE_UPDATE, adreno_iommu.c a5xx path); each has
++ * its own ASID in TTBR0, so TLB entries never mix.
++ */
++struct drgpu_space {
++	struct drgpu_pt pt;
++	struct drgpu_mem l1;
++	uint32_t asid;
++	int live;
++};
++
++struct drgpu {
++	struct drgpu_os os;
++	struct drgpu_fw fw;
++	uintptr_t gcc, gpucc, gpu, smmu, ldo, tcsr, rpm_ram, rpm_ipc;
++	struct drgpu_mem ring, memstore, scratch, pm4, pfp, setstate, smmu_info;
++	struct drgpu_space kspace;	/* the kernel's: CB0's TTBR0 after attach */
++	struct drgpu_space *cur_space;	/* the one the CP has selected */
++	uint8_t asid_used[256];
++	uint32_t ring_w;		/* next free dword */
++	uint32_t rb_ts;			/* ring 0 timestamp */
++	int zap_loaded, cp_running, powered;
++	int level, pll;			/* -1 = on XO */
++	uint32_t cx, memacc;
++	uint64_t bw;
++	/* RPM client state (drgpu_rpm.c) */
++	uintptr_t rpm_tx_desc, rpm_tx_fifo, rpm_rx_desc, rpm_rx_fifo;
++	uint32_t rpm_tx_size, rpm_rx_size, rpm_msg_id, rpm_acks, rpm_last_ack[4];
++	int rpm_up;
++	uint32_t cur_ctx;		/* context of the last submission */
++	const char *errmsg;
++};
++
++int drgpu_init(struct drgpu *g, const struct drgpu_os *os, const struct drgpu_fw *fw);
++int drgpu_power_on(struct drgpu *g);		/* CX, BHS, gfx3d on XO, GX, branches */
++int drgpu_smmu_attach(struct drgpu *g);		/* stream 0 -> CB0, globals mapped */
++int drgpu_cp_start(struct drgpu *g);		/* start sequence .. secure mode off */
++int drgpu_set_level(struct drgpu *g, int level);
++/* idle: GX collapsed, PLLs and GPU clocks off, votes down; CX (and the SMMU in it) stays on */
++int drgpu_power_off(struct drgpu *g);
++int drgpu_resume(struct drgpu *g, int level);	/* power on, CP restart (zap retained), level */
++uint32_t drgpu_gpu_khz(struct drgpu *g);	/* measured with an RBBM counter */
++
++/*
++ * One IB list for context ctx in space s (NULL: the kernel's), KGSL framing;
++ * n = 0 is a marker (timestamp only). Returns ts, 0 on error.
++ */
++struct drgpu_ib { uint64_t gpuaddr; uint32_t dwords; };
++uint32_t drgpu_submit(struct drgpu *g, struct drgpu_space *s, uint32_t ctx, const struct drgpu_ib *ibs, unsigned n,
++		      uint32_t ts);
++uint32_t drgpu_retired(struct drgpu *g, uint32_t ctx);	/* memstore eoptimestamp */
++int drgpu_wait(struct drgpu *g, uint32_t ctx, uint32_t ts, uint32_t timeout_us);	/* 0 or -1 */
++uint32_t drgpu_irq(struct drgpu *g);		/* reads and clears RBBM_INT_0_STATUS */
++
++/* address spaces (one per process) */
++int drgpu_space_create(struct drgpu *g, struct drgpu_space *s);
++int drgpu_space_destroy(struct drgpu *g, struct drgpu_space *s);	/* GPU must be done with it */
++
++/* GPU memory in space s (NULL: the kernel's); flush the TLB after a batch of changes */
++int drgpu_map(struct drgpu *g, struct drgpu_space *s, uint64_t gpuaddr, uint64_t pa, uint64_t len, int ro);
++void drgpu_unmap(struct drgpu *g, struct drgpu_space *s, uint64_t gpuaddr, uint64_t len);
++int drgpu_tlb_flush(struct drgpu *g);
++
++/* RPM requests (drgpu_rpm.c) */
++int drgpu_rpm_attach(struct drgpu *g, int link_already_open);
++int drgpu_rpm_kvp2(struct drgpu *g, uint32_t type, uint32_t id, uint32_t k1, uint32_t v1, uint32_t k2, uint32_t v2);
++int drgpu_rpm_kvp64(struct drgpu *g, uint32_t type, uint32_t id, uint32_t key, uint64_t v);
++
++/* diagnostics: last error text */
++const char *drgpu_err(const struct drgpu *g);
++
++#endif
+diff --git a/bsd/dev/drgpu/drgpu_fwblob.h b/bsd/dev/drgpu/drgpu_fwblob.h
+new file mode 100755
+index 0000000..f70322e
+--- /dev/null
++++ b/bsd/dev/drgpu/drgpu_fwblob.h
+@@ -0,0 +1,75 @@
++/*
++ * GPU firmware handed from the shim to XNU (drg/GPU-IOS-DESIGN.md): Nokia's
++ * files (vendor_b /vendor/firmware) never go into git or the CI kernel. The
++ * shim's loader copies them below topOfKernelData (memory XNU keeps as its
++ * own) and passes the blob's physical address as boot-arg drgpufw=<pa>.
++ * Layout: this header, then each file at its offset; fnv is FNV-1a 64 over
++ * every byte after the header (total bytes), checked by the kernel.
++ */
++#ifndef DRGPU_FWBLOB_H
++#define DRGPU_FWBLOB_H
++#include <stdint.h>
++
++#define DRGPU_FWBLOB_MAGIC	0x3157465550475244ULL	/* "DRGPUFW1" */
++#define DRGPU_FWBLOB_PM4	1	/* a530_pm4.fw */
++#define DRGPU_FWBLOB_PFP	2	/* a530_pfp.fw */
++#define DRGPU_FWBLOB_ZAP_MDT	3	/* a512_zap.mdt */
++#define DRGPU_FWBLOB_ZAP_B02	4	/* a512_zap.b02 */
++
++struct drgpu_fwblob {
++	uint64_t magic;
++	uint32_t version;	/* 1 */
++	uint32_t count;		/* entries used */
++	uint64_t total;		/* bytes after this header */
++	uint64_t fnv;
++	struct {
++		uint32_t type, off, len, pad;	/* off from the start of the blob */
++	} e[4];
++};
++
++static inline uint64_t drgpu_fnv(const volatile uint8_t *p, uint64_t n)
++{
++	uint64_t h = 0xcbf29ce484222325ULL;
++	for (uint64_t i = 0; i < n; i++)
++		h = (h ^ p[i]) * 0x100000001b3ULL;
++	return h;
++}
++
++/*
++ * Check a blob (magic, version, bounds, FNV) and point fw at its files.
++ * 0, or a negative step number that failed. Shared by the kernel and the
++ * shim's test, so both run the same check.
++ */
++#ifdef DRGPU_H
++static inline int drgpu_fwblob_parse(const uint8_t *blob, uint64_t maxlen, struct drgpu_fw *fw)
++{
++	const struct drgpu_fwblob *b = (const struct drgpu_fwblob *)blob;
++	if (maxlen < sizeof(*b) || b->magic != DRGPU_FWBLOB_MAGIC || b->version != 1 || b->count != 4)
++		return -1;
++	if (b->total > maxlen - sizeof(*b))
++		return -2;
++	if (drgpu_fnv(blob + sizeof(*b), b->total) != b->fnv)
++		return -3;
++	const uint8_t *p[5] = { 0 };
++	uint32_t n[5] = { 0 };
++	for (uint32_t i = 0; i < 4; i++) {
++		uint32_t t = b->e[i].type;
++		if (t < 1 || t > 4 || b->e[i].off < sizeof(*b) ||
++		    (uint64_t)b->e[i].off + b->e[i].len > sizeof(*b) + b->total || p[t])
++			return -4;
++		p[t] = blob + b->e[i].off;
++		n[t] = b->e[i].len;
++	}
++	fw->pm4 = p[DRGPU_FWBLOB_PM4];
++	fw->pm4_len = n[DRGPU_FWBLOB_PM4];
++	fw->pfp = p[DRGPU_FWBLOB_PFP];
++	fw->pfp_len = n[DRGPU_FWBLOB_PFP];
++	fw->zap_mdt = p[DRGPU_FWBLOB_ZAP_MDT];
++	fw->zap_mdt_len = n[DRGPU_FWBLOB_ZAP_MDT];
++	fw->zap_b02 = p[DRGPU_FWBLOB_ZAP_B02];
++	fw->zap_b02_len = n[DRGPU_FWBLOB_ZAP_B02];
++	return 0;
++}
++#endif
++
++#endif
+diff --git a/bsd/dev/drgpu/drgpu_os.h b/bsd/dev/drgpu/drgpu_os.h
+new file mode 100755
+index 0000000..2eebc9e
+--- /dev/null
++++ b/bsd/dev/drgpu/drgpu_os.h
+@@ -0,0 +1,82 @@
++/*
++ * drgpu: what the portable GPU core needs from its OS (shim or XNU), and
++ * the register accessors every MMIO access goes through.
++ *
++ * MMIO rule, measured on DRG (gpu-research/TWRP-MEASURED.md §6d): the GPU
++ * SMMU's global registers are trapped and emulated by the hypervisor, and an
++ * access with base writeback, or a store of the zero register, never
++ * completes. So every access is a plain `ldr/str Wt, [Xn]` from a real
++ * register (as Linux 4.4's __raw_readl/writel), for every block, always.
++ */
++#ifndef DRGPU_OS_H
++#define DRGPU_OS_H
++#include <stdint.h>
++#include <stddef.h>
++
++struct drgpu_mem {
++	uint64_t pa;	/* physical, contiguous */
++	void *va;	/* CPU address, uncached or write-combined */
++	uint64_t size;
++};
++
++struct drgpu_os {
++	void *ctx;
++	/* device memory mapping of [pa, pa + len) (page aligned by the caller) */
++	uintptr_t (*mmio)(void *ctx, uint64_t pa, uint64_t len);
++	/* zeroed, physically contiguous, aligned to `align` (a power of two >= 4 KiB) */
++	int (*alloc)(void *ctx, uint64_t size, uint64_t align, struct drgpu_mem *out);
++	void (*free)(void *ctx, struct drgpu_mem *m);
++	uint64_t *(*ptov)(void *ctx, uint64_t pa);	/* CPU address of memory from alloc */
++	void (*log)(void *ctx, const char *msg);	/* one line, no newline needed */
++	void (*sleep_us)(void *ctx, uint32_t us);	/* may sleep; the core busy-waits below 50 us itself */
++};
++
++static inline uint32_t drgpu_rd(uintptr_t a)
++{
++	uint32_t v;
++	__asm__ volatile("ldr %w0, [%1]" : "=r"(v) : "r"(a) : "memory");
++	return v;
++}
++
++static inline void drgpu_wr(uintptr_t a, uint32_t v)
++{
++	__asm__ volatile("str %w0, [%1]\n\tdsb sy" : : "r"(v), "r"(a) : "memory");
++}
++
++static inline void drgpu_wr64(uintptr_t a, uint64_t v)
++{
++	__asm__ volatile("str %x0, [%1]\n\tdsb sy" : : "r"(v), "r"(a) : "memory");
++}
++
++static inline uint64_t drgpu_ticks(void)
++{
++	uint64_t v;
++	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(v));
++	return v;
++}
++
++static inline uint64_t drgpu_freq(void)
++{
++	uint64_t v;
++	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v));
++	return v;
++}
++
++static inline void drgpu_udelay(uint32_t us)
++{
++	uint64_t end = drgpu_ticks() + drgpu_freq() / 1000000 * us + 1;
++	while (drgpu_ticks() < end)
++		;
++}
++
++/* poll until (rd(a) & mask) == want: microseconds taken, or -1 after timeout_us */
++static inline int drgpu_poll(uintptr_t a, uint32_t mask, uint32_t want, uint32_t timeout_us)
++{
++	uint64_t t0 = drgpu_ticks(), end = t0 + drgpu_freq() / 1000000 * timeout_us;
++	while ((drgpu_rd(a) & mask) != want)
++		if (drgpu_ticks() > end)
++			return -1;
++	return (int)((drgpu_ticks() - t0) * 1000000 / drgpu_freq());
++}
++
++#endif
+diff --git a/bsd/dev/drgpu/drgpu_pt.c b/bsd/dev/drgpu/drgpu_pt.c
+new file mode 100755
+index 0000000..e70f66f
+--- /dev/null
++++ b/bsd/dev/drgpu/drgpu_pt.c
+@@ -0,0 +1,110 @@
++/*
++ * drgpu GPU page tables, see drgpu_pt.h. Descriptor bits from HMD's
++ * io-pgtable-arm.c: TYPE_TABLE / TYPE_PAGE 3, AF bit 10, SH_OS 2 << 8,
++ * AP_RW 1 << 6, AP_RO 3 << 6, nG bit 11, ATTRINDX 0 (NC); output address
++ * bits 47:12 (oas 36 fits).
++ */
++#include "drgpu_pt.h"
++
++#define PTE_VALID_TABLE	3ULL
++#define PTE_PAGE	3ULL
++#define PTE_AF		(1ULL << 10)
++#define PTE_SH_OS	(2ULL << 8)
++#define PTE_AP_RW	(1ULL << 6)
++#define PTE_AP_RO	(3ULL << 6)
++#define PTE_NG		(1ULL << 11)
++#define PTE_ADDR	0x0000fffffffff000ULL
++#define VA_BITS		39
++
++static unsigned idx(uint64_t va, int level)	/* level 1..3, 4 KiB granule */
++{
++	return (unsigned)((va >> (12 + 9 * (3 - level))) & 511);
++}
++
++/* next-level table for va at level (1 or 2), created if create; NULL if absent/no memory */
++static uint64_t *next(struct drgpu_pt *pt, uint64_t *tbl, uint64_t va, int level, int create)
++{
++	uint64_t *e = &tbl[idx(va, level)];
++	if ((*e & 3) == PTE_VALID_TABLE)
++		return pt->table_va(pt->os, *e & PTE_ADDR);
++	if (*e & 1)
++		return 0;	/* a block mapping is in the way */
++	if (!create)
++		return 0;
++	struct drgpu_page p;
++	if (pt->alloc_table(pt->os, &p))
++		return 0;
++	*e = (p.pa & PTE_ADDR) | PTE_VALID_TABLE;
++	return p.va;
++}
++
++int drgpu_pt_map(struct drgpu_pt *pt, uint64_t va, uint64_t pa, uint64_t len, int prot)
++{
++	if ((va | pa | len) & 0xfff || va + len > (1ULL << VA_BITS) || va + len < va)
++		return -1;
++	uint64_t attr = PTE_PAGE | PTE_AF | PTE_SH_OS | PTE_NG | (prot == DRGPU_PT_RO ? PTE_AP_RO : PTE_AP_RW);
++	for (uint64_t off = 0; off < len; off += 0x1000) {
++		uint64_t v = va + off;
++		uint64_t *l2 = next(pt, pt->l1.va, v, 1, 1);
++		uint64_t *l3 = l2 ? next(pt, l2, v, 2, 1) : 0;
++		if (!l3)
++			return -1;
++		uint64_t *e = &l3[idx(v, 3)];
++		if (*e & 1)
++			return -1;
++		*e = ((pa + off) & PTE_ADDR) | attr;
++	}
++	pt->publish(pt->os);
++	return 0;
++}
++
++uint64_t drgpu_pt_unmap(struct drgpu_pt *pt, uint64_t va, uint64_t len)
++{
++	uint64_t n = 0;
++	for (uint64_t off = 0; off < len; off += 0x1000) {
++		uint64_t v = va + off;
++		uint64_t *l2 = next(pt, pt->l1.va, v, 1, 0);
++		uint64_t *l3 = l2 ? next(pt, l2, v, 2, 0) : 0;
++		if (l3 && (l3[idx(v, 3)] & 1)) {
++			l3[idx(v, 3)] = 0;
++			n++;
++		}
++	}
++	pt->publish(pt->os);
++	return n;
++}
++
++void drgpu_pt_destroy(struct drgpu_pt *pt, void (*free_table)(void *os, uint64_t pa))
++{
++	for (int i = 0; i < 512; i++) {
++		uint64_t e1 = pt->l1.va[i];
++		if ((e1 & 3) != PTE_VALID_TABLE)
++			continue;
++		uint64_t *l2 = pt->table_va(pt->os, e1 & PTE_ADDR);
++		for (int j = 0; j < 512; j++)
++			if ((l2[j] & 3) == PTE_VALID_TABLE) {
++				free_table(pt->os, l2[j] & PTE_ADDR);
++				l2[j] = 0;
++			}
++		free_table(pt->os, e1 & PTE_ADDR);
++		pt->l1.va[i] = 0;
++	}
++	pt->publish(pt->os);
++}
++
++uint64_t drgpu_pt_lookup(const struct drgpu_pt *pt, uint64_t va)
++{
++	const uint64_t *t = pt->l1.va;
++	for (int level = 1; level <= 3; level++) {
++		uint64_t e = t[idx(va, level)];
++		if (!(e & 1))
++			return ~0ULL;
++		if (level < 3 && (e & 3) == 1)	/* block: 1 GiB at L1, 2 MiB at L2 */
++			return (e & PTE_ADDR & ~((1ULL << (12 + 9 * (3 - level))) - 1)) |
++			       (va & ((1ULL << (12 + 9 * (3 - level))) - 1));
++		if (level == 3)
++			return (e & PTE_ADDR) | (va & 0xfff);
++		t = pt->table_va(pt->os, e & PTE_ADDR);
++	}
++	return ~0ULL;
++}
+diff --git a/bsd/dev/drgpu/drgpu_pt.h b/bsd/dev/drgpu/drgpu_pt.h
+new file mode 100755
+index 0000000..6e85f12
+--- /dev/null
++++ b/bsd/dev/drgpu/drgpu_pt.h
+@@ -0,0 +1,42 @@
++/*
++ * drgpu: GPU SMMU stage-1 page tables for the DRG Adreno 512 (portable C,
++ * no OS headers; used by the shim and by the XNU driver).
++ *
++ * Format as HMD's io-pgtable-arm.c ARM_64_LPAE_S1 programs it on this phone
++ * (gpu-research/TWRP-MEASURED.md §6d): 4 KiB granule, ias 39 (T0SZ 25, walk
++ * starts at level 1), oas 36. PTE for IOMMU_READ|IOMMU_WRITE: nG, AP_RW, AF,
++ * SH_OS, MAIR index 0 (NC); read-only adds AP_RO. Tables are 4 KiB pages the
++ * OS hands out zeroed, with their physical and CPU addresses.
++ */
++#ifndef DRGPU_PT_H
++#define DRGPU_PT_H
++#include <stdint.h>
++
++struct drgpu_page {
++	uint64_t pa;		/* physical address (what the SMMU walks) */
++	uint64_t *va;		/* CPU address of the same 4 KiB, zeroed */
++};
++
++struct drgpu_pt {
++	struct drgpu_page l1;	/* TTBR0 points here */
++	/* OS hooks: a zeroed 4 KiB page, and a barrier that makes CPU writes
++	 * to tables visible to the SMMU walker (dsb on the shim's NC memory). */
++	int (*alloc_table)(void *os, struct drgpu_page *out);
++	uint64_t *(*table_va)(void *os, uint64_t pa);	/* CPU address of a table page */
++	void (*publish)(void *os);
++	void *os;
++};
++
++#define DRGPU_PT_RW	0
++#define DRGPU_PT_RO	1
++
++/* map [va, va + len) to [pa, pa + len), 4 KiB aligned; 0 or -1 (no table page, or already mapped) */
++int drgpu_pt_map(struct drgpu_pt *pt, uint64_t va, uint64_t pa, uint64_t len, int prot);
++/* unmap [va, va + len); returns pages cleared. The caller flushes the SMMU TLB afterwards. */
++uint64_t drgpu_pt_unmap(struct drgpu_pt *pt, uint64_t va, uint64_t len);
++/* physical address for va, or ~0 if not mapped (the SMMU walk done by the CPU, for checks) */
++uint64_t drgpu_pt_lookup(const struct drgpu_pt *pt, uint64_t va);
++/* hand every L2/L3 table page back through free_table (the L1 stays the caller's); entries are cleared */
++void drgpu_pt_destroy(struct drgpu_pt *pt, void (*free_table)(void *os, uint64_t pa));
++
++#endif
+diff --git a/bsd/dev/drgpu/drgpu_rpm.c b/bsd/dev/drgpu/drgpu_rpm.c
+new file mode 100755
+index 0000000..039b050
+--- /dev/null
++++ b/bsd/dev/drgpu/drgpu_rpm.c
+@@ -0,0 +1,204 @@
++/*
++ * drgpu RPM client: GPU votes (MX/CX levels, GPU bus bandwidth) over the
++ * glink "rpm_requests" channel, polled. Same protocol as shim/drg_rpm.c,
++ * which brought up the touch supply on this phone (boots #27-#29), from
++ * HMD's DRG kernel (glink_smem_native_xprt.c, glink.c, rpm-smd.c):
++ *   - message RAM 0x778000 + 0x7000 ends with a 256-byte TOC (magic
++ *     0x67727430): TX FIFO 0x61703272, RX FIFO 0x72326170, each {read_index,
++ *     write_index} followed by the data; 32-bit accesses, 8-byte units
++ *   - after writing: the write index, then 1 to IPC 0x17911008
++ *   - commands {u16 id, u16 p1, u32 p2}: VERSION 0, VERSION_ACK 1, OPEN 2,
++ *     OPEN_ACK 4, TX_DATA 9 (+ size, size_left, data padded to 8)
++ *   - v0 request: 'req', length, msg_id, set 0 (active), type, id, data
++ *     length, then KVPs {key, nbytes, value}
++ * Attach mode continues the channel the shim opened before XNU (it keeps
++ * the shared indices; a second OPEN of the same channel is not sent).
++ */
++#include "drgpu.h"
++
++#define TOC_MAGIC	0x67727430u
++#define TOC_TX		0x61703272u
++#define TOC_RX		0x72326170u
++#define CMD_VERSION	0
++#define CMD_VERSION_ACK	1
++#define CMD_OPEN	2
++#define CMD_OPEN_ACK	4
++#define CMD_TX_DATA	9
++#define LCID		1
++#define IPC_OFF		0x8
++#define IPC_MASK	0x1u
++#define RAM_SIZE	0x7000u
++
++static int fifo_find(struct drgpu *g, uint32_t id, uintptr_t *desc, uintptr_t *fifo, uint32_t *size)
++{
++	uintptr_t toc = g->rpm_ram + RAM_SIZE - 256;
++	uint32_t n = drgpu_rd(toc + 4);
++	if (drgpu_rd(toc) != TOC_MAGIC || n > 20)
++		return -1;
++	for (uint32_t i = 0; i < n; i++) {
++		uintptr_t e = toc + 8 + 12 * i;
++		if (drgpu_rd(e) != id)
++			continue;
++		*desc = g->rpm_ram + drgpu_rd(e + 4);
++		*fifo = *desc + 8;
++		*size = drgpu_rd(e + 8);
++		return *fifo + *size > g->rpm_ram + RAM_SIZE ? -2 : 0;
++	}
++	return -3;
++}
++
++static int fifo_write(struct drgpu *g, const uint32_t *w, uint32_t len)
++{
++	uint32_t rd = drgpu_rd(g->rpm_tx_desc), wr = drgpu_rd(g->rpm_tx_desc + 4);
++	uint32_t avail = rd <= wr ? g->rpm_tx_size - wr + rd : rd - wr;
++	if (rd >= g->rpm_tx_size || wr >= g->rpm_tx_size || avail < len + 8)
++		return -1;
++	for (uint32_t i = 0; i < len / 4; i++) {
++		drgpu_wr(g->rpm_tx_fifo + wr, w[i]);
++		wr += 4;
++		if (wr >= g->rpm_tx_size)
++			wr = 0;
++	}
++	drgpu_wr(g->rpm_tx_desc + 4, wr);
++	drgpu_wr(g->rpm_ipc + IPC_OFF, IPC_MASK);
++	return 0;
++}
++
++static uint32_t rx_avail(struct drgpu *g)
++{
++	uint32_t rd = drgpu_rd(g->rpm_rx_desc), wr = drgpu_rd(g->rpm_rx_desc + 4);
++	if (rd >= g->rpm_rx_size || wr >= g->rpm_rx_size)
++		return 0;
++	return wr >= rd ? wr - rd : g->rpm_rx_size - rd + wr;
++}
++
++static void fifo_read(struct drgpu *g, uint32_t *w, uint32_t len)
++{
++	uint32_t rd = drgpu_rd(g->rpm_rx_desc);
++	for (uint32_t i = 0; i < len / 4; i++) {
++		uint32_t v = drgpu_rd(g->rpm_rx_fifo + rd);
++		if (w)
++			w[i] = v;
++		rd += 4;
++		if (rd >= g->rpm_rx_size)
++			rd = 0;
++	}
++	drgpu_wr(g->rpm_rx_desc, rd);
++}
++
++/* handle everything the RPM sent; returns bit 0 version acked, bit 1 open acked, bit 2 remote open */
++static uint32_t rx_poll(struct drgpu *g)
++{
++	uint32_t seen = 0;
++	while (rx_avail(g) >= 8) {
++		uint32_t c[2];
++		fifo_read(g, c, 8);
++		uint32_t id = c[0] & 0xffff, p1 = c[0] >> 16, p2 = c[1];
++		if (id == CMD_VERSION) {
++			uint32_t ack[2] = { CMD_VERSION_ACK | 1u << 16, p2 & 0x4 };
++			(void)fifo_write(g, ack, 8);
++		} else if (id == CMD_VERSION_ACK) {
++			seen |= 1;
++		} else if (id == CMD_OPEN) {
++			fifo_read(g, 0, (p2 + 7) & ~7u);	/* channel name */
++			uint32_t ack[2] = { CMD_OPEN_ACK | p1 << 16, 0 };
++			(void)fifo_write(g, ack, 8);
++			seen |= 4;
++		} else if (id == CMD_OPEN_ACK) {
++			if (p1 == LCID)
++				seen |= 2;
++		} else if (id == CMD_TX_DATA) {
++			uint32_t h[2];
++			fifo_read(g, h, 8);	/* size, size_left */
++			uint32_t padded = (h[0] + 7) & ~7u;
++			for (uint32_t i = 0; i < padded / 4; i++) {
++				uint32_t v;
++				fifo_read(g, &v, 4);
++				if (i < 4)
++					g->rpm_last_ack[i] = v;
++			}
++			g->rpm_acks++;
++		}
++	}
++	return seen;
++}
++
++int drgpu_rpm_attach(struct drgpu *g, int link_already_open)
++{
++	if (g->rpm_up)
++		return 0;
++	if (fifo_find(g, TOC_TX, &g->rpm_tx_desc, &g->rpm_tx_fifo, &g->rpm_tx_size) ||
++	    fifo_find(g, TOC_RX, &g->rpm_rx_desc, &g->rpm_rx_fifo, &g->rpm_rx_size))
++		return -1;
++	g->rpm_msg_id = 0x1000;	/* apart from the shim's ids */
++	if (link_already_open) {
++		(void)rx_poll(g);	/* drain what the shim left */
++		g->rpm_up = 1;
++		return 0;
++	}
++	drgpu_wr(g->rpm_tx_desc + 4, 0);	/* as the Linux transport does at probe */
++	drgpu_wr(g->rpm_rx_desc, 0);
++	uint32_t ver[2] = { CMD_VERSION | 1u << 16, 0x4 };
++	if (fifo_write(g, ver, 8))
++		return -2;
++	uint32_t st = 0;
++	uint64_t end = drgpu_ticks() + drgpu_freq() / 2;
++	while (!(st & 1) && drgpu_ticks() < end)
++		st |= rx_poll(g);
++	uint32_t open[6] = { CMD_OPEN | LCID << 16, 13, 0, 0, 0, 0 };
++	const char *name = "rpm_requests";
++	for (int i = 0; i < 13; i++)
++		((char *)&open[2])[i] = name[i];
++	if (fifo_write(g, open, 24))
++		return -3;
++	end = drgpu_ticks() + drgpu_freq() / 2;
++	while (!(st & 2) && drgpu_ticks() < end)
++		st |= rx_poll(g);
++	if (!(st & 2))
++		return -4;
++	g->rpm_up = 1;
++	return 0;
++}
++
++static int rpm_send(struct drgpu *g, uint32_t type, uint32_t id, const uint32_t *kvp, uint32_t kvp_words)
++{
++	if (!g->rpm_up || kvp_words > 16)
++		return -1;
++	uint32_t data = 28 + 4 * kvp_words, words = 4 + (data + 7) / 8 * 2;
++	uint32_t pkt[4 + 7 + 16 + 1];
++	for (uint32_t i = 0; i < words; i++)
++		pkt[i] = 0;
++	pkt[0] = CMD_TX_DATA | LCID << 16;
++	pkt[2] = data;
++	pkt[4] = 0x716572;			/* 'req' */
++	pkt[5] = 20 + 4 * kvp_words;
++	pkt[6] = g->rpm_msg_id++;
++	pkt[7] = 0;				/* active set */
++	pkt[8] = type;
++	pkt[9] = id;
++	pkt[10] = 4 * kvp_words;
++	for (uint32_t i = 0; i < kvp_words; i++)
++		pkt[11 + i] = kvp[i];
++	uint32_t before = g->rpm_acks;
++	if (fifo_write(g, pkt, 4 * words))
++		return -5;
++	uint64_t end = drgpu_ticks() + drgpu_freq() / 2;
++	while (g->rpm_acks == before && drgpu_ticks() < end)
++		(void)rx_poll(g);
++	if (g->rpm_acks == before)
++		return -6;
++	/* an answer carrying only "msg#" (12 bytes) has no error KVP */
++	return g->rpm_last_ack[1] == 12 ? 0 : -7;
++}
++
++int drgpu_rpm_kvp2(struct drgpu *g, uint32_t type, uint32_t id, uint32_t k1, uint32_t v1, uint32_t k2, uint32_t v2)
++{
++	const uint32_t kvp[6] = { k1, 4, v1, k2, 4, v2 };
++	return rpm_send(g, type, id, kvp, 6);
++}
++
++int drgpu_rpm_kvp64(struct drgpu *g, uint32_t type, uint32_t id, uint32_t key, uint64_t v)
++{
++	const uint32_t kvp[4] = { key, 8, (uint32_t)v, (uint32_t)(v >> 32) };
++	return rpm_send(g, type, id, kvp, 4);
++}
+diff --git a/bsd/dev/drgpu/drgpu_start.h b/bsd/dev/drgpu/drgpu_start.h
+new file mode 100755
+index 0000000..7c47b4e
+--- /dev/null
++++ b/bsd/dev/drgpu/drgpu_start.h
+@@ -0,0 +1,170 @@
++/*
++ * a5xx start sequence as HMD's kernel wrote it on this phone (ftrace
++ * kgsl_regwrite, research/vendor-adreno/trace/ftrace-cold.txt lines 272-483:
++ * a5xx_hwcg_set + a5xx_start, second power-on). Generated, not hand-typed.
++ * CP_CONTEXT_SWITCH_SMMU_INFO_LO/HI (0x840/0x841) point at the global
++ * smmu_info page (a5xx_preemption_start), filled by drgpu_cp_start.
++ */
++static const uint32_t a5xx_start_seq[][2] = {
++	{ 0x67, 0x55 },	/* RBBM_CLOCK_CNTL */
++	{ 0x68, 0x2222222 },	/* RBBM_CLOCK_CNTL_SP0 */
++	{ 0x69, 0x2222222 },	/* RBBM_CLOCK_CNTL_SP1 */
++	{ 0x6c, 0x2222220 },	/* RBBM_CLOCK_CNTL2_SP0 */
++	{ 0x6d, 0x2222220 },	/* RBBM_CLOCK_CNTL2_SP1 */
++	{ 0x70, 0xf3cf },	/* RBBM_CLOCK_HYST_SP0 */
++	{ 0x71, 0xf3cf },	/* RBBM_CLOCK_HYST_SP1 */
++	{ 0x74, 0x80 },	/* RBBM_CLOCK_DELAY_SP0 */
++	{ 0x75, 0x80 },	/* RBBM_CLOCK_DELAY_SP1 */
++	{ 0x4a, 0x22222222 },	/* RBBM_CLOCK_CNTL_TP0 */
++	{ 0x4b, 0x22222222 },	/* RBBM_CLOCK_CNTL_TP1 */
++	{ 0x4e, 0x22222222 },	/* RBBM_CLOCK_CNTL2_TP0 */
++	{ 0x4f, 0x22222222 },	/* RBBM_CLOCK_CNTL2_TP1 */
++	{ 0x52, 0x2222 },	/* RBBM_CLOCK_CNTL3_TP0 */
++	{ 0x53, 0x2222 },	/* RBBM_CLOCK_CNTL3_TP1 */
++	{ 0xb0, 0x77777777 },	/* RBBM_CLOCK_HYST_TP0 */
++	{ 0xb1, 0x77777777 },	/* RBBM_CLOCK_HYST_TP1 */
++	{ 0xb4, 0x77777777 },	/* RBBM_CLOCK_HYST2_TP0 */
++	{ 0xb5, 0x77777777 },	/* RBBM_CLOCK_HYST2_TP1 */
++	{ 0xb8, 0x7777 },	/* RBBM_CLOCK_HYST3_TP0 */
++	{ 0xb9, 0x7777 },	/* RBBM_CLOCK_HYST3_TP1 */
++	{ 0xa4, 0x11111111 },	/* RBBM_CLOCK_DELAY_TP0 */
++	{ 0xa5, 0x11111111 },	/* RBBM_CLOCK_DELAY_TP1 */
++	{ 0xa8, 0x11111111 },	/* RBBM_CLOCK_DELAY2_TP0 */
++	{ 0xa9, 0x11111111 },	/* RBBM_CLOCK_DELAY2_TP1 */
++	{ 0xac, 0x1111 },	/* RBBM_CLOCK_DELAY3_TP0 */
++	{ 0xad, 0x1111 },	/* RBBM_CLOCK_DELAY3_TP1 */
++	{ 0x5a, 0x22222222 },	/* RBBM_CLOCK_CNTL_UCHE */
++	{ 0x5b, 0x22222222 },	/* RBBM_CLOCK_CNTL2_UCHE */
++	{ 0x5c, 0x22222222 },	/* RBBM_CLOCK_CNTL3_UCHE */
++	{ 0x5d, 0x222222 },	/* RBBM_CLOCK_CNTL4_UCHE */
++	{ 0x5e, 0x444444 },	/* RBBM_CLOCK_HYST_UCHE */
++	{ 0x5f, 0x2 },	/* RBBM_CLOCK_DELAY_UCHE */
++	{ 0x78, 0x22222222 },	/* RBBM_CLOCK_CNTL_RB0 */
++	{ 0x79, 0x22222222 },	/* RBBM_CLOCK_CNTL_RB1 */
++	{ 0x7c, 0x222222 },	/* RBBM_CLOCK_CNTL2_RB0 */
++	{ 0x7d, 0x222222 },	/* RBBM_CLOCK_CNTL2_RB1 */
++	{ 0x82, 0x22220 },	/* RBBM_CLOCK_CNTL_CCU0 */
++	{ 0x83, 0x22220 },	/* RBBM_CLOCK_CNTL_CCU1 */
++	{ 0x8a, 0x5522222 },	/* RBBM_CLOCK_CNTL_RAC */
++	{ 0x8b, 0x505555 },	/* RBBM_CLOCK_CNTL2_RAC */
++	{ 0x86, 0x4040404 },	/* RBBM_CLOCK_HYST_RB_CCU0 */
++	{ 0x87, 0x4040404 },	/* RBBM_CLOCK_HYST_RB_CCU1 */
++	{ 0x80, 0x7444044 },	/* RBBM_CLOCK_HYST_RAC */
++	{ 0x8c, 0x2 },	/* RBBM_CLOCK_DELAY_RB_CCU_L1_0 */
++	{ 0x8d, 0x2 },	/* RBBM_CLOCK_DELAY_RB_CCU_L1_1 */
++	{ 0x81, 0x10011 },	/* RBBM_CLOCK_DELAY_RAC */
++	{ 0x63, 0x4222222 },	/* RBBM_CLOCK_CNTL_TSE_RAS_RBBM */
++	{ 0x60, 0x2222222 },	/* RBBM_CLOCK_MODE_GPC */
++	{ 0x91, 0x2222 },	/* RBBM_CLOCK_MODE_VFD */
++	{ 0x64, 0x0 },	/* RBBM_CLOCK_HYST_TSE_RAS_RBBM */
++	{ 0x62, 0x4104004 },	/* RBBM_CLOCK_HYST_GPC */
++	{ 0x90, 0x0 },	/* RBBM_CLOCK_HYST_VFD */
++	{ 0x66, 0x0 },	/* RBBM_CLOCK_DELAY_HLSQ */
++	{ 0x65, 0x4000 },	/* RBBM_CLOCK_DELAY_TSE_RAS_RBBM */
++	{ 0x61, 0x200 },	/* RBBM_CLOCK_DELAY_GPC */
++	{ 0x92, 0x2222 },	/* RBBM_CLOCK_DELAY_VFD */
++	{ 0x67, 0xaaa8aa00 },	/* RBBM_CLOCK_CNTL */
++	{ 0x533, 0x182 },	/* RBBM_ISDB_CNT */
++	{ 0x67, 0xaaa82a00 },	/* RBBM_CLOCK_CNTL */
++	{ 0xf803, 0x0 },	/* RBBM_SECVID_TSB_CNTL */
++	{ 0xf800, 0xe8000000 },	/* RBBM_SECVID_TSB_TRUSTED_BASE_LO */
++	{ 0xf801, 0x0 },	/* RBBM_SECVID_TSB_TRUSTED_BASE_HI */
++	{ 0xf802, 0x10000000 },	/* RBBM_SECVID_TSB_TRUSTED_SIZE */
++	{ 0x860, 0x1 },	/* CP_ADDR_MODE_CNTL */
++	{ 0xbc1, 0x1 },	/* VSC_ADDR_MODE_CNTL */
++	{ 0xc81, 0x1 },	/* GRAS_ADDR_MODE_CNTL */
++	{ 0xcc5, 0x1 },	/* RB_ADDR_MODE_CNTL */
++	{ 0xd01, 0x1 },	/* PC_ADDR_MODE_CNTL */
++	{ 0xe05, 0x1 },	/* HLSQ_ADDR_MODE_CNTL */
++	{ 0xe41, 0x1 },	/* VFD_ADDR_MODE_CNTL */
++	{ 0xe61, 0x1 },	/* VPC_ADDR_MODE_CNTL */
++	{ 0xe80, 0x1 },	/* UCHE_ADDR_MODE_CNTL */
++	{ 0xec1, 0x1 },	/* SP_ADDR_MODE_CNTL */
++	{ 0xf01, 0x1 },	/* TPL1_ADDR_MODE_CNTL */
++	{ 0xf810, 0x1 },	/* RBBM_SECVID_TSB_ADDR_MODE_CNTL */
++	{ 0x46b, 0x6 },	/* RBBM_PERFCTR_RBBM_SEL_0 */
++	{ 0x3108, 0x1 },
++	{ 0x3108, 0x0 },
++	{ 0x3100, 0x1 },	/* VBIF_PERF_PWR_CNT_EN0 */
++	{ 0x30cb, 0x1 },
++	{ 0x30cb, 0x0 },
++	{ 0x30d3, 0x55 },	/* VBIF_PERF_CNT_SEL3 */
++	{ 0x30c3, 0x1 },
++	{ 0x469, 0x0 },	/* RBBM_PERFCTR_LOAD_VALUE_LO */
++	{ 0x46a, 0x0 },	/* RBBM_PERFCTR_LOAD_VALUE_HI */
++	{ 0x466, 0x8000 },	/* RBBM_PERFCTR_LOAD_CMD1 */
++	{ 0x469, 0x0 },	/* RBBM_PERFCTR_LOAD_VALUE_LO */
++	{ 0x46a, 0x0 },	/* RBBM_PERFCTR_LOAD_VALUE_HI */
++	{ 0x467, 0x2000 },	/* RBBM_PERFCTR_LOAD_CMD2 */
++	{ 0x469, 0x0 },	/* RBBM_PERFCTR_LOAD_VALUE_LO */
++	{ 0x46a, 0x0 },	/* RBBM_PERFCTR_LOAD_VALUE_HI */
++	{ 0x467, 0x4000 },	/* RBBM_PERFCTR_LOAD_CMD2 */
++	{ 0x469, 0x0 },	/* RBBM_PERFCTR_LOAD_VALUE_LO */
++	{ 0x46a, 0x0 },	/* RBBM_PERFCTR_LOAD_VALUE_HI */
++	{ 0x467, 0x8000 },	/* RBBM_PERFCTR_LOAD_CMD2 */
++	{ 0x3049, 0x3 },	/* VBIF_ROUND_ROBIN_QOS_ARB */
++	{ 0x302a, 0x9 },	/* VBIF_GATE_OFF_WRREQ_EN */
++	{ 0x46f, 0xffffffff },	/* RBBM_PERFCTR_GPU_BUSY_MASKED */
++	{ 0x93, 0x1 },	/* RBBM_AHB_CNTL0 */
++	{ 0x2f, 0x4003ffff },	/* RBBM_INTERFACE_HANG_INT_CNTL */
++	{ 0x464, 0x1 },	/* RBBM_PERFCTR_CNTL */
++	{ 0xe96, 0x2 },	/* UCHE_CACHE_WAYS */
++	{ 0xe89, 0xffff0000 },	/* UCHE_TRAP_BASE_LO */
++	{ 0xe8a, 0x1ffff },	/* UCHE_TRAP_BASE_HI */
++	{ 0xe87, 0xffff0000 },	/* UCHE_WRITE_THRU_BASE_LO */
++	{ 0xe88, 0x1ffff },	/* UCHE_WRITE_THRU_BASE_HI */
++	{ 0xe8b, 0x100000 },	/* UCHE_GMEM_RANGE_MIN_LO */
++	{ 0xe8c, 0x0 },	/* UCHE_GMEM_RANGE_MIN_HI */
++	{ 0xe8d, 0x143fff },	/* UCHE_GMEM_RANGE_MAX_LO */
++	{ 0xe8e, 0x0 },	/* UCHE_GMEM_RANGE_MAX_HI */
++	{ 0x825, 0x40 },	/* CP_MEQ_THRESHOLDS */
++	{ 0x826, 0x400 },	/* CP_MERCIU_SIZE */
++	{ 0x820, 0x80000060 },	/* CP_ROQ_THRESHOLDS_2 */
++	{ 0x81f, 0x40201b16 },	/* CP_ROQ_THRESHOLDS_1 */
++	{ 0xd00, 0x80100000 },	/* PC_DBG_ECO_CNTL */
++	{ 0xcc4, 0x100200 },	/* RB_DBG_ECO_CNT */
++	{ 0xe81, 0x20000000 },	/* UCHE_MODE_CNTL */
++	{ 0x833, 0x2000000 },	/* CP_CHICKEN_DBG */
++	{ 0x94, 0xa6ffffff },	/* RBBM_AHB_CNTL1 */
++	{ 0x95, 0x3f },	/* RBBM_AHB_CNTL2 */
++	{ 0xf02, 0x80 },	/* TPL1_MODE_CNTL */
++	{ 0xcc6, 0x2 },	/* RB_MODE_CNTL */
++	{ 0xe8f, 0x1 },	/* UCHE_DBG_ECO_CNTL_2 */
++	{ 0xe60, 0x400 },	/* VPC_DBG_ECO_CNTL */
++	{ 0xe60, 0x800400 },	/* VPC_DBG_ECO_CNTL */
++	{ 0xe04, 0x0 },	/* HLSQ_DBG_ECO_CNTL */
++	{ 0x840, (uint32_t)DRGPU_VA_SMMU_INFO },	/* CP_CONTEXT_SWITCH_SMMU_INFO_LO */
++	{ 0x841, (uint32_t)(DRGPU_VA_SMMU_INFO >> 32) },	/* CP_CONTEXT_SWITCH_SMMU_INFO_HI */
++	{ 0x8a0, 0x7 },	/* CP_PROTECT_CNTL */
++	{ 0x880, 0x62000010 },	/* CP_PROTECT_REG_0 */
++	{ 0x881, 0x63000020 },
++	{ 0x882, 0x64000040 },
++	{ 0x883, 0x65000080 },
++	{ 0x884, 0x66000100 },
++	{ 0x885, 0x66000200 },
++	{ 0x886, 0x6403e000 },
++	{ 0x887, 0x6103d000 },
++	{ 0x888, 0x66002000 },
++	{ 0x889, 0x63002100 },
++	{ 0x88a, 0x65002200 },
++	{ 0x88b, 0x60002a80 },
++	{ 0x88c, 0x60003300 },
++	{ 0x88d, 0x610033c0 },
++	{ 0x88e, 0x630039a0 },
++	{ 0x88f, 0x640039c0 },
++	{ 0x890, 0x64003a00 },
++	{ 0x891, 0x6e040000 },
++	{ 0x38, 0x33d003fe },	/* RBBM_INT_0_MASK */
++	{ 0xc93, 0x6 },	/* GRAS_PERFCTR_TSE_SEL_3 */
++	{ 0xed9, 0x27 },	/* SP_PERFCTR_SP_SEL_9 */
++	{ 0xeda, 0x35 },	/* SP_PERFCTR_SP_SEL_10 */
++	{ 0xedb, 0x1 },	/* SP_PERFCTR_SP_SEL_11 */
++	{ 0x46b, 0x6 },	/* RBBM_PERFCTR_RBBM_SEL_0 */
++	{ 0x30cb, 0x1 },
++	{ 0x30cb, 0x0 },
++	{ 0x30d3, 0x55 },	/* VBIF_PERF_CNT_SEL3 */
++	{ 0x30c3, 0x1 },
++	{ 0x3108, 0x1 },
++	{ 0x3108, 0x0 },
++	{ 0x3100, 0x1 },	/* VBIF_PERF_PWR_CNT_EN0 */
++};
+diff --git a/bsd/dev/drgpu/drgpu_uc.h b/bsd/dev/drgpu/drgpu_uc.h
+new file mode 100755
+index 0000000..f24ec61
+--- /dev/null
++++ b/bsd/dev/drgpu/drgpu_uc.h
+@@ -0,0 +1,65 @@
++/*
++ * drgpu user client ABI: XNU's DrgGPU (iokit/Kernel/arm/DrgGPU.cpp) and the
++ * drgles host layer that turns Nokia's KGSL calls into IOConnectCallMethod.
++ *
++ * One method per KGSL call Nokia's driver makes (drg/gpu-research/
++ * TWRP-MEASURED.md §4), plus WAIT (sleeps on the GPU interrupt instead of
++ * polling the memstore) and the IOSurface import a window system needs.
++ * Every scalar is a uint64_t. Open the service named DRGPU_UC_SERVICE,
++ * connection type 0. GPU addresses are addresses in the calling task
++ * (KGSL USE_CPU_MAP): the kernel maps each object into the task and, at the
++ * same address, into the task's own GPU address space.
++ */
++#ifndef DRGPU_UC_H
++#define DRGPU_UC_H
++#include <stdint.h>
++
++#define DRGPU_UC_SERVICE	"DrgGPU"
++#define DRGPU_UC_VERSION	1
++
++enum drgpu_uc_selector {
++	/* in: KGSL property type; struct out: its bytes, exactly the size KGSL returns */
++	DRGPU_UC_GETPROPERTY = 0,
++	/* in: KGSL context flags; out: context id */
++	DRGPU_UC_CTX_CREATE = 1,
++	/* in: context id (waits for its submissions first) */
++	DRGPU_UC_CTX_DESTROY = 2,
++	/* in: size, KGSL memflags; out: id, GPU address (= task address), mapped size */
++	DRGPU_UC_OBJ_ALLOC = 3,
++	/* in: id, on_event, context id, timestamp: on_event 1 frees once the
++	 * context retired the timestamp (KGSL_GPUOBJ_FREE_ON_EVENT), 0 now */
++	DRGPU_UC_OBJ_FREE = 4,
++	/* in: context id, KGSL cmdbatch flags, timestamp; struct in: n x
++	 * struct drgpu_uc_ib (n <= DRGPU_UC_MAX_IBS); out: timestamp */
++	DRGPU_UC_SUBMIT = 5,
++	/* in: context id, timestamp, timeout in ms */
++	DRGPU_UC_WAIT = 6,
++	/* out: task address of the memstore (read-only, KGSL's DEVICE_SHADOW), size */
++	DRGPU_UC_MEMSTORE = 7,
++	/* out: id */
++	DRGPU_UC_SYNCSRC_CREATE = 8,
++	/* in: id */
++	DRGPU_UC_SYNCSRC_DESTROY = 9,
++	/* in: IOSurface id; out: object id, GPU address (= task address), size */
++	DRGPU_UC_SURFACE_MAP = 10,
++	/* in: object id: clean and invalidate the CPU caches over it (for memory
++	 * the CPU maps cached, such as IOSurfaces created cacheable) */
++	DRGPU_UC_OBJ_SYNC = 11,
++	/* out: DRGPU_UC_VERSION */
++	DRGPU_UC_GET_VERSION = 12,
++	DRGPU_UC_COUNT
++};
++
++struct drgpu_uc_ib {
++	uint64_t gpuaddr;	/* 4-byte aligned */
++	uint64_t bytes;		/* multiple of 4 */
++};
++
++#define DRGPU_UC_MAX_IBS	16
++
++/* KGSL values the kernel interprets (HMD msm_kgsl.h) */
++#define DRGPU_KGSL_CONTEXT_USER_GENERATED_TS	0x00000080u
++#define DRGPU_KGSL_CMDBATCH_MARKER		0x00000002u
++#define DRGPU_KGSL_MEMFLAGS_GPUREADONLY		0x01000000u
++
++#endif
+diff --git a/iokit/Kernel/arm/DrgGPU.cpp b/iokit/Kernel/arm/DrgGPU.cpp
+new file mode 100755
+index 0000000..91efe80
+--- /dev/null
++++ b/iokit/Kernel/arm/DrgGPU.cpp
+@@ -0,0 +1,1532 @@
++/*
++ * DRG (Nokia 6.1 Plus) GPU: the Adreno 512 for iOS userland.
++ *
++ * A thin XNU wrapper around the portable drgpu core (bsd/dev/drgpu, the
++ * source the shim proved on this phone: drg/GPU-IOS-DESIGN.md I2, I3).
++ *
++ *   firmware   Nokia's files, handed over by the shim below topOfKernelData
++ *              (boot-arg drgpufw=<pa>, gpu/drgpu/drgpu_fwblob.h), checked by
++ *              FNV-1a before use. Never in the kernel image.
++ *   memory     the core's rings, globals and page tables come from
++ *              write-combined, physically contiguous pools (the GPU walks and
++ *              reads them non-cacheable). Process objects are wired pages
++ *              mapped into the task and, at the same address, into the task's
++ *              own GPU address space (KGSL USE_CPU_MAP; Nokia's driver needs
++ *              GPU address == CPU address).
++ *   interrupt  kgsl-3d0 "interrupts = <0 0x12c 0>": SPI 300 = INTID 332,
++ *              level, routed to the boot CPU; sleh_irq hands it to
++ *              drg_gpu_irq on whichever CPU takes it. CACHE_FLUSH_TS wakes
++ *              waiters; CP_HW_ERROR and MISC_HANG_DETECT start a recovery.
++ *   power      GX collapse after Nokia's qcom,idle-timeout (80 ms) without
++ *              work, resume on the next submission (~9 ms measured, no zap
++ *              reload). SMMU registers are only touched while powered.
++ *   clocks     levels 430/370/266/160 MHz (gpu-research §6g), starting at
++ *              Linux's default 266; every 50 ms the busy share of the last
++ *              window moves one level up (> 75 %) or down (< 30 %).
++ *
++ * DrgGPUUserClient offers Nokia's KGSL calls (gpu/drgpu/drgpu_uc.h).
++ * Boot-args: drggpu=0 (off), drggpu_level=0..3 (fixed level, no DCVS),
++ * drggpu_idle=<ms> (0: never collapse).
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(DRG)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOInterrupts.h>
++#include <libkern/c++/OSNumber.h>
++#include <machine/machine_routines.h>
++#include <machine/atomic.h>
++#include <kern/thread_call.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++#include <sys/proc.h>
++
++#include "DrgSurface.h"
++
++extern "C" {
++vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);   /* as drg_ts.c, drg_emmc.c */
++#include "../../../bsd/dev/drgpu/drgpu.h"
++#include "../../../bsd/dev/drgpu/drgpu_fwblob.h"
++#include "../../../bsd/dev/drgpu/drgpu_uc.h"
++}
++
++#define DRG_GPU_INTID           332u            /* SPI 300 */
++#define DRG_GPU_GICD            0x17a00000ull   /* qcom,msm-qgic2 / GICv3 distributor */
++#define DRG_GPU_GICD_SIZE       0x10000ull
++#define DRG_GPU_FW_MAX          (4ull << 20)    /* the blob is ~48 KiB */
++#define DRG_GPU_POOL_CHUNK      (2u << 20)
++#define DRG_GPU_POOL_CHUNKS     8
++#define DRG_GPU_POOL_PAGES      (DRG_GPU_POOL_CHUNK / 0x1000)
++#define DRG_GPU_BIG_ALLOCS      4               /* zap image region and meta */
++#define DRG_GPU_PA_MASK         0x0000000fffffffffull   /* SMMU oas 36 */
++#define DRG_GPU_KCTX            (DRGPU_MS_RB - 1)       /* the kernel's own context */
++#define DRG_GPU_DEFAULT_LEVEL   2               /* 266 MHz, Linux default_pwrlevel */
++#define DRG_GPU_IDLE_MS         80              /* qcom,idle-timeout */
++#define DRG_GPU_DCVS_MS         50
++#define DRG_GPU_OBJ_MAX         (512ull << 20)
++#define DRG_GPU_CLIENT_MAX      (1024ull << 20)
++#define DRG_GPU_MAX_OBJS        65536u
++#define DRG_GPU_VA_MIN          0x100000000ull  /* above the kernel's global region */
++#define DRG_GPU_VA_END          (1ull << 39)    /* TCR T0SZ 25 */
++#define RBBM_INT_0_MASK         0x38            /* a5xx_reg.h */
++#define CP_HW_FAULT             0xb1a
++#define CP_INTERRUPT_STATUS     0xb18
++#define CP_PROTECT_STATUS       0xb1c
++#define RBBM_STATUS             0x4f5
++#define CP_RB_RPTR              0x806
++#define INT_CP_HW_ERROR         (1u << 9)       /* A5XX_INT_CP_HW_ERROR */
++#define INT_CACHE_FLUSH_TS      (1u << 20)
++#define INT_MISC_HANG_DETECT    (1u << 23)
++
++/* GICv3 distributor (non-secure view) */
++#define GICD_CTLR               0x0000
++#define GICD_IGROUPR            0x0080
++#define GICD_ISENABLER          0x0100
++#define GICD_ICENABLER          0x0180
++#define GICD_IPRIORITYR         0x0400
++#define GICD_ICFGR              0x0c00
++#define GICD_IROUTER            0x6000
++#define GICD_CTLR_RWP           (1u << 31)
++
++class DrgGPUUserClient;
++
++struct drg_gpu_chunk {
++	IOBufferMemoryDescriptor *md;           /* owns the pages */
++	IOMemoryMap              *map;          /* write-combined view the core uses */
++	uint64_t                  pa;
++	uint8_t                  *va;
++	uint32_t                  used[DRG_GPU_POOL_PAGES / 32];
++};
++
++struct drg_gpu_big {
++	IOBufferMemoryDescriptor *md;
++	IOMemoryMap              *map;          /* NULL once the memory belongs to TZ */
++	uint64_t                  pa, size;
++	uint8_t                  *va;
++};
++
++struct drg_gpu_ctx {
++	DrgGPUUserClient *owner;        /* NULL: free */
++	uint32_t          flags;
++	uint32_t          ts;           /* last timestamp submitted */
++	uint32_t          gen;          /* kernel-generated timestamps */
++	bool              submitted;
++	bool              faulted;      /* its work was dropped by a recovery */
++};
++
++class DrgGPU : public IOService {
++	OSDeclareDefaultStructors(DrgGPU);
++	friend class DrgGPUUserClient;
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++
++	void interrupt(void);
++
++private:
++	struct drgpu         fG;
++	IOLock              *fLock;
++	IOMemoryMap         *fFwMap;
++	uintptr_t            fGicd;
++	struct drg_gpu_chunk fPool[DRG_GPU_POOL_CHUNKS];
++	struct drg_gpu_big   fBig[DRG_GPU_BIG_ALLOCS];
++	struct drg_gpu_ctx   fCtx[DRGPU_MS_RB];
++	int                  fLevel;
++	bool                 fDcvs;
++	uint32_t             fIdleMs;
++	thread_call_t        fIdleCall, fDcvsCall, fRecoverCall;
++	uint64_t             fLastSubmitAbs;
++	uint64_t             fDcvsLastAbs;
++	uint64_t             fWiredBytes;
++
++	/* shared with the interrupt handler (os_atomic) */
++	uint32_t             fIrqLive;          /* the GPU is powered and may be read */
++	uint32_t             fInIrq;
++	uint32_t             fIrqEvent;         /* wait channel */
++	uint32_t             fIrqCount;
++	uint32_t             fFaultStatus;
++	uint32_t             fLastCtx, fLastTs; /* last submission (the ring runs in order) */
++	uint64_t             fBusySince;        /* 0: idle */
++	uint64_t             fBusyAccum;
++
++public:
++	/* drgpu_os hooks */
++	uintptr_t osMmio(uint64_t pa, uint64_t len);
++	int osAlloc(uint64_t size, uint64_t align, struct drgpu_mem *out);
++	void osFree(struct drgpu_mem *m);
++	uint64_t *osPtov(uint64_t pa);
++
++private:
++	bool loadFirmware(struct drgpu_fw *fw);
++	bool bringUp(void);
++	bool selfTest(void);
++	void gicSetup(void);
++	void gicEnable(bool on);
++	void irqLive(bool on);
++	bool lastRetired(void);
++	IOReturn ensurePowered(void);
++	void collapse(void);
++	void setLevel(int level);
++	void dumpFault(uint32_t status);
++	uint32_t regRead(uint32_t reg);
++
++	static void idleTimer(thread_call_param_t p0, thread_call_param_t p1);
++	static void dcvsTimer(thread_call_param_t p0, thread_call_param_t p1);
++	static void recover(thread_call_param_t p0, thread_call_param_t p1);
++
++	/* used by the user client, lock held unless noted */
++	int ctxCreate(DrgGPUUserClient *owner, uint32_t flags);
++	void ctxRelease(uint32_t id);
++	bool ctxRetired(uint32_t id, uint32_t ts);              /* no lock */
++	IOReturn waitTs(uint32_t id, uint32_t ts, uint32_t ms); /* no lock */
++	IOReturn submit(DrgGPUUserClient *c, uint32_t ctx, uint32_t flags, uint32_t *ts,
++	    const struct drgpu_uc_ib *ibs, unsigned n);
++};
++
++OSDefineMetaClassAndStructors(DrgGPU, IOService);
++
++struct drg_gpu_obj {
++	IOMemoryDescriptor *md;         /* owns the pages; NULL: free slot */
++	IOMemoryDescriptor *phys;       /* the same pages as physical ranges */
++	IOMemoryMap        *map;        /* of phys in the task, write-combined; its address is the GPU address */
++	uint64_t            gpuaddr, size;
++	uint32_t            pendCtx, pendTs;
++	bool                pending;    /* freed on (pendCtx, pendTs) */
++	bool                surface;    /* an imported IOSurface (not counted, prepared here) */
++	bool                unmapped;   /* off the GPU, waiting for the TLB flush */
++};
++
++class DrgGPUUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(DrgGPUUserClient);
++	friend class DrgGPU;
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++
++private:
++	DrgGPU             *fGPU;
++	task_t              fTask;
++	struct drgpu_space  fSpace;
++	bool                fSpaceLive;
++	bool                fClosed;
++	struct drg_gpu_obj *fObjs;
++	uint32_t            fObjCap;
++	uint32_t            fPending;
++	uint64_t            fBytes;
++	IOMemoryMap        *fMemstore;
++	uint32_t            fSyncSrc;
++
++	IOReturn kgslProperty(uint32_t type, IOExternalMethodArguments *args);
++	IOReturn objInsert(IOMemoryDescriptor *md, uint64_t size, bool ro, bool surface, uint64_t *out);
++	IOReturn objAlloc(uint64_t size, uint64_t flags, uint64_t *out);
++	IOReturn surfaceMap(uint32_t surfaceID, uint64_t *out);
++	IOReturn objFree(uint32_t id, bool onEvent, uint32_t ctx, uint32_t ts);
++	struct drg_gpu_obj *obj(uint64_t id);
++	void retire(bool all);
++	void unmapObj(struct drg_gpu_obj *o);
++	void releaseUnmapped(void);
++	IOReturn ctxDestroy(uint32_t id);
++	IOReturn waitCtx(uint32_t id, uint32_t ts, uint32_t ms);
++	void teardown(void);
++};
++
++OSDefineMetaClassAndStructors(DrgGPUUserClient, IOUserClient);
++
++static DrgGPU *gDrgGPU;
++
++static uint64_t
++drg_gpu_deadline_ms(uint32_t ms)
++{
++	uint64_t d;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &d);
++	return d;
++}
++
++/*
++ * Memory the GPU reads and writes uncached (it does not snoop the CPU's
++ * caches), the way Linux's dma_alloc does it on arm64 for such a device:
++ * ordinary pages, zeroed and cleaned out of the caches once, then used only
++ * through a write-combined mapping of their physical pages. The cacheable
++ * alias the pages already have is never used for them again. Mappings of a
++ * physical descriptor take the cache mode per mapping (as DrgSurface maps
++ * the panel), so the buffer's own memory object is never changed.
++ */
++static IOMemoryDescriptor *
++drg_gpu_phys_view(IOMemoryDescriptor *md, uint64_t size)
++{
++	uint32_t n = 0;
++	for (uint64_t off = 0, last = ~0ull; off < size;) {
++		IOByteCount seg = 0;
++		addr64_t pa = md->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
++		if (pa == 0 || seg == 0) {
++			return NULL;
++		}
++		if (seg > size - off) {
++			seg = size - off;
++		}
++		if (pa != last) {
++			n++;
++		}
++		last = pa + seg;
++		off += seg;
++	}
++	IOAddressRange *r = IONew(IOAddressRange, n);
++	if (r == NULL) {
++		return NULL;
++	}
++	uint32_t i = 0;
++	for (uint64_t off = 0; off < size;) {
++		IOByteCount seg = 0;
++		addr64_t pa = md->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
++		if (seg > size - off) {
++			seg = size - off;
++		}
++		if (i != 0 && r[i - 1].address + r[i - 1].length == pa) {
++			r[i - 1].length += seg;
++		} else {
++			r[i].address = pa;
++			r[i].length = seg;
++			i++;
++		}
++		off += seg;
++	}
++	IOMemoryDescriptor *view = IOMemoryDescriptor::withAddressRanges(r, i,
++	    kIODirectionInOut | kIOMemoryTypePhysical64, TASK_NULL);
++	IODelete(r, IOAddressRange, n);
++	return view;
++}
++
++/* Contiguous, zeroed, cleaned; *va is a write-combined kernel mapping. */
++static bool
++drg_gpu_contig(uint64_t size, uint64_t align, IOBufferMemoryDescriptor **mdp, IOMemoryMap **mapp,
++    uint64_t *pa, uint8_t **va)
++{
++	IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, DRG_GPU_PA_MASK & ~(align - 1));
++	if (md == NULL) {
++		return false;
++	}
++	bzero(md->getBytesNoCopy(), size);
++	md->performOperation(kIOMemoryIncoherentIOFlush, 0, size);
++	*pa = md->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++	IOMemoryDescriptor *phys = IOMemoryDescriptor::withPhysicalAddress(*pa, size, kIODirectionInOut);
++	IOMemoryMap *map = phys != NULL ? phys->map(kIOMapWriteCombineCache) : NULL;
++	OSSafeReleaseNULL(phys);
++	if (map == NULL) {
++		md->release();
++		return false;
++	}
++	*mdp = md;
++	*mapp = map;
++	*va = (uint8_t *)(uintptr_t)map->getVirtualAddress();
++	return true;
++}
++
++/* ---- OS hooks for the core (all called with fLock held, or during start) ---- */
++
++static uintptr_t
++drg_gpu_os_mmio(void *ctx, uint64_t pa, uint64_t len)
++{
++	return static_cast<DrgGPU *>(ctx)->osMmio(pa, len);
++}
++
++static int
++drg_gpu_os_alloc(void *ctx, uint64_t size, uint64_t align, struct drgpu_mem *out)
++{
++	return static_cast<DrgGPU *>(ctx)->osAlloc(size, align, out);
++}
++
++static void
++drg_gpu_os_free(void *ctx, struct drgpu_mem *m)
++{
++	static_cast<DrgGPU *>(ctx)->osFree(m);
++}
++
++static uint64_t *
++drg_gpu_os_ptov(void *ctx, uint64_t pa)
++{
++	return static_cast<DrgGPU *>(ctx)->osPtov(pa);
++}
++
++static void
++drg_gpu_os_log(void *ctx __unused, const char *msg)
++{
++	IOLog("DRG GPU: %s\n", msg);
++}
++
++static void
++drg_gpu_os_sleep(void *ctx __unused, uint32_t us)
++{
++	if (us >= 1000) {
++		IOSleep((us + 999) / 1000);
++	} else {
++		IODelay(us);
++	}
++}
++
++/* Device memory (nGnRE), mapped the way the other DRG drivers map theirs; never unmapped. */
++uintptr_t
++DrgGPU::osMmio(uint64_t pa, uint64_t len)
++{
++	return (uintptr_t)ml_io_map((vm_offset_t)pa, (vm_size_t)len);
++}
++
++/*
++ * Zeroed, physically contiguous, written and read write-combined
++ * (drg_gpu_contig). Up to 16 KiB alignment from the pools (4 KiB pages: a page
++ * table costs 4 KiB, not a 16 KiB CPU page); larger alignments (the zap
++ * region, 1 MiB) get their own buffer.
++ */
++int
++DrgGPU::osAlloc(uint64_t size, uint64_t align, struct drgpu_mem *out)
++{
++	if (size == 0 || (align & (align - 1)) != 0) {
++		return -1;
++	}
++	size = (size + 0xfff) & ~0xfffull;
++	if (align <= 0x4000 && size <= DRG_GPU_POOL_CHUNK) {
++		uint32_t n = (uint32_t)(size >> 12), step = align > 0x1000 ? (uint32_t)(align >> 12) : 1;
++		for (unsigned c = 0; c < DRG_GPU_POOL_CHUNKS; c++) {
++			struct drg_gpu_chunk *k = &fPool[c];
++			if (k->md == NULL) {
++				if (!drg_gpu_contig(DRG_GPU_POOL_CHUNK, DRG_GPU_POOL_CHUNK, &k->md, &k->map, &k->pa, &k->va)) {
++					return -1;
++				}
++				bzero(k->used, sizeof(k->used));
++			}
++			for (uint32_t first = 0; first + n <= DRG_GPU_POOL_PAGES; first += step) {
++				uint32_t i = 0;
++				while (i < n && !(k->used[(first + i) / 32] & (1u << ((first + i) % 32)))) {
++					i++;
++				}
++				if (i < n) {
++					continue;
++				}
++				for (i = 0; i < n; i++) {
++					k->used[(first + i) / 32] |= 1u << ((first + i) % 32);
++				}
++				out->pa = k->pa + ((uint64_t)first << 12);
++				out->va = k->va + ((uint64_t)first << 12);
++				out->size = size;
++				bzero(out->va, size);
++				return 0;
++			}
++		}
++		return -1;
++	}
++	for (unsigned b = 0; b < DRG_GPU_BIG_ALLOCS; b++) {
++		struct drg_gpu_big *g = &fBig[b];
++		if (g->md != NULL) {
++			continue;
++		}
++		if (!drg_gpu_contig(size, align, &g->md, &g->map, &g->pa, &g->va)) {
++			return -1;
++		}
++		g->size = size;
++		out->pa = g->pa;
++		out->va = g->va;
++		out->size = size;
++		return 0;
++	}
++	return -1;
++}
++
++void
++DrgGPU::osFree(struct drgpu_mem *m)
++{
++	for (unsigned c = 0; c < DRG_GPU_POOL_CHUNKS; c++) {
++		struct drg_gpu_chunk *k = &fPool[c];
++		if (k->md != NULL && m->pa >= k->pa && m->pa < k->pa + DRG_GPU_POOL_CHUNK) {
++			uint32_t first = (uint32_t)((m->pa - k->pa) >> 12), n = (uint32_t)((m->size + 0xfff) >> 12);
++			for (uint32_t i = 0; i < n && first + i < DRG_GPU_POOL_PAGES; i++) {
++				k->used[(first + i) / 32] &= ~(1u << ((first + i) % 32));
++			}
++			return;
++		}
++	}
++	for (unsigned b = 0; b < DRG_GPU_BIG_ALLOCS; b++) {
++		if (fBig[b].md != NULL && fBig[b].pa == m->pa) {
++			OSSafeReleaseNULL(fBig[b].map);
++			fBig[b].md->release();
++			bzero(&fBig[b], sizeof(fBig[b]));
++			return;
++		}
++	}
++}
++
++uint64_t *
++DrgGPU::osPtov(uint64_t pa)
++{
++	for (unsigned c = 0; c < DRG_GPU_POOL_CHUNKS; c++) {
++		struct drg_gpu_chunk *k = &fPool[c];
++		if (k->md != NULL && pa >= k->pa && pa < k->pa + DRG_GPU_POOL_CHUNK) {
++			return (uint64_t *)(void *)(k->va + (pa - k->pa));
++		}
++	}
++	for (unsigned b = 0; b < DRG_GPU_BIG_ALLOCS; b++) {
++		if (fBig[b].map != NULL && pa >= fBig[b].pa && pa < fBig[b].pa + fBig[b].size) {
++			return (uint64_t *)(void *)(fBig[b].va + (pa - fBig[b].pa));
++		}
++	}
++	return NULL;
++}
++
++/* ---- start ---- */
++
++/* The shim's blob (static memory below topOfKernelData): map, check, point fw at it. */
++bool
++DrgGPU::loadFirmware(struct drgpu_fw *fw)
++{
++	uint64_t pa = 0;
++	if (!PE_parse_boot_argn("drgpufw", &pa, sizeof(pa)) || pa == 0 || (pa & 0x3fff) != 0) {
++		IOLog("DRG GPU: no firmware from the shim (boot-arg drgpufw)\n");
++		return false;
++	}
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa, 0x4000, kIODirectionIn);
++	IOMemoryMap *head = md != NULL ? md->map(kIOMapReadOnly) : NULL;
++	OSSafeReleaseNULL(md);
++	if (head == NULL) {
++		return false;
++	}
++	const struct drgpu_fwblob *b = (const struct drgpu_fwblob *)(uintptr_t)head->getVirtualAddress();
++	uint64_t len = b->magic == DRGPU_FWBLOB_MAGIC ? sizeof(*b) + b->total : 0;
++	head->release();
++	if (len == 0 || len > DRG_GPU_FW_MAX) {
++		IOLog("DRG GPU: firmware blob at 0x%llx is not valid\n", pa);
++		return false;
++	}
++	md = IOMemoryDescriptor::withPhysicalAddress(pa, (len + 0x3fff) & ~0x3fffull, kIODirectionIn);
++	fFwMap = md != NULL ? md->map(kIOMapReadOnly) : NULL;
++	OSSafeReleaseNULL(md);
++	if (fFwMap == NULL) {
++		return false;
++	}
++	int rc = drgpu_fwblob_parse((const uint8_t *)(uintptr_t)fFwMap->getVirtualAddress(), len, fw);
++	if (rc != 0) {
++		IOLog("DRG GPU: firmware blob check failed (step %d)\n", -rc);
++		return false;
++	}
++	return true;
++}
++
++/*
++ * SPI 332: Group 1, priority 0xa0, level, routed to the boot CPU (it never
++ * goes offline), as the shim proved it (drg_gic_spi) and Linux sets it up.
++ */
++void
++DrgGPU::gicSetup(void)
++{
++	const uint32_t n = DRG_GPU_INTID / 32, bit = 1u << (DRG_GPU_INTID % 32);
++	const ml_topology_info_t *topology = ml_get_topology_info();
++	uint64_t mpidr = topology->boot_cpu->phys_id;
++	uint32_t v = drgpu_rd(fGicd + GICD_CTLR);
++	if ((v & 0x13) != 0x13) {       /* ARE_NS, EnableGrp1A, EnableGrp1 (Linux gic_dist_init) */
++		drgpu_wr(fGicd + GICD_CTLR, v | 0x13);
++	}
++	drgpu_wr(fGicd + GICD_IGROUPR + 4 * n, drgpu_rd(fGicd + GICD_IGROUPR + 4 * n) | bit);
++	uintptr_t pr = fGicd + GICD_IPRIORITYR + (DRG_GPU_INTID & ~3u);
++	uint32_t sh = 8 * (DRG_GPU_INTID & 3);
++	drgpu_wr(pr, (drgpu_rd(pr) & ~(0xffu << sh)) | 0xa0u << sh);
++	uintptr_t cfg = fGicd + GICD_ICFGR + 4 * (DRG_GPU_INTID / 16);
++	drgpu_wr(cfg, drgpu_rd(cfg) & ~(2u << (2 * (DRG_GPU_INTID % 16))));     /* level */
++	drgpu_wr(fGicd + GICD_IROUTER + 8 * DRG_GPU_INTID, (uint32_t)(mpidr & 0xffffff));
++	drgpu_wr(fGicd + GICD_IROUTER + 8 * DRG_GPU_INTID + 4, (uint32_t)((mpidr >> 32) & 0xff));
++}
++
++void
++DrgGPU::gicEnable(bool on)
++{
++	const uint32_t n = DRG_GPU_INTID / 32, bit = 1u << (DRG_GPU_INTID % 32);
++	drgpu_wr(fGicd + (on ? GICD_ISENABLER : GICD_ICENABLER) + 4 * n, bit);
++	for (int i = 0; i < 100000 && (drgpu_rd(fGicd + GICD_CTLR) & GICD_CTLR_RWP); i++) {
++		;
++	}
++}
++
++static void
++drg_gpu_irq(void *target __unused, void *refCon __unused, void *nub __unused, int source)
++{
++	if ((uint32_t)source == DRG_GPU_INTID && gDrgGPU != NULL) {
++		gDrgGPU->interrupt();
++	}
++}
++
++/* sleh_irq calls this CPU's handler for every SPI with its INTID. */
++static void
++drg_gpu_install_handler(void *arg __unused)
++{
++	ml_install_interrupt_handler(NULL, (int)DRG_GPU_INTID, NULL, drg_gpu_irq, NULL);
++}
++
++/*
++ * Interrupt context. The GPU is only read while fIrqLive (powered); the
++ * power-off path disables the SPI, clears fIrqLive and waits for fInIrq.
++ */
++void
++DrgGPU::interrupt(void)
++{
++	os_atomic_inc(&fInIrq, acquire);
++	if (os_atomic_load(&fIrqLive, acquire)) {
++		uint32_t st = drgpu_irq(&fG);
++		if (st & (INT_CP_HW_ERROR | INT_MISC_HANG_DETECT)) {
++			/* a hung GPU keeps these asserted: no more GPU interrupts until recovered */
++			drgpu_wr(fG.gpu + 4 * RBBM_INT_0_MASK, 0);
++			if (os_atomic_cmpxchg(&fFaultStatus, 0u, st | 1u, acq_rel)) {
++				thread_call_enter(fRecoverCall);
++			}
++		}
++		if (st & INT_CACHE_FLUSH_TS) {
++			os_atomic_inc(&fIrqCount, relaxed);
++			if (lastRetired()) {
++				uint64_t since = os_atomic_xchg(&fBusySince, 0ull, acq_rel);
++				if (since != 0) {
++					os_atomic_add(&fBusyAccum, mach_absolute_time() - since, relaxed);
++				}
++			}
++			thread_wakeup((event_t)&fIrqEvent);
++		}
++	}
++	os_atomic_dec(&fInIrq, release);
++}
++
++void
++DrgGPU::irqLive(bool on)
++{
++	if (on) {
++		os_atomic_store(&fIrqLive, 1u, release);
++		gicEnable(true);
++	} else {
++		gicEnable(false);
++		os_atomic_store(&fIrqLive, 0u, release);
++		while (os_atomic_load(&fInIrq, acquire) != 0) {
++			;
++		}
++	}
++}
++
++uint32_t
++DrgGPU::regRead(uint32_t reg)
++{
++	return drgpu_rd(fG.gpu + 4 * reg);
++}
++
++bool
++DrgGPU::lastRetired(void)
++{
++	uint32_t ctx = os_atomic_load(&fLastCtx, acquire);
++	return ctx == 0 || ctxRetired(ctx, os_atomic_load(&fLastTs, acquire));
++}
++
++bool
++DrgGPU::ctxRetired(uint32_t id, uint32_t ts)
++{
++	return (int32_t)(drgpu_retired(&fG, id) - ts) >= 0;  /* KGSL timestamp compare */
++}
++
++bool
++DrgGPU::bringUp(void)
++{
++	if (drgpu_rpm_attach(&fG, 1) != 0) {
++		IOLog("DRG GPU: RPM channel not found (the shim opens it)\n");
++		return false;
++	}
++	if (drgpu_power_on(&fG) || drgpu_smmu_attach(&fG) || drgpu_cp_start(&fG) ||
++	    drgpu_set_level(&fG, fLevel)) {
++		IOLog("DRG GPU: bring-up failed: %s\n", drgpu_err(&fG));
++		return false;
++	}
++	return true;
++}
++
++/* A marker through the ring, retired through the interrupt: CP, memstore, IRQ. */
++bool
++DrgGPU::selfTest(void)
++{
++	uint32_t irqs = os_atomic_load(&fIrqCount, relaxed);
++	uint64_t t0 = mach_absolute_time();
++	IOLockLock(fLock);
++	fCtx[DRG_GPU_KCTX].ts++;
++	uint32_t ts = fCtx[DRG_GPU_KCTX].ts;
++	uint32_t got = drgpu_submit(&fG, NULL, DRG_GPU_KCTX, NULL, 0, ts);
++	if (got != 0) {
++		os_atomic_store(&fLastTs, ts, release);
++		os_atomic_store(&fLastCtx, (uint32_t)DRG_GPU_KCTX, release);
++	}
++	IOLockUnlock(fLock);
++	IOReturn rc = got != 0 ? waitTs(DRG_GPU_KCTX, ts, 500) : kIOReturnError;
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	IOLockLock(fLock);
++	uint32_t khz = drgpu_gpu_khz(&fG);
++	IOLockUnlock(fLock);
++	IOLog("DRG GPU: self-test %s: marker retired in %llu us, %u interrupt(s), %u kHz\n",
++	    rc == kIOReturnSuccess ? "PASS" : "FAIL", ns / 1000,
++	    os_atomic_load(&fIrqCount, relaxed) - irqs, khz);
++	return rc == kIOReturnSuccess && os_atomic_load(&fIrqCount, relaxed) != irqs;
++}
++
++bool
++DrgGPU::start(IOService *provider)
++{
++	uint32_t on = 1, level = 0xff, idle = DRG_GPU_IDLE_MS;
++	struct drgpu_fw fw;
++	struct drgpu_os os;
++
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	PE_parse_boot_argn("drggpu", &on, sizeof(on));
++	if (!on) {
++		IOLog("DRG GPU: off (drggpu=0)\n");
++		return false;
++	}
++	PE_parse_boot_argn("drggpu_level", &level, sizeof(level));
++	PE_parse_boot_argn("drggpu_idle", &idle, sizeof(idle));
++	fDcvs = level >= DRGPU_LEVELS;
++	fLevel = fDcvs ? DRG_GPU_DEFAULT_LEVEL : (int)level;
++	fIdleMs = idle;
++	fLock = IOLockAlloc();
++	fIdleCall = thread_call_allocate(idleTimer, this);
++	fDcvsCall = thread_call_allocate(dcvsTimer, this);
++	fRecoverCall = thread_call_allocate(recover, this);
++	if (fLock == NULL || fIdleCall == NULL || fDcvsCall == NULL || fRecoverCall == NULL) {
++		return false;
++	}
++	bzero(&fw, sizeof(fw));
++	if (!loadFirmware(&fw)) {
++		return false;
++	}
++	os.ctx = this;
++	os.mmio = drg_gpu_os_mmio;
++	os.alloc = drg_gpu_os_alloc;
++	os.free = drg_gpu_os_free;
++	os.ptov = drg_gpu_os_ptov;
++	os.log = drg_gpu_os_log;
++	os.sleep_us = drg_gpu_os_sleep;
++	bzero(&fG, sizeof(fG));
++	if (drgpu_init(&fG, &os, &fw) != 0) {
++		IOLog("DRG GPU: init failed: %s\n", drgpu_err(&fG));
++		return false;
++	}
++	fGicd = osMmio(DRG_GPU_GICD, DRG_GPU_GICD_SIZE);
++	if (fGicd == 0) {
++		return false;
++	}
++	fCtx[DRG_GPU_KCTX].owner = NULL;
++	fCtx[DRG_GPU_KCTX].submitted = true;    /* reserved: never handed out */
++	IOLockLock(fLock);
++	bool up = bringUp();
++	if (up && fG.zap_loaded) {
++		/* the zap region now belongs to TZ: no CPU mapping of it stays (its pages stay ours) */
++		for (unsigned b = 0; b < DRG_GPU_BIG_ALLOCS; b++) {
++			OSSafeReleaseNULL(fBig[b].map);
++		}
++	}
++	IOLockUnlock(fLock);
++	if (!up) {
++		return false;
++	}
++	gDrgGPU = this;
++	cpu_broadcast_xcall_simple(TRUE, drg_gpu_install_handler, NULL);
++	gicSetup();
++	irqLive(true);
++	if (!selfTest()) {
++		irqLive(false);
++		IOLockLock(fLock);
++		(void)drgpu_power_off(&fG);
++		IOLockUnlock(fLock);
++		return false;
++	}
++	IOLockLock(fLock);
++	fDcvsLastAbs = mach_absolute_time();
++	fLastSubmitAbs = fDcvsLastAbs;
++	if (fDcvs) {
++		thread_call_enter_delayed(fDcvsCall, drg_gpu_deadline_ms(DRG_GPU_DCVS_MS));
++	}
++	if (fIdleMs != 0) {
++		thread_call_enter_delayed(fIdleCall, drg_gpu_deadline_ms(fIdleMs));
++	}
++	IOLockUnlock(fLock);
++	setProperty("IOUserClientClass", "DrgGPUUserClient");
++	setProperty("DrgGPUChipID", 0x05010200ull, 32);
++	registerService();
++	IOLog("DRG GPU: Adreno 512 up (level %d%s, idle collapse %u ms)\n", fLevel,
++	    fDcvs ? ", DCVS" : ", fixed", fIdleMs);
++	return true;
++}
++
++/* ---- power, clocks, recovery ---- */
++
++/* Lock held. After a collapse (or a failed one) the GPU comes back at the current level. */
++IOReturn
++DrgGPU::ensurePowered(void)
++{
++	if (fG.powered && fG.cp_running) {
++		return kIOReturnSuccess;
++	}
++	if (drgpu_resume(&fG, fLevel) != 0) {
++		IOLog("DRG GPU: resume failed: %s\n", drgpu_err(&fG));
++		return kIOReturnNotResponding;
++	}
++	irqLive(true);
++	fDcvsLastAbs = mach_absolute_time();
++	os_atomic_store(&fBusyAccum, 0ull, relaxed);
++	if (fDcvs) {
++		thread_call_enter_delayed(fDcvsCall, drg_gpu_deadline_ms(DRG_GPU_DCVS_MS));
++	}
++	return kIOReturnSuccess;
++}
++
++/* Lock held, all work retired: GX off, clocks and votes down; CX (and the SMMU) stay on. */
++void
++DrgGPU::collapse(void)
++{
++	if (!fG.powered) {
++		return;
++	}
++	irqLive(false);
++	if (drgpu_power_off(&fG) != 0) {
++		IOLog("DRG GPU: collapse failed: %s\n", drgpu_err(&fG));
++		if (fG.powered && fG.cp_running) {
++			irqLive(true);
++		}
++		return;
++	}
++	thread_call_cancel(fDcvsCall);
++	os_atomic_store(&fBusySince, 0ull, relaxed);    /* idle time is not busy time */
++}
++
++void
++DrgGPU::setLevel(int level)
++{
++	if (drgpu_set_level(&fG, level) == 0) {
++		fLevel = level;
++	} else {
++		IOLog("DRG GPU: level %d failed: %s\n", level, drgpu_err(&fG));
++	}
++}
++
++void
++DrgGPU::idleTimer(thread_call_param_t p0, thread_call_param_t p1 __unused)
++{
++	DrgGPU *me = static_cast<DrgGPU *>(p0);
++	IOLockLock(me->fLock);
++	if (me->fG.powered) {
++		uint64_t idle;
++		nanoseconds_to_absolutetime((uint64_t)me->fIdleMs * NSEC_PER_MSEC, &idle);
++		if (me->lastRetired() && mach_absolute_time() - me->fLastSubmitAbs >= idle &&
++		    os_atomic_load(&me->fFaultStatus, acquire) == 0) {
++			me->collapse();
++		} else {
++			thread_call_enter_delayed(me->fIdleCall, drg_gpu_deadline_ms(me->fIdleMs));
++		}
++	}
++	IOLockUnlock(me->fLock);
++}
++
++/* Busy share of the last window (submission to retirement, ring order) moves the level one step. */
++void
++DrgGPU::dcvsTimer(thread_call_param_t p0, thread_call_param_t p1 __unused)
++{
++	DrgGPU *me = static_cast<DrgGPU *>(p0);
++	IOLockLock(me->fLock);
++	if (me->fG.powered && me->fG.cp_running && me->fDcvs) {
++		uint64_t now = mach_absolute_time();
++		uint64_t busy = os_atomic_xchg(&me->fBusyAccum, 0ull, relaxed);
++		uint64_t since = os_atomic_load(&me->fBusySince, acquire);
++		if (since != 0 && os_atomic_cmpxchg(&me->fBusySince, since, now, acq_rel)) {
++			busy += now - since;
++		}
++		uint64_t window = now - me->fDcvsLastAbs;
++		me->fDcvsLastAbs = now;
++		if (window != 0) {
++			uint64_t pct = busy * 100 / window;
++			if (pct > 75 && me->fLevel > 0) {
++				me->setLevel(me->fLevel - 1);
++			} else if (pct < 30 && me->fLevel < DRGPU_LEVELS - 1) {
++				me->setLevel(me->fLevel + 1);
++			}
++		}
++		thread_call_enter_delayed(me->fDcvsCall, drg_gpu_deadline_ms(DRG_GPU_DCVS_MS));
++	}
++	IOLockUnlock(me->fLock);
++}
++
++void
++DrgGPU::dumpFault(uint32_t status)
++{
++	IOLog("DRG GPU: fault, int status 0x%x: cp hw fault 0x%x, cp int 0x%x, protect 0x%x, "
++	    "rbbm status 0x%x, rptr 0x%x wptr 0x%x\n", status & ~1u, regRead(CP_HW_FAULT),
++	    regRead(CP_INTERRUPT_STATUS), regRead(CP_PROTECT_STATUS), regRead(RBBM_STATUS),
++	    regRead(CP_RB_RPTR), fG.ring_w);
++}
++
++/*
++ * CP_HW_ERROR or a hang (adreno_dispatch fault handling, simplified): power
++ * the GPU off and on again (zap retained). Contexts whose work had started
++ * are marked faulted (KGSL invalidates the guilty context); every submitted
++ * timestamp is written as retired so nobody waits for lost work.
++ */
++void
++DrgGPU::recover(thread_call_param_t p0, thread_call_param_t p1 __unused)
++{
++	DrgGPU *me = static_cast<DrgGPU *>(p0);
++	IOLockLock(me->fLock);
++	uint32_t st = os_atomic_load(&me->fFaultStatus, acquire);
++	if (st != 0 && me->fG.powered) {
++		me->dumpFault(st);
++		me->irqLive(false);
++		me->fG.cp_running = 0;          /* hung: no idle wait on the way down */
++		(void)drgpu_power_off(&me->fG);
++	}
++	uint8_t *ms = (uint8_t *)me->fG.memstore.va;
++	for (uint32_t i = 1; i < DRGPU_MS_RB; i++) {
++		struct drg_gpu_ctx *c = &me->fCtx[i];
++		if (!c->submitted || me->ctxRetired(i, c->ts)) {
++			continue;
++		}
++		volatile uint32_t *sop = (volatile uint32_t *)(void *)(ms + i * DRGPU_MS_ENTRY + DRGPU_MS_SOP);
++		volatile uint32_t *eop = (volatile uint32_t *)(void *)(ms + i * DRGPU_MS_ENTRY + DRGPU_MS_EOP);
++		if (*sop != *eop) {
++			c->faulted = true;      /* its submission had started */
++		}
++		*sop = c->ts;
++		*eop = c->ts;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	os_atomic_store(&me->fFaultStatus, 0u, release);
++	if (me->ensurePowered() != kIOReturnSuccess) {
++		IOLog("DRG GPU: recovery failed, GPU stays off\n");
++	} else {
++		IOLog("DRG GPU: recovered\n");
++	}
++	thread_wakeup((event_t)&me->fIrqEvent);
++	IOLockUnlock(me->fLock);
++}
++
++/* ---- contexts and submissions ---- */
++
++int
++DrgGPU::ctxCreate(DrgGPUUserClient *owner, uint32_t flags)
++{
++	for (uint32_t i = 1; i < DRG_GPU_KCTX; i++) {
++		if (fCtx[i].owner == NULL) {
++			bzero(&fCtx[i], sizeof(fCtx[i]));
++			fCtx[i].owner = owner;
++			fCtx[i].flags = flags;
++			/* a fresh memstore entry (kgsl context init), as no GPU work refers to it */
++			bzero((uint8_t *)fG.memstore.va + i * DRGPU_MS_ENTRY, DRGPU_MS_ENTRY);
++			return (int)i;
++		}
++	}
++	return 0;
++}
++
++void
++DrgGPU::ctxRelease(uint32_t id)
++{
++	bzero(&fCtx[id], sizeof(fCtx[id]));
++}
++
++/* No lock: sleeps on the GPU interrupt (wakeups are never lost: assert first, then check). */
++IOReturn
++DrgGPU::waitTs(uint32_t id, uint32_t ts, uint32_t ms)
++{
++	uint64_t deadline = drg_gpu_deadline_ms(ms);
++	for (;;) {
++		if (ctxRetired(id, ts)) {
++			return kIOReturnSuccess;
++		}
++		uint64_t now = mach_absolute_time();
++		if (now >= deadline) {
++			return kIOReturnTimeout;
++		}
++		uint64_t slice = drg_gpu_deadline_ms(100);      /* a lost interrupt costs 100 ms, not a hang */
++		assert_wait_deadline((event_t)&fIrqEvent, THREAD_ABORTSAFE, slice < deadline ? slice : deadline);
++		if (ctxRetired(id, ts)) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++			return kIOReturnSuccess;
++		}
++		if (thread_block(THREAD_CONTINUE_NULL) == THREAD_INTERRUPTED) {
++			return kIOReturnAborted;
++		}
++	}
++}
++
++/* Lock held. */
++IOReturn
++DrgGPU::submit(DrgGPUUserClient *c, uint32_t ctx, uint32_t flags, uint32_t *ts,
++    const struct drgpu_uc_ib *ibs, unsigned n)
++{
++	struct drgpu_ib kib[DRGPU_UC_MAX_IBS];
++
++	if (ctx == 0 || ctx >= DRG_GPU_KCTX || fCtx[ctx].owner != c || n > DRGPU_UC_MAX_IBS) {
++		return kIOReturnBadArgument;
++	}
++	if (fCtx[ctx].faulted) {
++		return kIOReturnIOError;        /* KGSL: the context was invalidated by a fault */
++	}
++	if (flags & DRGPU_KGSL_CMDBATCH_MARKER) {
++		n = 0;                          /* markers only carry the timestamp */
++	}
++	for (unsigned i = 0; i < n; i++) {
++		if ((ibs[i].gpuaddr & 3) != 0 || ibs[i].gpuaddr == 0 || ibs[i].gpuaddr >= DRG_GPU_VA_END ||
++		    ibs[i].bytes == 0 || (ibs[i].bytes & 3) != 0 || ibs[i].bytes / 4 > 0xfffff) {
++			return kIOReturnBadArgument;
++		}
++		kib[i].gpuaddr = ibs[i].gpuaddr;
++		kib[i].dwords = (uint32_t)(ibs[i].bytes / 4);
++	}
++	if (!(fCtx[ctx].flags & DRGPU_KGSL_CONTEXT_USER_GENERATED_TS)) {
++		*ts = ++fCtx[ctx].gen;
++	}
++	if (*ts == 0) {
++		return kIOReturnBadArgument;
++	}
++	IOReturn rc = ensurePowered();
++	if (rc != kIOReturnSuccess) {
++		return rc;
++	}
++	if (drgpu_submit(&fG, &c->fSpace, ctx, kib, n, *ts) == 0) {
++		IOLog("DRG GPU: submit failed: %s\n", drgpu_err(&fG));
++		return kIOReturnNoResources;
++	}
++	fCtx[ctx].ts = *ts;
++	fCtx[ctx].submitted = true;
++	os_atomic_store(&fLastTs, *ts, release);
++	os_atomic_store(&fLastCtx, ctx, release);
++	uint64_t now = mach_absolute_time();
++	(void)os_atomic_cmpxchg(&fBusySince, 0ull, now, acq_rel);
++	fLastSubmitAbs = now;
++	if (fIdleMs != 0) {
++		thread_call_enter_delayed(fIdleCall, drg_gpu_deadline_ms(fIdleMs));
++	}
++	return kIOReturnSuccess;
++}
++
++/* ---- user client ---- */
++
++
++/* KGSL property answers Nokia's driver got on this phone (kgsl-trace-2.txt), byte for byte. */
++static const struct {
++	uint32_t type, len;
++	uint8_t  b[40];
++} drg_gpu_props[] = {
++	{ 0x01, 40, { 0x01, 0, 0, 0, 0x00, 0x02, 0x01, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0,     /* DEVICE_INFO */
++		      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++		      0x00, 0x40, 0x04, 0, 0, 0, 0, 0 } },
++	{ 0x02, 24, { 0x00, 0x10, 0x00, 0xf8, 0, 0, 0, 0, 0x00, 0x20, 0, 0, 0, 0, 0, 0,        /* DEVICE_SHADOW */
++		      0x04, 0x02, 0, 0, 0, 0, 0, 0 } },
++	{ 0x13, 8, { 0x00, 0x00, 0x10, 0x00, 0, 0, 0, 0 } },                                     /* UCHE_GMEM_VADDR */
++	{ 0x15, 8, { 0x12, 0xf1, 0x5f, 0x00, 0x66, 0xf0, 0x5f, 0x00 } },                         /* UCODE_VERSION */
++	{ 0x17, 4, { 0x0e, 0, 0, 0 } },                                                          /* HIGHEST_BANK_BIT */
++	{ 0x18, 4, { 0x30, 0, 0, 0 } },                                                          /* DEVICE_BITNESS */
++	{ 0x19, 16, { 0 } },                                                                     /* DEVICE_QDSS_STM */
++	{ 0x20, 16, { 0 } },                                                                     /* DEVICE_QTIMER */
++};
++
++bool
++DrgGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (type != 0 || !IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fTask = owningTask;
++	return true;
++}
++
++bool
++DrgGPUUserClient::start(IOService *provider)
++{
++	fGPU = OSDynamicCast(DrgGPU, provider);
++	if (fGPU == NULL || !IOUserClient::start(provider)) {
++		return false;
++	}
++	IOLockLock(fGPU->fLock);
++	bzero(&fSpace, sizeof(fSpace));
++	fSpaceLive = drgpu_space_create(&fGPU->fG, &fSpace) == 0;
++	IOLockUnlock(fGPU->fLock);
++	if (!fSpaceLive) {
++		IOLog("DRG GPU: no GPU address space for a new client: %s\n", drgpu_err(&fGPU->fG));
++		return false;
++	}
++	return true;
++}
++
++struct drg_gpu_obj *
++DrgGPUUserClient::obj(uint64_t id)
++{
++	if (id == 0 || id > fObjCap || fObjs[id - 1].md == NULL || fObjs[id - 1].pending) {
++		return NULL;
++	}
++	return &fObjs[id - 1];
++}
++
++/*
++ * Lock held. md owns wired pages: map them (as physical ranges, write-
++ * combined) into the task anywhere, then at the same address into this task's
++ * GPU space. out: id, GPU address, size.
++ */
++IOReturn
++DrgGPUUserClient::objInsert(IOMemoryDescriptor *md, uint64_t size, bool ro, bool surface, uint64_t *out)
++{
++	uint32_t slot = 0;
++	while (slot < fObjCap && fObjs[slot].md != NULL) {
++		slot++;
++	}
++	if (slot == fObjCap) {
++		uint32_t cap = fObjCap ? fObjCap * 2 : 64;
++		if (cap > DRG_GPU_MAX_OBJS) {
++			return kIOReturnNoResources;
++		}
++		struct drg_gpu_obj *objs = IONewZero(struct drg_gpu_obj, cap);
++		if (objs == NULL) {
++			return kIOReturnNoMemory;
++		}
++		if (fObjs != NULL) {
++			bcopy(fObjs, objs, fObjCap * sizeof(*objs));
++			IODelete(fObjs, struct drg_gpu_obj, fObjCap);
++		}
++		fObjs = objs;
++		fObjCap = cap;
++	}
++	IOMemoryDescriptor *phys = drg_gpu_phys_view(md, size);
++	if (phys == NULL) {
++		return kIOReturnNoMemory;
++	}
++	IOMemoryMap *map = phys->createMappingInTask(fTask, 0,
++	    kIOMapAnywhere | kIOMapWriteCombineCache | (ro ? kIOMapReadOnly : 0));
++	if (map == NULL) {
++		phys->release();
++		return kIOReturnNoMemory;
++	}
++	uint64_t va = map->getAddress(), off = 0;
++	if (va < DRG_GPU_VA_MIN || va + size > DRG_GPU_VA_END || map->getLength() < size) {
++		map->release();
++		phys->release();
++		return kIOReturnNoSpace;
++	}
++	while (off < size) {
++		IOByteCount seg = 0;
++		uint64_t pa = phys->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
++		if (seg > size - off) {
++			seg = size - off;
++		}
++		if (pa == 0 || ((pa | seg) & 0xfff) != 0 || seg == 0 ||
++		    drgpu_map(&fGPU->fG, &fSpace, va + off, pa, seg, ro) != 0) {
++			drgpu_unmap(&fGPU->fG, &fSpace, va, off);
++			(void)drgpu_tlb_flush(&fGPU->fG);
++			map->release();
++			phys->release();
++			return kIOReturnNoMemory;
++		}
++		off += seg;
++	}
++	struct drg_gpu_obj *o = &fObjs[slot];
++	bzero(o, sizeof(*o));
++	md->retain();
++	o->md = md;
++	o->phys = phys;
++	o->map = map;
++	o->gpuaddr = va;
++	o->size = size;
++	o->surface = surface;
++	out[0] = slot + 1;
++	out[1] = va;
++	out[2] = size;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++DrgGPUUserClient::objAlloc(uint64_t size, uint64_t flags, uint64_t *out)
++{
++	if (size == 0 || size > DRG_GPU_OBJ_MAX) {
++		return kIOReturnBadArgument;
++	}
++	size = round_page(size);
++	if (fBytes + size > DRG_GPU_CLIENT_MAX) {
++		return kIOReturnNoMemory;
++	}
++	/* KGSL's default cache mode (memflags bits 26-27 = 0) is write-combined */
++	IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut, size, page_size);
++	if (md == NULL) {
++		return kIOReturnNoMemory;
++	}
++	bzero(md->getBytesNoCopy(), size);
++	md->performOperation(kIOMemoryIncoherentIOFlush, 0, size);
++	IOReturn rc = objInsert(md, size, (flags & DRGPU_KGSL_MEMFLAGS_GPUREADONLY) != 0, false, out);
++	md->release();
++	if (rc == kIOReturnSuccess) {
++		fBytes += size;
++	}
++	return rc;
++}
++
++/*
++ * An IOSurface's pages at a new address in the task, the same address on the
++ * GPU. The task's other mappings of the surface keep their cache mode: CPU
++ * writers through a cached one call OBJ_SYNC before the GPU reads, and after
++ * the GPU wrote, before they read.
++ */
++IOReturn
++DrgGPUUserClient::surfaceMap(uint32_t surfaceID, uint64_t *out)
++{
++	DrgSurface *s = drg_surface_copy(surfaceID);
++	if (s == NULL || s->memory == NULL) {
++		OSSafeReleaseNULL(s);
++		return kIOReturnNotFound;
++	}
++	IOMemoryDescriptor *md = s->memory;
++	uint64_t size = round_page(md->getLength());
++	IOReturn rc = md->prepare();
++	if (rc == kIOReturnSuccess) {
++		md->performOperation(kIOMemoryIncoherentIOFlush, 0, md->getLength());
++		rc = objInsert(md, size, false, true, out);
++		if (rc != kIOReturnSuccess) {
++			md->complete();
++		}
++	}
++	s->release();
++	return rc;
++}
++
++/* Lock held: off the GPU (the caller flushes the TLB, then releaseUnmapped). */
++void
++DrgGPUUserClient::unmapObj(struct drg_gpu_obj *o)
++{
++	drgpu_unmap(&fGPU->fG, &fSpace, o->gpuaddr, o->size);
++	o->unmapped = true;
++}
++
++/* Lock held, TLB flushed: give the pages back. */
++void
++DrgGPUUserClient::releaseUnmapped(void)
++{
++	for (uint32_t i = 0; i < fObjCap; i++) {
++		struct drg_gpu_obj *o = &fObjs[i];
++		if (o->md == NULL || !o->unmapped) {
++			continue;
++		}
++		o->map->release();
++		o->phys->release();
++		if (o->surface) {
++			o->md->complete();
++		} else {
++			fBytes -= o->size;
++		}
++		o->md->release();
++		bzero(o, sizeof(*o));
++	}
++}
++
++/* Lock held: frees whose timestamp retired (all: every pending one). */
++void
++DrgGPUUserClient::retire(bool all)
++{
++	if (fPending == 0) {
++		return;
++	}
++	bool any = false;
++	for (uint32_t i = 0; i < fObjCap; i++) {
++		struct drg_gpu_obj *o = &fObjs[i];
++		if (o->md != NULL && o->pending && (all || fGPU->ctxRetired(o->pendCtx, o->pendTs))) {
++			unmapObj(o);
++			o->pending = false;
++			fPending--;
++			any = true;
++		}
++	}
++	if (any) {
++		(void)drgpu_tlb_flush(&fGPU->fG);
++		releaseUnmapped();
++	}
++}
++
++/* Lock held. */
++IOReturn
++DrgGPUUserClient::objFree(uint32_t id, bool onEvent, uint32_t ctx, uint32_t ts)
++{
++	struct drg_gpu_obj *o = obj(id);
++	if (o == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (onEvent) {
++		if (ctx == 0 || ctx >= DRG_GPU_KCTX || fGPU->fCtx[ctx].owner != this) {
++			return kIOReturnBadArgument;
++		}
++		if (!fGPU->ctxRetired(ctx, ts)) {
++			o->pending = true;
++			o->pendCtx = ctx;
++			o->pendTs = ts;
++			fPending++;
++			return kIOReturnSuccess;
++		}
++	}
++	unmapObj(o);
++	(void)drgpu_tlb_flush(&fGPU->fG);
++	releaseUnmapped();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++DrgGPUUserClient::waitCtx(uint32_t id, uint32_t ts, uint32_t ms)
++{
++	if (id == 0 || id >= DRG_GPU_KCTX || fGPU->fCtx[id].owner != this) {
++		return kIOReturnBadArgument;
++	}
++	IOReturn rc = fGPU->waitTs(id, ts, ms);
++	if (rc == kIOReturnSuccess && fGPU->fCtx[id].faulted) {
++		rc = kIOReturnIOError;
++	}
++	return rc;
++}
++
++/* No lock on entry: waits for the context's work (2 s, then a GPU recovery drops it). */
++IOReturn
++DrgGPUUserClient::ctxDestroy(uint32_t id)
++{
++	IOLockLock(fGPU->fLock);
++	bool mine = id != 0 && id < DRG_GPU_KCTX && fGPU->fCtx[id].owner == this;
++	uint32_t ts = fGPU->fCtx[id < DRG_GPU_KCTX ? id : 0].ts;
++	bool submitted = mine && fGPU->fCtx[id].submitted;
++	IOLockUnlock(fGPU->fLock);
++	if (!mine) {
++		return kIOReturnBadArgument;
++	}
++	if (submitted && fGPU->waitTs(id, ts, 2000) != kIOReturnSuccess) {
++		IOLog("DRG GPU: context %u did not retire 0x%x, recovering\n", id, ts);
++		if (os_atomic_cmpxchg(&fGPU->fFaultStatus, 0u, 1u, acq_rel)) {
++			thread_call_enter(fGPU->fRecoverCall);
++		}
++		(void)fGPU->waitTs(id, ts, 2000);
++	}
++	IOLockLock(fGPU->fLock);
++	retire(false);
++	/* frees still waiting on this context: its work is done or dropped */
++	bool any = false;
++	for (uint32_t i = 0; i < fObjCap; i++) {
++		struct drg_gpu_obj *o = &fObjs[i];
++		if (o->md != NULL && o->pending && o->pendCtx == id) {
++			unmapObj(o);
++			o->pending = false;
++			fPending--;
++			any = true;
++		}
++	}
++	if (any) {
++		(void)drgpu_tlb_flush(&fGPU->fG);
++		releaseUnmapped();
++	}
++	fGPU->ctxRelease(id);
++	IOLockUnlock(fGPU->fLock);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++DrgGPUUserClient::kgslProperty(uint32_t type, IOExternalMethodArguments *args)
++{
++	for (unsigned i = 0; i < sizeof(drg_gpu_props) / sizeof(drg_gpu_props[0]); i++) {
++		if (drg_gpu_props[i].type != type) {
++			continue;
++		}
++		if (args->structureOutputDescriptor != NULL || args->structureOutputSize != drg_gpu_props[i].len) {
++			return kIOReturnBadArgument;
++		}
++		bcopy(drg_gpu_props[i].b, args->structureOutput, drg_gpu_props[i].len);
++		return kIOReturnSuccess;
++	}
++	return kIOReturnUnsupported;    /* KGSL: EINVAL (0x21, 0x23, 0x24 on this phone) */
++}
++
++/* Everything this client holds, after its work is done. */
++void
++DrgGPUUserClient::teardown(void)
++{
++	for (uint32_t id = 1; id < DRG_GPU_KCTX; id++) {
++		IOLockLock(fGPU->fLock);
++		bool mine = fGPU->fCtx[id].owner == this;
++		IOLockUnlock(fGPU->fLock);
++		if (mine) {
++			(void)ctxDestroy(id);
++		}
++	}
++	IOLockLock(fGPU->fLock);
++	retire(true);
++	for (uint32_t i = 0; i < fObjCap; i++) {
++		if (fObjs[i].md != NULL) {
++			unmapObj(&fObjs[i]);
++		}
++	}
++	(void)drgpu_tlb_flush(&fGPU->fG);
++	releaseUnmapped();
++	if (fSpaceLive && drgpu_space_destroy(&fGPU->fG, &fSpace) == 0) {
++		fSpaceLive = false;
++	} else if (fSpaceLive) {
++		IOLog("DRG GPU: address space kept: %s\n", drgpu_err(&fGPU->fG));
++	}
++	IOLockUnlock(fGPU->fLock);
++	if (fObjs != NULL) {
++		IODelete(fObjs, struct drg_gpu_obj, fObjCap);
++		fObjs = NULL;
++		fObjCap = 0;
++	}
++	OSSafeReleaseNULL(fMemstore);
++}
++
++IOReturn
++DrgGPUUserClient::clientClose(void)
++{
++	if (!fClosed) {
++		fClosed = true;
++		teardown();
++	}
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++DrgGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	uint64_t out[3] = { 0, 0, 0 };
++	uint32_t outCount = 0;
++	const uint64_t *in = args->scalarInput;
++	uint32_t nin = args->scalarInputCount;
++	IOReturn rc = kIOReturnSuccess;
++
++	if (fClosed || !fSpaceLive) {
++		return kIOReturnNotAttached;
++	}
++	switch (selector) {
++	case DRGPU_UC_GETPROPERTY:
++		rc = nin >= 1 ? kgslProperty((uint32_t)in[0], args) : kIOReturnBadArgument;
++		break;
++	case DRGPU_UC_CTX_CREATE: {
++		IOLockLock(fGPU->fLock);
++		int id = fGPU->ctxCreate(this, nin >= 1 ? (uint32_t)in[0] : 0);
++		IOLockUnlock(fGPU->fLock);
++		rc = id != 0 ? kIOReturnSuccess : kIOReturnNoResources;
++		out[0] = (uint64_t)id;
++		outCount = 1;
++		break;
++	}
++	case DRGPU_UC_CTX_DESTROY:
++		rc = nin >= 1 ? ctxDestroy((uint32_t)in[0]) : kIOReturnBadArgument;
++		break;
++	case DRGPU_UC_OBJ_ALLOC:
++		if (nin < 2) {
++			rc = kIOReturnBadArgument;
++			break;
++		}
++		IOLockLock(fGPU->fLock);
++		retire(false);
++		rc = objAlloc(in[0], in[1], out);
++		IOLockUnlock(fGPU->fLock);
++		outCount = 3;
++		break;
++	case DRGPU_UC_OBJ_FREE:
++		if (nin < 4) {
++			rc = kIOReturnBadArgument;
++			break;
++		}
++		IOLockLock(fGPU->fLock);
++		rc = objFree((uint32_t)in[0], in[1] != 0, (uint32_t)in[2], (uint32_t)in[3]);
++		retire(false);
++		IOLockUnlock(fGPU->fLock);
++		break;
++	case DRGPU_UC_SUBMIT: {
++		unsigned n = (unsigned)(args->structureInputSize / sizeof(struct drgpu_uc_ib));
++		if (nin < 3 || args->structureInputDescriptor != NULL ||
++		    args->structureInputSize % sizeof(struct drgpu_uc_ib) != 0 || n > DRGPU_UC_MAX_IBS) {
++			rc = kIOReturnBadArgument;
++			break;
++		}
++		struct drgpu_uc_ib ibs[DRGPU_UC_MAX_IBS];
++		if (n != 0) {
++			bcopy(args->structureInput, ibs, n * sizeof(ibs[0]));
++		}
++		uint32_t ts = (uint32_t)in[2];
++		IOLockLock(fGPU->fLock);
++		retire(false);
++		rc = fGPU->submit(this, (uint32_t)in[0], (uint32_t)in[1], &ts, ibs, n);
++		IOLockUnlock(fGPU->fLock);
++		out[0] = ts;
++		outCount = 1;
++		break;
++	}
++	case DRGPU_UC_WAIT:
++		rc = nin >= 3 ? waitCtx((uint32_t)in[0], (uint32_t)in[1], (uint32_t)in[2]) : kIOReturnBadArgument;
++		break;
++	case DRGPU_UC_MEMSTORE:
++		IOLockLock(fGPU->fLock);
++		if (fMemstore == NULL) {
++			IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(fGPU->fG.memstore.pa,
++			    fGPU->fG.memstore.size, kIODirectionIn);
++			if (md != NULL) {
++				fMemstore = md->createMappingInTask(fTask, 0,
++				    kIOMapAnywhere | kIOMapReadOnly | kIOMapWriteCombineCache);
++				md->release();
++			}
++		}
++		IOLockUnlock(fGPU->fLock);
++		if (fMemstore == NULL) {
++			rc = kIOReturnNoMemory;
++			break;
++		}
++		out[0] = fMemstore->getAddress();
++		out[1] = DRGPU_MEMSTORE_SIZE;
++		outCount = 2;
++		break;
++	case DRGPU_UC_SYNCSRC_CREATE:
++		out[0] = ++fSyncSrc;
++		outCount = 1;
++		break;
++	case DRGPU_UC_SYNCSRC_DESTROY:
++		break;
++	case DRGPU_UC_SURFACE_MAP:
++		if (nin < 1) {
++			rc = kIOReturnBadArgument;
++			break;
++		}
++		IOLockLock(fGPU->fLock);
++		rc = surfaceMap((uint32_t)in[0], out);
++		IOLockUnlock(fGPU->fLock);
++		outCount = 3;
++		break;
++	case DRGPU_UC_OBJ_SYNC: {
++		IOLockLock(fGPU->fLock);
++		struct drg_gpu_obj *o = nin >= 1 ? obj(in[0]) : NULL;
++		if (o != NULL) {
++			o->md->performOperation(kIOMemoryIncoherentIOFlush, 0, o->size);
++		}
++		IOLockUnlock(fGPU->fLock);
++		rc = o != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
++		break;
++	}
++	case DRGPU_UC_GET_VERSION:
++		out[0] = DRGPU_UC_VERSION;
++		outCount = 1;
++		break;
++	default:
++		rc = kIOReturnUnsupported;
++		break;
++	}
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = i < outCount ? out[i] : 0;
++	}
++	return rc;
++}
++#endif /* DRG */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index c6109c4..5d1a138 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -87,6 +87,12 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = DrgBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = DrgGPU;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOResourceMatch' = IOAllCPUInitialized;"
++    "     'IOMatchCategory' = DrgGPU;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index cad501a..49988b0 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,6 +17,7 @@ iokit/Kernel/arm/DrgWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/DrgSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/DrgFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/DrgBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/DrgGPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/hid/DrgHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
