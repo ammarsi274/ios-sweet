@@ -232,25 +232,48 @@ void *host_read_file(const char *path, size_t *size)
 }
 
 /*
- * Every mapping is a JIT mapping. The loader maps a library read-write and
- * makes its code pages executable afterwards; on iOS only MAP_JIT memory may
- * become executable without a code signature for its pages, and only there
- * may a page be writable and executable at once (a 16 KiB page holding both
- * the end of a 4 KiB-aligned code segment and the start of data). XNU's
- * policy (vm_map.h, not an alien map): several JIT regions per process,
- * W+X outside them fails; DRG has no AMFI map_anon hook gating MAP_JIT.
+ * One JIT arena per process; every loader mapping comes out of it.
+ * The loader maps a library read-write and makes its code pages executable
+ * afterwards. On iOS only MAP_JIT memory may become executable without page
+ * signatures (and be writable and executable at once: a 16 KiB page can
+ * hold the end of a 4 KiB-aligned code segment and the start of data).
+ * Every iOS map is "alien" (vm_map.h VM_MAP_IS_ALIEN is true off macOS):
+ * one JIT region per process at a random address, a second MAP_JIT fails
+ * with EINVAL, W+X elsewhere is refused. Measured in boot #33: the first
+ * library's MAP_JIT worked, every later one got EINVAL. So the arena is
+ * reserved once (address space only; pages are committed when touched)
+ * and handed out in host pages. Mappings are never reused: the loader
+ * keeps its libraries for the life of the process.
  */
+#define JIT_ARENA	(256ul << 20)
+static uint8_t *jit_base;
+static size_t jit_used;
+
 void *host_map(size_t len, int prot)
 {
-	void *p = mmap(0, len, prot, D_MAP_PRIVATE | D_MAP_ANON | D_MAP_JIT, -1, 0);
-	if (p != (void *)-1)
-		return p;
-	int jit_err = *__error();
-	p = mmap(0, len, prot, D_MAP_PRIVATE | D_MAP_ANON, -1, 0);
-	int err = p == (void *)-1 ? *__error() : 0;
-	host_log("drgles: mmap %zu bytes prot %d: MAP_JIT errno %d, plain mapping %s (errno %d)\n", len, prot,
-		 jit_err, p == (void *)-1 ? "failed" : "used", err);
-	return p == (void *)-1 ? 0 : p;
+	uint8_t *base = __atomic_load_n(&jit_base, __ATOMIC_ACQUIRE);
+	if (!base) {
+		void *p = mmap(0, JIT_ARENA, HOST_PROT_R | HOST_PROT_W, D_MAP_PRIVATE | D_MAP_ANON | D_MAP_JIT, -1, 0);
+		if (p == (void *)-1) {
+			host_log("drgles: JIT arena (%lu MiB): mmap errno %d\n", JIT_ARENA >> 20, *__error());
+			return 0;
+		}
+		uint8_t *none = 0;
+		if (!__atomic_compare_exchange_n(&jit_base, &none, (uint8_t *)p, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+			munmap(p, JIT_ARENA);	/* another thread made it first */
+		base = __atomic_load_n(&jit_base, __ATOMIC_ACQUIRE);
+	}
+	size_t pg = host_page_size();
+	len = (len + pg - 1) & ~(pg - 1);
+	size_t off = __atomic_fetch_add(&jit_used, len, __ATOMIC_ACQ_REL);
+	if (off + len > JIT_ARENA) {
+		host_log("drgles: JIT arena full (%zu of %lu MiB asked)\n", (off + len) >> 20, JIT_ARENA >> 20);
+		return 0;
+	}
+	void *p = base + off;
+	if ((prot & (HOST_PROT_W | HOST_PROT_X)) != HOST_PROT_W && host_protect(p, len, prot))
+		return 0;
+	return p;
 }
 
 int host_protect(void *addr, size_t len, int prot)
@@ -263,7 +286,11 @@ int host_protect(void *addr, size_t len, int prot)
 
 void host_unmap(void *addr, size_t len)
 {
-	munmap(addr, len);
+	uint8_t *p = addr, *base = __atomic_load_n(&jit_base, __ATOMIC_ACQUIRE);
+	if (base && p >= base && p < base + JIT_ARENA)
+		mprotect(addr, len, 0);	/* arena pages are not reused; just make them inaccessible */
+	else
+		munmap(addr, len);
 }
 
 void host_sync_icache(void *addr, size_t len)
