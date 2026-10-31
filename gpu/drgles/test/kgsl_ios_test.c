@@ -21,6 +21,7 @@ static int fails, opened, closed;
 int host_open(const char *path, int flags, int mode) { (void)flags; (void)mode; CHECK(!strcmp(path, "/dev/null")); return 7; }
 int host_close(int fd) { CHECK(fd == 7); closed++; return 0; }
 void *host_alloc(size_t n) { return calloc(1, n); }
+void host_sleep_ns(int64_t ns) { (void)ns; }
 void host_free(void *p) { free(p); }
 void host_log(const char *fmt, ...) { va_list ap; va_start(ap, fmt); printf("  log: "); vprintf(fmt, ap); va_end(ap); }
 

@@ -231,11 +231,18 @@ void *host_read_file(const char *path, size_t *size)
 	return buf;
 }
 
+/*
+ * Every mapping is a JIT mapping. The loader maps a library read-write and
+ * makes its code pages executable afterwards; on iOS only MAP_JIT memory may
+ * become executable without a code signature for its pages, and only there
+ * may a page be writable and executable at once (a 16 KiB page holding both
+ * the end of a 4 KiB-aligned code segment and the start of data). XNU's
+ * policy (vm_map.h, not an alien map): several JIT regions per process,
+ * W+X outside them fails; DRG has no AMFI map_anon hook gating MAP_JIT.
+ */
 void *host_map(size_t len, int prot)
 {
-	void *p = mmap(0, len, prot, D_MAP_PRIVATE | D_MAP_ANON, -1, 0);
-	if (p == (void *)-1 && (prot & HOST_PROT_W) && (prot & HOST_PROT_X))	/* code and data in one 16 KiB page */
-		p = mmap(0, len, prot, D_MAP_PRIVATE | D_MAP_ANON | D_MAP_JIT, -1, 0);
+	void *p = mmap(0, len, prot, D_MAP_PRIVATE | D_MAP_ANON | D_MAP_JIT, -1, 0);
 	return p == (void *)-1 ? 0 : p;
 }
 

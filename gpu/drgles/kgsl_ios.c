@@ -160,7 +160,13 @@ int kgsl_open(int flags)
 			d = &devs[i];
 	if (!d)
 		return -E_NOMEM;
-	mach_port_t svc = IOServiceGetMatchingService(0, IOServiceMatching(DRGPU_UC_SERVICE));
+	/* launchd may start us before DrgGPU registered: wait up to 30 s */
+	mach_port_t svc = 0;
+	for (int i = 0; i < 150 && !svc; i++) {
+		svc = IOServiceGetMatchingService(0, IOServiceMatching(DRGPU_UC_SERVICE));
+		if (!svc)
+			host_sleep_ns(200000000);
+	}
 	if (!svc) {
 		host_log("drgles: no %s service (GPU driver off or not started)\n", DRGPU_UC_SERVICE);
 		return -E_NODEV;
