@@ -6,7 +6,7 @@
  * GPU_COMMAND, SYNCSOURCE_CREATE/DESTROY, memstore mmap.
  *
  * kgsl_bench.c: the real device under TWRP, every call checked against
- * that set and counted. kgsl_ios.c (later): our XNU GPU driver.
+ * that set and counted. kgsl_ios.c: our XNU GPU driver (DrgGPU, gpu/drgpu/drgpu_uc.h).
  */
 #ifndef DRGLES_KGSL_H
 #define DRGLES_KGSL_H

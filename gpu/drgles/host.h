@@ -2,7 +2,7 @@
  * drgles host interface: the few services the ELF loader needs from the
  * process it runs in. One implementation per host:
  *   host_linux.c   TWRP on the Nokia (test bench), raw Linux system calls
- *   host_darwin.c  iOS (later), libSystem
+ *   host_darwin.c  iOS, libSystem
  * Everything above this line is the same code on both.
  */
 #ifndef DRGLES_HOST_H

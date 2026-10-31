@@ -1967,7 +1967,7 @@ index 0000000..f24ec61
 +#endif
 diff --git a/iokit/Kernel/arm/DrgGPU.cpp b/iokit/Kernel/arm/DrgGPU.cpp
 new file mode 100755
-index 0000000..91efe80
+index 0000000..db45bec
 --- /dev/null
 +++ b/iokit/Kernel/arm/DrgGPU.cpp
 @@ -0,0 +1,1532 @@
@@ -3079,8 +3079,8 @@ index 0000000..91efe80
 +	if (phys == NULL) {
 +		return kIOReturnNoMemory;
 +	}
-+	IOMemoryMap *map = phys->createMappingInTask(fTask, 0,
-+	    kIOMapAnywhere | kIOMapWriteCombineCache | (ro ? kIOMapReadOnly : 0));
++	/* KGSL_MEMFLAGS_GPUREADONLY limits the GPU only: the CPU fills the object */
++	IOMemoryMap *map = phys->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
 +	if (map == NULL) {
 +		phys->release();
 +		return kIOReturnNoMemory;

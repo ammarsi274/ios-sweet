@@ -1106,8 +1106,8 @@ DrgGPUUserClient::objInsert(IOMemoryDescriptor *md, uint64_t size, bool ro, bool
 	if (phys == NULL) {
 		return kIOReturnNoMemory;
 	}
-	IOMemoryMap *map = phys->createMappingInTask(fTask, 0,
-	    kIOMapAnywhere | kIOMapWriteCombineCache | (ro ? kIOMapReadOnly : 0));
+	/* KGSL_MEMFLAGS_GPUREADONLY limits the GPU only: the CPU fills the object */
+	IOMemoryMap *map = phys->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
 	if (map == NULL) {
 		phys->release();
 		return kIOReturnNoMemory;
