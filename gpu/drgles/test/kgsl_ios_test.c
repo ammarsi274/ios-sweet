@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../kgsl.h"
+#include "../host.h"
 #include "../../drgpu/drgpu_uc.h"
 
 typedef unsigned int mach_port_t;
@@ -22,6 +23,7 @@ int host_open(const char *path, int flags, int mode) { (void)flags; (void)mode; 
 int host_close(int fd) { CHECK(fd == 7); closed++; return 0; }
 void *host_alloc(size_t n) { return calloc(1, n); }
 void host_sleep_ns(int64_t ns) { (void)ns; }
+int host_clock(int c, struct host_ts *t) { (void)c; t->sec = 0; t->nsec = 0; return 0; }	/* no trace here */
 void host_free(void *p) { free(p); }
 long host_write(int fd, const void *b, size_t n) { (void)fd; (void)b; CHECK(0); return (long)n; }	/* no capture here */
 void host_log(const char *fmt, ...) { va_list ap; va_start(ap, fmt); printf("  log: "); vprintf(fmt, ap); va_end(ap); }

@@ -17,12 +17,13 @@ Idempotent. root:wheel, 0755 programs and directories, 0644 libraries.
 import glob, os, plistlib, shutil, sys
 
 RUNS = [
-    # Boot #40, the race test: #36 (no capture) hit CP_OPCODE_ERROR on the first draw, #39 (capture,
-    # which waits for every submit) passed with GPU work identical to Linux. Same bench, three
-    # processes: as #36 at boot; capture without waiting at +60 s; capture as #39 at +120 s.
-    ('com.drg.gpubench', [], 'drgles.log'),
-    ('com.drg.gpubench2', ['-delay', '60', '-capture-nowait', '/private/var/log/drgles-cap2.bin'], 'drgles2.log'),
-    ('com.drg.gpubench3', ['-delay', '120', '-capture', '/private/var/log/drgles-cap3.bin'], 'drgles3.log'),
+    # Boot #41, completion trace: #40's plain run read the previous frame back after glFinish (GPU work
+    # identical to Linux). -trace logs the memstore sop/eop and the driver's retire state at every
+    # submit and after each glFinish/readback (Linux reference: logs/twrp-trace.txt). Trace at boot,
+    # plain at +60 s (does the failure repeat), trace at +120 s.
+    ('com.drg.gpubench', ['-trace'], 'drgles.log'),
+    ('com.drg.gpubench2', ['-delay', '60'], 'drgles2.log'),
+    ('com.drg.gpubench3', ['-delay', '120', '-trace'], 'drgles3.log'),
 ]
 
 

@@ -554,7 +554,9 @@ static int run(void)
 	glClearColor(1, 0, 0, 1);
 	glClear(GL_COLOR_BUFFER_BIT);
 	glFinish();
+	kgsl_trace_point("after glFinish");
 	glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px);
+	kgsl_trace_point("after read");
 	fails += check("clear: 4096 red", count(0xff0000ff) == W * H);
 
 	u32 p1 = program("attribute vec2 p;\nvoid main() { gl_Position = vec4(p, 0.0, 1.0); }\n",
@@ -569,7 +571,9 @@ static int run(void)
 	glEnableVertexAttribArray(0);
 	glDrawArrays(GL_TRIANGLES, 0, 3);
 	glFinish();
+	kgsl_trace_point("after glFinish");
 	glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px);
+	kgsl_trace_point("after read");
 	int g = count(0x00ff00ff), b = count(0x0000ffff);
 	host_log("triangle: %d green, %d blue\n", g, b);
 	fails += check("triangle", (g == 2016 || g == 2080) && g + b == W * H);
@@ -600,7 +604,9 @@ static int run(void)
 	glEnableVertexAttribArray(1);
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 	glFinish();
+	kgsl_trace_point("after glFinish");
 	glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px);
+	kgsl_trace_point("after read");
 	/* texel rows: row 0 (bottom) red, green; row 1 blue, white */
 	int q = rgba_at(5, 5) == 0xff0000ff && rgba_at(60, 5) == 0x00ff00ff && rgba_at(5, 60) == 0x0000ffff &&
 		rgba_at(60, 60) == 0xffffffff;
@@ -635,6 +641,10 @@ static int main_(int argc, char **argv, char **envp)
 				s = s * 10 + (*p - '0');
 			host_log("delay %d s\n", s);
 			host_sleep_ns((int64_t)s * 1000000000);
+			continue;
+		}
+		if (!strcmp(argv[i], "-trace")) {
+			kgsl_trace();
 			continue;
 		}
 		if (!strcmp(argv[i], "-capture-nowait") && i + 1 < argc) {	/* boot #40: the race test */

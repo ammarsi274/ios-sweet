@@ -122,9 +122,59 @@ static void cap_after_submit(int fd, struct gpu_command *c, long rc)
 	cap_submits++;
 }
 
+/*
+ * -trace (boot #41): what completion the blob can see. #40's plain run read
+ * the previous frame back after glFinish, with GPU work identical to
+ * Linux. At each GPU_COMMAND and at the bench's sync points: time, the
+ * memstore's sop/eop of contexts 1-2 (the blob's: kgsl_devmemstore, 40-byte
+ * entries, sop +0, eop +8) and whether the driver itself counts the last
+ * submitted timestamp as retired (kgsl_cap_wait with timeout 0).
+ */
+static int trace_on, trace_fd = -1;
+static uint32_t trace_ts[8];
+static int64_t trace_t0;
+
+void kgsl_trace(void)
+{
+	trace_on = 1;
+}
+
+static int64_t trace_us(void)
+{
+	struct host_ts t;
+	host_clock(1, &t);
+	if (!trace_t0)
+		trace_t0 = t.sec * 1000000 + t.nsec / 1000;
+	return t.sec * 1000000 + t.nsec / 1000 - trace_t0;
+}
+
+static void trace_state(const char *what, uint32_t a, uint32_t b)
+{
+	volatile const uint32_t *ms = (volatile const uint32_t *)(uintptr_t)memstore_va;
+	uint32_t s1 = 0, e1 = 0, s2 = 0, e2 = 0;
+	if (ms && memstore_len >= 3 * 40) {
+		s1 = ms[40 / 4], e1 = ms[48 / 4], s2 = ms[80 / 4], e2 = ms[88 / 4];
+	}
+	long r1 = trace_fd >= 0 && trace_ts[1] ? kgsl_cap_wait(trace_fd, 1, trace_ts[1], 0) : 1;
+	long r2 = trace_fd >= 0 && trace_ts[2] ? kgsl_cap_wait(trace_fd, 2, trace_ts[2], 0) : 1;
+	host_log("trace %8lld us %-14s %u %u | ctx1 sop %u eop %u last %u %s | ctx2 sop %u eop %u last %u %s\n",
+		 (long long)trace_us(), what, a, b, s1, e1, trace_ts[1], r1 == 0 ? "retired" : r1 == 1 ? "-" : "busy",
+		 s2, e2, trace_ts[2], r2 == 0 ? "retired" : r2 == 1 ? "-" : "busy");
+}
+
+void kgsl_trace_point(const char *what)
+{
+	if (trace_on)
+		trace_state(what, 0, 0);
+}
+
 void kgsl_cap_before(int fd, unsigned long req, void *arg)
 {
 	(void)fd;
+	if (trace_on && ((req >> 8) & 0xff) == 0x09 && NR(req) == 0x4a) {
+		struct gpu_command *c = arg;
+		trace_state("submit", c->context_id, c->timestamp);
+	}
 	if (cap_fd < 0 || ((req >> 8) & 0xff) != 0x09)
 		return;
 	if (NR(req) == 0x46) {			/* GPUOBJ_FREE */
@@ -140,6 +190,13 @@ void kgsl_cap_before(int fd, unsigned long req, void *arg)
 
 void kgsl_cap_after(int fd, unsigned long req, void *arg, long rc)
 {
+	if (trace_on && ((req >> 8) & 0xff) == 0x09 && NR(req) == 0x4a && rc == 0) {
+		struct gpu_command *c = arg;
+		trace_fd = fd;
+		if (c->context_id < 8)
+			trace_ts[c->context_id] = c->timestamp;
+		trace_state(c->flags & 2 ? "submitted mark" : "submitted", c->context_id, c->timestamp);
+	}
 	if (cap_fd < 0 || ((req >> 8) & 0xff) != 0x09)
 		return;
 	if (NR(req) == 0x45 && rc == 0) {	/* GPUOBJ_ALLOC */
@@ -162,6 +219,10 @@ void kgsl_cap_after(int fd, unsigned long req, void *arg, long rc)
 
 void kgsl_cap_mmap(void *p, size_t len, int prot, int flags, long off)
 {
+	if (p != (void *)-1 && (uint64_t)off >= 0xf8000000ULL) {	/* for -trace too */
+		memstore_va = (uintptr_t)p;
+		memstore_len = len;
+	}
 	if (cap_fd < 0 || p == (void *)-1)
 		return;
 	struct { uint64_t off, va, len; uint32_t prot, flags; } r = { (uint64_t)off, (uintptr_t)p, len, (uint32_t)prot,
