@@ -30,6 +30,7 @@ struct drawctxt_create { uint32_t flags, drawctxt_id; };
 #define NR(req)		((req) & 0xff)
 
 static int cap_fd = -1;
+static int cap_nowait;	/* kgsl_capture_nowait(): no wait after a submit, so the driver's own timing stays */
 static uint32_t cap_submits;
 static struct capobj { uint32_t id, live; uint64_t size, flags, va, maplen, hash; } objs[256];
 static uint64_t memstore_va, memstore_len;
@@ -84,6 +85,11 @@ static void cap_objects(uint32_t phase)
 	}
 }
 
+void kgsl_capture_nowait(void)
+{
+	cap_nowait = 1;
+}
+
 int kgsl_capture_start(const char *path)
 {
 	cap_fd = host_open(path, 0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644);
@@ -107,7 +113,7 @@ static void cap_submit(struct gpu_command *c)
 
 static void cap_after_submit(int fd, struct gpu_command *c, long rc)
 {
-	long wr = rc ? rc : kgsl_cap_wait(fd, c->context_id, c->timestamp, 2000);
+	long wr = rc || cap_nowait ? rc : kgsl_cap_wait(fd, c->context_id, c->timestamp, 2000);
 	struct { uint32_t submit, ctx, ts; int32_t submit_rc, wait_rc; } r = {
 		cap_submits, c->context_id, c->timestamp, (int32_t)rc, (int32_t)wr
 	};

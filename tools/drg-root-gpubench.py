@@ -10,30 +10,35 @@
 Adds:
   /usr/local/bin/drgles-bench
   /usr/local/drgles/adreno/*.so
-  launchd job com.drg.gpubench: runs the bench once at boot, output to
-  /private/var/log/drgles.log (pulled from TWRP afterwards)
+  launchd jobs com.drg.gpubench{,2,3} (RUNS): the bench once each at boot,
+  output to /private/var/log/drgles{,2,3}.log (pulled from TWRP afterwards)
 Idempotent. root:wheel, 0755 programs and directories, 0644 libraries.
 """
 import glob, os, plistlib, shutil, sys
 
-LABEL = 'com.drg.gpubench'
-KEY = '/System/Library/LaunchDaemons/' + LABEL + '.plist'
-JOB = {
-    'Label': LABEL,
-    # at boot, as in #36 (its GPU objects then sat below 4 GB: #37's later run hit the pmap bug patch 0912
-    # fixes); -capture: the GPU work, compared with the TWRP run by gpu/drgles/tools/cap-diff.py
-    'ProgramArguments': ['/usr/local/bin/drgles-bench', '-capture', '/private/var/log/drgles-cap.bin',
-                         '/usr/local/drgles/adreno'],
-    'RunAtLoad': True,
-    'LaunchOnlyOnce': True,
-    'KeepAlive': False,
-    'UserName': 'root',
-    'LimitLoadToSessionType': 'System',
-    'POSIXSpawnType': 'Interactive',
-    'StandardOutPath': '/private/var/log/drgles.log',
-    'StandardErrorPath': '/private/var/log/drgles.log',
-}
+RUNS = [
+    # Boot #40, the race test: #36 (no capture) hit CP_OPCODE_ERROR on the first draw, #39 (capture,
+    # which waits for every submit) passed with GPU work identical to Linux. Same bench, three
+    # processes: as #36 at boot; capture without waiting at +60 s; capture as #39 at +120 s.
+    ('com.drg.gpubench', [], 'drgles.log'),
+    ('com.drg.gpubench2', ['-delay', '60', '-capture-nowait', '/private/var/log/drgles-cap2.bin'], 'drgles2.log'),
+    ('com.drg.gpubench3', ['-delay', '120', '-capture', '/private/var/log/drgles-cap3.bin'], 'drgles3.log'),
+]
 
+
+def job(label, args, log):
+    return {
+        'Label': label,
+        'ProgramArguments': ['/usr/local/bin/drgles-bench'] + args + ['/usr/local/drgles/adreno'],
+        'RunAtLoad': True,
+        'LaunchOnlyOnce': True,
+        'KeepAlive': False,
+        'UserName': 'root',
+        'LimitLoadToSessionType': 'System',
+        'POSIXSpawnType': 'Interactive',
+        'StandardOutPath': '/private/var/log/' + log,
+        'StandardErrorPath': '/private/var/log/' + log,
+    }
 
 def put(src, dst, mode):
     os.makedirs(os.path.dirname(dst), mode=0o755, exist_ok=True)
@@ -74,24 +79,25 @@ def main():
         os.chmod(os.path.join(root, d), 0o755)
     print(f'bench + {len(sos)} Nokia libraries in /usr/local')
 
-    # the job, in launchd's cache and as its own plist
+    # the jobs, in launchd's cache and as their own plists
     path = os.path.join(root, 'System/Library/xpc/launchd.plist')
     st = os.stat(path)
     with open(path, 'rb') as f:
         plist = plistlib.load(f)
-    plist['LaunchDaemons'][KEY] = JOB
+    for label, args, log in RUNS:
+        key = '/System/Library/LaunchDaemons/' + label + '.plist'
+        plist['LaunchDaemons'][key] = job(label, args, log)
+        with open(os.path.join(root, key.lstrip('/')), 'wb') as f:
+            plistlib.dump(job(label, args, log), f, fmt=plistlib.FMT_BINARY)
+        os.chown(os.path.join(root, key.lstrip('/')), 0, 0)
+        os.chmod(os.path.join(root, key.lstrip('/')), 0o644)
     with open(path, 'wb') as f:
         plistlib.dump(plist, f, fmt=plistlib.FMT_BINARY)
     os.chown(path, st.st_uid, st.st_gid)
     os.chmod(path, st.st_mode & 0o7777)
-    job = os.path.join(root, KEY.lstrip('/'))
-    with open(job, 'wb') as f:
-        plistlib.dump(JOB, f, fmt=plistlib.FMT_BINARY)
-    os.chown(job, 0, 0)
-    os.chmod(job, 0o644)
-    print(f'job {LABEL}: in launchd.plist ({len(plist["LaunchDaemons"])} jobs) and {KEY}')
-    jetsam(root, LABEL, {'JetsamPriority': 180, 'ActiveSoftMemoryLimit': -1, 'InactiveHardMemoryLimit': -1})
-
+    print(f'jobs {[r[0] for r in RUNS]} in launchd.plist ({len(plist["LaunchDaemons"])} jobs)')
+    for label, _, _ in RUNS:
+        jetsam(root, label, {'JetsamPriority': 180, 'ActiveSoftMemoryLimit': -1, 'InactiveHardMemoryLimit': -1})
 
 if __name__ == '__main__':
     main()

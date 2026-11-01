@@ -637,6 +637,12 @@ static int main_(int argc, char **argv, char **envp)
 			host_sleep_ns((int64_t)s * 1000000000);
 			continue;
 		}
+		if (!strcmp(argv[i], "-capture-nowait") && i + 1 < argc) {	/* boot #40: the race test */
+			kgsl_capture_nowait();
+			int rc = kgsl_capture_start(argv[++i]);
+			host_log("capture (no wait) to %s: %d\n", argv[i], rc);
+			continue;
+		}
 		if (!strcmp(argv[i], "-capture") && i + 1 < argc) {
 			int rc = kgsl_capture_start(argv[++i]);
 			host_log("capture to %s: %d\n", argv[i], rc);
