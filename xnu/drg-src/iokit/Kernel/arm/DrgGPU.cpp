@@ -94,6 +94,22 @@ vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);   /* as drg_ts.c, 
 #define CP_PROTECT_STATUS       0xb1c
 #define RBBM_STATUS             0x4f5
 #define CP_RB_RPTR              0x806
+/* fault details (HMD a5xx_reg.h; a5xx_cp_hw_err_callback reads PFP_STAT the same way) */
+#define CP_PFP_STAT_ADDR        0x808
+#define CP_PFP_STAT_DATA        0x809
+#define CP_IB1_BASE             0xb1f
+#define CP_IB1_BASE_HI          0xb20
+#define CP_IB1_BUFSZ            0xb21
+#define CP_IB2_BASE             0xb22
+#define CP_IB2_BASE_HI          0xb23
+#define CP_IB2_BUFSZ            0xb24
+/* SMMU context bank 0 fault state (HMD arm-smmu.c ARM_SMMU_CB_*), from the SMMU base */
+#define SMMU_CB0_FSR            (0x8000 + 0x58)
+#define SMMU_CB0_FAR_LO         (0x8000 + 0x60)
+#define SMMU_CB0_FAR_HI         (0x8000 + 0x64)
+#define SMMU_CB0_FSYNR0         (0x8000 + 0x68)
+#define SMMU_CB0_TTBR0_LO       (0x8000 + 0x20)
+#define SMMU_CB0_TTBR0_HI       (0x8000 + 0x24)
 #define INT_CP_HW_ERROR         (1u << 9)       /* A5XX_INT_CP_HW_ERROR */
 #define INT_CACHE_FLUSH_TS      (1u << 20)
 #define INT_MISC_HANG_DETECT    (1u << 23)
@@ -944,6 +960,46 @@ DrgGPU::dumpFault(uint32_t status)
 	    "rbbm status 0x%x, rptr 0x%x wptr 0x%x\n", status & ~1u, regRead(CP_HW_FAULT),
 	    regRead(CP_INTERRUPT_STATUS), regRead(CP_PROTECT_STATUS), regRead(RBBM_STATUS),
 	    regRead(CP_RB_RPTR), fG.ring_w);
+
+	/* boots #36-#42: CP_OPCODE_ERROR only without pauses between submits; which word, where */
+	drgpu_wr(fG.gpu + 4 * CP_PFP_STAT_ADDR, 0);
+	(void)regRead(CP_PFP_STAT_DATA);
+	uint32_t opcode = regRead(CP_PFP_STAT_DATA);
+	uint64_t ib1 = regRead(CP_IB1_BASE) | (uint64_t)regRead(CP_IB1_BASE_HI) << 32;
+	uint64_t ib2 = regRead(CP_IB2_BASE) | (uint64_t)regRead(CP_IB2_BASE_HI) << 32;
+	uint32_t ctx = os_atomic_load(&fLastCtx, acquire);
+	IOLog("DRG GPU: fault detail: pfp opcode 0x%08x, ib1 0x%llx left %u dw, ib2 0x%llx left %u dw, "
+	    "last ctx %u ts 0x%x\n", opcode, ib1, regRead(CP_IB1_BUFSZ), ib2, regRead(CP_IB2_BUFSZ),
+	    ctx, os_atomic_load(&fLastTs, acquire));
+	IOLog("DRG GPU: fault smmu: fsr 0x%x far 0x%llx fsynr0 0x%x ttbr0 0x%llx\n",
+	    drgpu_rd(fG.smmu + SMMU_CB0_FSR),
+	    drgpu_rd(fG.smmu + SMMU_CB0_FAR_LO) | (uint64_t)drgpu_rd(fG.smmu + SMMU_CB0_FAR_HI) << 32,
+	    drgpu_rd(fG.smmu + SMMU_CB0_FSYNR0),
+	    drgpu_rd(fG.smmu + SMMU_CB0_TTBR0_LO) | (uint64_t)drgpu_rd(fG.smmu + SMMU_CB0_TTBR0_HI) << 32);
+
+	/* the words around each IB position, as the CPU sees them in the owner's object */
+	DrgGPUUserClient *c = ctx != 0 && ctx < DRGPU_MS_RB ? fCtx[ctx].owner : NULL;
+	const uint64_t at[2] = { ib1, ib2 };
+	for (unsigned k = 0; c != NULL && k < 2; k++) {
+		uint64_t a = at[k];
+		for (uint32_t i = 0; a != 0 && i < c->fObjCap; i++) {
+			struct drg_gpu_obj *o = &c->fObjs[i];
+			IOBufferMemoryDescriptor *b = o->md != NULL ? OSDynamicCast(IOBufferMemoryDescriptor, o->md) : NULL;
+			if (b == NULL || a < o->gpuaddr || a >= o->gpuaddr + o->size) {
+				continue;
+			}
+			uint64_t off = (a - o->gpuaddr) & ~3ull;
+			uint64_t from = off >= 16 ? off - 16 : 0;
+			const uint32_t *w = (const uint32_t *)(const void *)((const uint8_t *)b->getBytesNoCopy() + from);
+			uint32_t n = (uint32_t)MIN(8ull, (o->size - from) / 4);
+			IOLog("DRG GPU: fault ib%u words from +0x%llx (obj 0x%llx size 0x%llx%s): "
+			    "%08x %08x %08x %08x %08x %08x %08x %08x\n", k + 1, from, o->gpuaddr, o->size,
+			    o->pending ? ", free pending" : "",
+			    n > 0 ? w[0] : 0, n > 1 ? w[1] : 0, n > 2 ? w[2] : 0, n > 3 ? w[3] : 0,
+			    n > 4 ? w[4] : 0, n > 5 ? w[5] : 0, n > 6 ? w[6] : 0, n > 7 ? w[7] : 0);
+			break;
+		}
+	}
 }
 
 /*
