@@ -643,6 +643,16 @@ static int main_(int argc, char **argv, char **envp)
 			host_sleep_ns((int64_t)s * 1000000000);
 			continue;
 		}
+#ifdef __APPLE__
+		if (!strcmp(argv[i], "-dsb") || !strcmp(argv[i], "-deferfree")) {	/* boot #42 */
+			static int dsb, deferfree;
+			dsb |= !strcmp(argv[i], "-dsb");
+			deferfree |= !strcmp(argv[i], "-deferfree");
+			kgsl_ios_options(dsb, deferfree);
+			host_log("isolation: dsb %d deferfree %d\n", dsb, deferfree);
+			continue;
+		}
+#endif
 		if (!strcmp(argv[i], "-trace")) {
 			kgsl_trace();
 			continue;

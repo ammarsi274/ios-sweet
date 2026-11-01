@@ -24,7 +24,8 @@ void kgsl_report(void);
 int kgsl_capture_start(const char *path);	/* bench: record GPU work for replay (0 or -errno) */
 void kgsl_capture_nowait(void);
 void kgsl_trace(void);				/* -trace: completion state at submits and kgsl_trace_point() */
-void kgsl_trace_point(const char *what);			/* capture without waiting for each submit (phase 1 = right after it) */
+void kgsl_trace_point(const char *what);
+void kgsl_ios_options(int dsb, int deferfree);	/* kgsl_ios.c only: boot #42 isolation switches */			/* capture without waiting for each submit (phase 1 = right after it) */
 /* kgsl_cap.c, called by each platform's layer around every ioctl and mmap */
 void kgsl_cap_before(int fd, unsigned long req, void *arg);
 void kgsl_cap_after(int fd, unsigned long req, void *arg, long rc);

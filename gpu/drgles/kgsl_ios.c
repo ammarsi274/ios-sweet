@@ -116,6 +116,25 @@ static unsigned seen_count[64];
 static int nseen;
 static int skipped_preamble_logged;
 
+/*
+ * Boot #42 isolation switches (bench -dsb / -deferfree). #41: without the
+ * capture's pauses every run hit CP_OPCODE_ERROR (GPU work identical to
+ * Linux when it passes). -dsb: a full barrier right before each submit, so
+ * the blob's command writes are in memory before the kernel kicks the GPU.
+ * -deferfree: free-on-event frees are kept here and done (immediately, in
+ * DrgGPU) only once the memstore shows their timestamp retired.
+ */
+static int opt_dsb, opt_deferfree;
+#define NDEFER 256
+static struct { struct kdev *d; uint32_t id, ctx, ts; } defer[NDEFER];
+static unsigned ndefer;
+
+void kgsl_ios_options(int dsb, int deferfree)
+{
+	opt_dsb = dsb;
+	opt_deferfree = deferfree;
+}
+
 static int err_of(int rc)
 {
 	switch (rc) {
@@ -259,6 +278,32 @@ static long gpuobj_alloc(struct kdev *d, struct gpuobj_alloc *a)
 	return 0;
 }
 
+/* the memstore's eop of ctx (kgsl_devmemstore: 40-byte entries, eop at +8) has reached ts */
+static int ms_retired(struct kdev *d, uint32_t ctx, uint32_t ts)
+{
+	if (!d->memstore) {
+		uint64_t out[2] = { 0 };
+		if (call(d, DRGPU_UC_MEMSTORE, 0, 0, 0, 0, out, 2, 0, 0))
+			return 0;
+		d->memstore = out[0];
+	}
+	volatile const uint32_t *ms = (volatile const uint32_t *)(uintptr_t)d->memstore;
+	return (int32_t)(ms[ctx * 10 + 2] - ts) >= 0;
+}
+
+static void defer_reap(void)
+{
+	for (unsigned i = 0; i < ndefer;) {
+		if (ms_retired(defer[i].d, defer[i].ctx, defer[i].ts)) {
+			uint64_t in[4] = { defer[i].id, 0, 0, 0 };
+			(void)call(defer[i].d, DRGPU_UC_OBJ_FREE, in, 4, 0, 0, 0, 0, 0, 0);
+			defer[i] = defer[--ndefer];
+		} else {
+			i++;
+		}
+	}
+}
+
 static long gpuobj_free(struct kdev *d, struct gpuobj_free *f)
 {
 	struct kobj *o = obj_find(d, f->id);
@@ -270,6 +315,16 @@ static long gpuobj_free(struct kdev *d, struct gpuobj_free *f)
 		if (f->type != KGSL_GPU_EVENT_TIMESTAMP || f->len != sizeof(ev) || !f->priv)
 			return -E_INVAL;
 		memcpy(&ev, (const void *)(uintptr_t)f->priv, sizeof(ev));
+		if (opt_deferfree && ndefer < NDEFER) {
+			defer[ndefer].d = d;
+			defer[ndefer].id = f->id;
+			defer[ndefer].ctx = ev.context_id;
+			defer[ndefer].ts = ev.timestamp;
+			ndefer++;
+			o->live = 0;
+			o->freed = 1;
+			return 0;
+		}
 		in[1] = 1;
 		in[2] = ev.context_id;
 		in[3] = ev.timestamp;
@@ -317,6 +372,10 @@ static long gpu_command(struct kdev *d, struct gpu_command *c)
 		n++;
 	}
 	uint64_t in[3] = { c->context_id, c->flags, c->timestamp }, out[1] = { 0 };
+#if defined(__aarch64__)	/* (the host test builds this file for x86) */
+	if (opt_dsb)
+		__asm__ volatile("dsb sy" ::: "memory");
+#endif
 	int rc = call(d, DRGPU_UC_SUBMIT, in, 3, n ? ibs : 0, n * sizeof(ibs[0]), out, 1, 0, 0);
 	if (rc)
 		return rc;
@@ -381,6 +440,8 @@ static long ioctl_(int fd, unsigned long req, void *arg)
 
 long kgsl_ioctl(int fd, unsigned long req, void *arg)
 {
+	if (ndefer)
+		defer_reap();
 	kgsl_cap_before(fd, req, arg);
 	long rc = ioctl_(fd, req, arg);
 	kgsl_cap_after(fd, req, arg, rc);

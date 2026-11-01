@@ -17,13 +17,12 @@ Idempotent. root:wheel, 0755 programs and directories, 0644 libraries.
 import glob, os, plistlib, shutil, sys
 
 RUNS = [
-    # Boot #41, completion trace: #40's plain run read the previous frame back after glFinish (GPU work
-    # identical to Linux). -trace logs the memstore sop/eop and the driver's retire state at every
-    # submit and after each glFinish/readback (Linux reference: logs/twrp-trace.txt). Trace at boot,
-    # plain at +60 s (does the failure repeat), trace at +120 s.
+    # Boot #42, isolation: #41's plain runs all hit CP_OPCODE_ERROR (the capture's pauses hide it).
+    # Plain at boot (control), -dsb (full barrier before each submit) at +60 s, -deferfree (free-on-event
+    # frees done only once the memstore shows the timestamp retired) at +120 s; all three traced.
     ('com.drg.gpubench', ['-trace'], 'drgles.log'),
-    ('com.drg.gpubench2', ['-delay', '60'], 'drgles2.log'),
-    ('com.drg.gpubench3', ['-delay', '120', '-trace'], 'drgles3.log'),
+    ('com.drg.gpubench2', ['-delay', '60', '-dsb', '-trace'], 'drgles2.log'),
+    ('com.drg.gpubench3', ['-delay', '120', '-deferfree', '-trace'], 'drgles3.log'),
 ]
 
 
