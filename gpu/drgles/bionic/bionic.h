@@ -78,6 +78,16 @@ void *bionic_lookup(const char *name);
 /* a hook for things only the bench provides (gralloc through TWRP) */
 extern void *(*bionic_bench_hook)(const char *name);
 
+/*
+ * Window buffers for EGLImages (gralloc.c): handle = the native_handle EGL
+ * gets in the ANativeWindowBuffer, cpu = the memory's CPU address. 0 or
+ * -LE_NOMEM.
+ */
+int b_gralloc_register(const void *handle, void *cpu, uint32_t width, uint32_t height, uint32_t stride,
+		       int32_t format, uint64_t usage);
+void b_gralloc_unregister(const void *handle);
+extern int b_gralloc_trace;	/* log every gralloc call */
+
 void b_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 __attribute__((noreturn)) void b_fatal(const char *what);
 

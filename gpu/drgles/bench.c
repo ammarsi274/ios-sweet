@@ -264,6 +264,8 @@ static int gr_perform(void *dev, int op, uint64_t a, uint64_t b, uint64_t c, uin
 	int r = gr_real_perform(dev, op, a, b, c, d, e, f);
 	host_log("gralloc1 Perform(op %d, %#llx, %#llx, %#llx, %#llx) -> %d\n", op, (unsigned long long)a,
 		 (unsigned long long)b, (unsigned long long)c, (unsigned long long)d, r);
+	if (b > 0x10000 && (op == 9 || op == 10))	/* what it wrote (8 bytes at the out pointer) */
+		host_log("gralloc1 Perform(op %d) out: %#llx\n", op, (unsigned long long)*(const uint64_t *)(uintptr_t)b);
 	return r;
 }
 
@@ -603,15 +605,33 @@ static void anwb_ref(void *p)
 #define GR_PROD_GPU_RENDER	(1ULL << 10)
 #define GR_CONS_GPU_TEXTURE	(1ULL << 8)
 
+/*
+ * -owngbuf W H FMT: the iOS arrangement on TWRP. Nokia's gralloc (through
+ * TWRP's libhardware) only allocates the dma-buf; EGL sees OUR module
+ * (bionic/gralloc.c) and our copy of the handle with the metadata fd set to
+ * -1 (iOS has no metadata buffer). FMT 1 = RGBA_8888, 5 = BGRA_8888 (iOS
+ * display surfaces are 'BGRA').
+ */
+static int gbuf_own, gbuf_fmt = 1, gbuf_keepmeta;	/* -gbufmeta: keep Nokia's metadata fd */
+static uint64_t gbuf_usage = 1ULL << 8;	/* -gbufusage N: what our GetConsumerUsage answers */
+
 static int gbuf_test(EGLDisplay d)
 {
 	int w = gbuf_w, h = gbuf_h;
-	if (!gr_real_mod) {
-		host_log("gbuf: needs -nokiagralloc\n");
+	const struct hw_module *gm = gr_real_mod;
+	int (*gopen)(const struct hw_module *, const char *, void **) = gr_real_open;
+	if (gbuf_own) {
+		int (*hgm)(const char *, const struct hw_module **) = dlsym(host_libs[6], "hw_get_module");
+		gm = 0;
+		if (hgm && hgm("gralloc", &gm) == 0 && gm)
+			gopen = gm->methods->open;
+	}
+	if (!gm) {
+		host_log("gbuf: needs -nokiagralloc or Nokia's module in TWRP's libhardware path\n");
 		return 1;
 	}
 	void *dev = 0;
-	int r = gr_real_open(gr_real_mod, "gralloc", &dev);
+	int r = gopen(gm, "gralloc", &dev);
 	if (r || !dev)
 		return check("gbuf: own gralloc device", 0);
 	void *(*get)(void *, int32_t) = ((struct gr1_dev *)dev)->get;
@@ -628,7 +648,7 @@ static int gbuf_test(EGLDisplay d)
 	const void *hnd = 0;
 	r = create(dev, &desc);
 	r = r ? r : dims(dev, desc, (uint32_t)w, (uint32_t)h);
-	r = r ? r : fmt(dev, desc, 1);	/* HAL_PIXEL_FORMAT_RGBA_8888 */
+	r = r ? r : fmt(dev, desc, gbuf_fmt);	/* HAL_PIXEL_FORMAT_RGBA_8888 1, BGRA_8888 5 */
 	r = r ? r : prod(dev, desc, GR_PROD_GPU_RENDER | GR_PROD_CPU_READ_OFTEN);
 	r = r ? r : cons(dev, desc, GR_CONS_GPU_TEXTURE);
 	r = r ? r : alloc(dev, 1, &desc, &hnd);
@@ -647,15 +667,43 @@ static int gbuf_test(EGLDisplay d)
 			n += snprintf(line + n, sizeof(line) - n, " %08x", (uint32_t)nh[3 + k]);
 		host_log("%s\n", line);
 	}
+	/* the buffer's memory, writable: padding markers now, our module's CPU address */
+	const uint32_t marker = 0xa55aa55a;
+	size_t blen = (size_t)(uint32_t)nh[3 + 10];	/* the handle's size field */
+	int ah = st ? (int)(blen / ((size_t)st * 4)) : 0;	/* rows gralloc allocated */
+	int perr = 0;
+	uint32_t *pad = st ? host_mmap_fd(0, blen, HOST_PROT_R | HOST_PROT_W, 1 /* MAP_SHARED */, nh[3], 0, &perr) : 0;
+	if (perr)
+		pad = 0;
+	const void *ehnd = hnd;	/* what EGL gets */
+	static int32_t own_handle[3 + 64];
+	if (gbuf_own) {
+		int n = 3 + nh[1] + nh[2];
+		if (n > (int)(sizeof(own_handle) / 4) || nh[1] < 2 || !pad)
+			return check("gbuf: own handle", 0);
+		memcpy(own_handle, nh, (size_t)n * 4);
+		if (!gbuf_keepmeta)
+			own_handle[3 + 1] = -1;	/* no metadata buffer */
+		ehnd = own_handle;
+		b_gralloc_trace = 1;
+		/*
+		 * CPU address 0, as Nokia's module answers Perform 10 for this buffer
+		 * (TWRP 2026-11-02: out 0, base not mapped here). With a real address
+		 * the driver never rendered into the buffer.
+		 */
+		r = b_gralloc_register(ehnd, 0, (uint32_t)w, (uint32_t)h, st, gbuf_fmt, gbuf_usage);
+		host_log("gbuf: own module: handle %p (fd %d, metadata fd %d) registered rc %d, format %d, usage %#llx\n",
+			 ehnd, own_handle[3], own_handle[4], r, gbuf_fmt, (unsigned long long)gbuf_usage);
+	}
 
 	static struct anwb b;
 	b.magic = 0x5f626672;	/* '_bfr' */
 	b.version = sizeof(b);
 	b.inc = b.dec = anwb_ref;
-	b.width = w, b.height = h, b.stride = (int32_t)st, b.format = 1;
+	b.width = w, b.height = h, b.stride = (int32_t)st, b.format = gbuf_fmt;
 	b.usage_deprecated = (int32_t)(GR_PROD_GPU_RENDER | GR_CONS_GPU_TEXTURE);
 	b.layer_count = 1;
-	b.handle = hnd;
+	b.handle = ehnd;
 	b.usage = GR_PROD_GPU_RENDER | GR_CONS_GPU_TEXTURE;
 	void *(*gpa)(const char *) = (void *(*)(const char *))drg_elf_sym(egl_dso, "eglGetProcAddress");
 	void *(*mkimg)(EGLDisplay, void *, u32, void *, const int *) = gpa ? gpa("eglCreateImageKHR") : 0;
@@ -684,13 +732,6 @@ static int gbuf_test(EGLDisplay d)
 	 * dma-buf before the draw; afterwards count what the GPU overwrote. The
 	 * marker's top byte 0xa5 never occurs in the pattern (y >> 8 <= 9).
 	 */
-	const uint32_t marker = 0xa55aa55a;
-	size_t blen = (size_t)(uint32_t)nh[3 + 10];	/* the handle's size field */
-	int ah = st ? (int)(blen / ((size_t)st * 4)) : 0;	/* rows gralloc allocated */
-	int perr = 0;
-	uint32_t *pad = st ? host_mmap_fd(0, blen, HOST_PROT_R | HOST_PROT_W, 1 /* MAP_SHARED */, nh[3], 0, &perr) : 0;
-	if (perr)
-		pad = 0;
 	long pad_words = 0, pad_kept_before = 0;
 	if (pad) {
 		for (int y = 0; y < ah; y++)
@@ -788,7 +829,8 @@ static int gbuf_test(EGLDisplay d)
 				n += snprintf(line + n, sizeof(line) - n, "%c", pad[(size_t)y * st + x] == marker ? '.' : '#');
 			host_log("%s\n", line);
 		}
-		host_munmap(pad, blen);
+		if (!gbuf_own)	/* else our module still hands this address to EGL */
+			host_munmap(pad, blen);
 	}
 
 	/* the pattern through gralloc's own CPU mapping, rows st pixels apart */
@@ -823,8 +865,10 @@ static int gbuf_test(EGLDisplay d)
 		for (int y = 0; y < h - 1; y++)
 			for (int x = 0; x < w; x++) {
 				const unsigned char *t = (const unsigned char *)cpu + ((size_t)y * st + x) * 4;
-				/* GL's row 0 is the bottom one; gralloc's row 0 the top: check both orders */
-				int ok = t[0] == (x & 0xff) && t[1] == (x >> 8) && t[2] == (y & 0xff) && t[3] == (y >> 8);
+				/* RGBA: R = x & 0xff, G = x >> 8, B = y & 0xff, A = y >> 8; BGRA keeps B, G, R, A in memory */
+				int ok = gbuf_fmt == 5 ?
+					 t[0] == (y & 0xff) && t[1] == (x >> 8) && t[2] == (x & 0xff) && t[3] == (y >> 8) :
+					 t[0] == (x & 0xff) && t[1] == (x >> 8) && t[2] == (y & 0xff) && t[3] == (y >> 8);
 				if (ok)
 					linear++;
 				else if (first_bad_x < 0)
@@ -1077,6 +1121,25 @@ static int main_(int argc, char **argv, char **envp)
 					v[k] = v[k] * 10 + (*p - '0');
 			gbuf_w = v[0], gbuf_h = v[1];
 			host_log("gbuf test %dx%d\n", gbuf_w, gbuf_h);
+			continue;
+		}
+		if (!strcmp(argv[i], "-owngbuf") && i + 3 < argc) {	/* our gralloc module, Nokia's memory */
+			int v[3] = { 0, 0, 0 };
+			for (int k = 0; k < 3; k++)
+				for (const char *p = argv[++i]; *p >= '0' && *p <= '9'; p++)
+					v[k] = v[k] * 10 + (*p - '0');
+			gbuf_w = v[0], gbuf_h = v[1], gbuf_fmt = v[2], gbuf_own = 1;
+			host_log("own gbuf test %dx%d format %d\n", gbuf_w, gbuf_h, gbuf_fmt);
+			continue;
+		}
+		if (!strcmp(argv[i], "-gbufmeta")) {
+			gbuf_keepmeta = 1;
+			continue;
+		}
+		if (!strcmp(argv[i], "-gbufusage") && i + 1 < argc) {
+			gbuf_usage = 0;
+			for (const char *p = argv[++i]; *p >= '0' && *p <= '9'; p++)
+				gbuf_usage = gbuf_usage * 10 + (uint64_t)(*p - '0');
 			continue;
 		}
 #endif
