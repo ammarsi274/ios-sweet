@@ -99,6 +99,9 @@ struct kobj {
 	uint32_t id;
 	uint8_t live, freed;
 	uint64_t va, size;
+	uint64_t flags;		/* as GPUOBJ_INFO reports them */
+	uint32_t imports;	/* an imported IOSurface: imports still holding it */
+	uint32_t surface;	/* its IOSurface id */
 };
 
 #define NDEV 4
@@ -133,6 +136,58 @@ void kgsl_ios_options(int dsb, int deferfree)
 {
 	opt_dsb = dsb;
 	opt_deferfree = deferfree;
+}
+
+/* DrgGPU submission framing for connections opened from now on (DRGPU_UC_OPT_*) */
+static uint32_t opt_framing;
+void kgsl_ios_framing(uint32_t opts)
+{
+	opt_framing = opts;
+}
+
+/* a submission was refused because a GPU fault invalidated its context */
+static volatile int gpu_faulted;
+int kgsl_ios_faulted(void)
+{
+	return gpu_faulted;
+}
+
+/*
+ * IOSurfaces as dma-bufs: the window layer hands EGL a gralloc handle whose
+ * first fd is a token from kgsl_ios_surface_fd; the driver's GPUOBJ_IMPORT
+ * (type 3, measured on TWRP) of that fd maps the surface through DrgGPU's
+ * SURFACE_MAP. One kernel object per surface at a time: XNU resets a page's
+ * cache mode when any device-pager mapping of it goes away
+ * (drg/GPU-DRAW-PLAN.md), so repeated imports share it, counted.
+ */
+#define NSURF 64
+static struct { int fd; uint32_t surface; } surfs[NSURF];
+
+int kgsl_ios_surface_fd(uint32_t surface)
+{
+	for (int i = 0; i < NSURF; i++)
+		if (surfs[i].fd > 0 && surfs[i].surface == surface)
+			return surfs[i].fd;
+	for (int i = 0; i < NSURF; i++)
+		if (surfs[i].fd <= 0) {
+			int fd = host_open("/dev/null", 0x80002 /* O_RDWR | O_CLOEXEC */, 0);
+			if (fd < 0)
+				return fd;
+			surfs[i].fd = fd;
+			surfs[i].surface = surface;
+			return fd;
+		}
+	return -E_NOMEM;
+}
+
+static int surface_of_fd(int fd, uint32_t *surface)
+{
+	for (int i = 0; i < NSURF; i++)
+		if (fd > 0 && surfs[i].fd == fd) {
+			*surface = surfs[i].surface;
+			return 1;
+		}
+	return 0;
 }
 
 static int err_of(int rc)
@@ -204,6 +259,16 @@ int kgsl_open(int flags)
 		IOServiceClose(conn);
 		return -E_NODEV;
 	}
+	if (opt_framing) {
+		uint64_t in[1] = { opt_framing }, got[1] = { 0 };
+		int rc = call(d, DRGPU_UC_SET_OPTIONS, in, 1, 0, 0, got, 1, 0, 0);
+		host_log("drgles: submission framing 0x%x -> rc %d, in effect 0x%llx\n", opt_framing, rc,
+			 (unsigned long long)got[0]);
+		if (rc) {
+			IOServiceClose(conn);
+			return rc;
+		}
+	}
 	int fd = host_open("/dev/null", (flags & 0x80000) | 2 /* O_RDWR, O_CLOEXEC as asked */, 0);
 	if (fd < 0) {
 		IOServiceClose(conn);
@@ -270,11 +335,80 @@ static long gpuobj_alloc(struct kdev *d, struct gpuobj_alloc *a)
 	int rc = call(d, DRGPU_UC_OBJ_ALLOC, in, 2, 0, 0, out, 3, 0, 0);
 	if (rc)
 		return rc;
-	*o = (struct kobj){ (uint32_t)out[0], 1, 0, out[1], out[2] };
+	*o = (struct kobj){ (uint32_t)out[0], 1, 0, out[1], out[2], a->flags, 0, 0 };
 	a->id = (uint32_t)out[0];
 	a->size = out[2];
 	a->mmapsize = out[2];
 	a->va_len = out[2];
+	return 0;
+}
+
+#define KGSL_USER_MEM_TYPE_DMABUF	3
+#define KGSL_MEMFLAGS_USE_CPU_MAP	0x10000000ull
+#define KGSL_MEMALIGN_MASK		0x00ff0000ull
+#define KGSL_MEMFLAGS_USERMEM_MASK	0x000000e0ull
+#define KGSL_MEMFLAGS_USERMEM_ION	0x00000080ull	/* (KGSL_USER_MEM_TYPE_ION + 1) << 5 */
+struct gpuobj_import { uint64_t priv, priv_len, flags; uint32_t type, id; };
+struct gpuobj_info { uint64_t gpuaddr, flags, size, va_len, va_addr; uint32_t id; };
+
+/*
+ * TWRP, Linux's answer for a gralloc buffer: flags in 0x10001200 -> out
+ * 0x141280 (USE_CPU_MAP dropped, the ION user-memory type set, alignment
+ * 2^20 for its own GPU address). Here the GPU address is the task address
+ * of the import (USE_CPU_MAP as for every object): its real alignment.
+ */
+static long gpuobj_import(struct kdev *d, struct gpuobj_import *im)
+{
+	uint32_t surface = 0;
+	int fd = -1;
+	if (im->type != KGSL_USER_MEM_TYPE_DMABUF || im->priv_len < sizeof(int) || !im->priv)
+		return -E_INVAL;
+	memcpy(&fd, (const void *)(uintptr_t)im->priv, sizeof(fd));
+	if (!surface_of_fd(fd, &surface)) {
+		host_log("drgles: GPUOBJ_IMPORT of fd %d: not a surface token\n", fd);
+		return -E_INVAL;
+	}
+	for (uint32_t i = 0; i < d->nobjs; i++) {
+		struct kobj *o = &d->objs[i];
+		if (o->live && o->imports && o->surface == surface) {	/* already imported: share it */
+			o->imports++;
+			im->id = o->id;
+			im->flags = o->flags;
+			return 0;
+		}
+	}
+	struct kobj *o = obj_slot(d);
+	uint64_t in[1] = { surface }, out[3] = { 0 };
+	if (!o)
+		return -E_NOMEM;
+	int rc = call(d, DRGPU_UC_SURFACE_MAP, in, 1, 0, 0, out, 3, 0, 0);
+	if (rc) {
+		host_log("drgles: SURFACE_MAP of IOSurface %u: rc %d\n", surface, rc);
+		return rc;
+	}
+	unsigned align = 12;
+	while (align < 20 && !(out[1] & (1ull << align)))
+		align++;
+	uint64_t flags = (im->flags & ~(KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_MEMALIGN_MASK | KGSL_MEMFLAGS_USERMEM_MASK)) |
+			 KGSL_MEMFLAGS_USERMEM_ION | (uint64_t)align << 16;
+	*o = (struct kobj){ (uint32_t)out[0], 1, 0, out[1], out[2], flags, 1, surface };
+	im->id = o->id;
+	im->flags = flags;
+	host_log("drgles: IOSurface %u imported: object %u at 0x%llx, 0x%llx bytes, flags 0x%llx\n", surface, o->id,
+		 (unsigned long long)o->va, (unsigned long long)o->size, (unsigned long long)flags);
+	return 0;
+}
+
+static long gpuobj_info(struct kdev *d, struct gpuobj_info *gi)
+{
+	struct kobj *o = obj_find(d, gi->id);
+	if (!o)
+		return -E_INVAL;
+	gi->gpuaddr = o->va;
+	gi->flags = o->flags;
+	gi->size = o->size;
+	gi->va_len = o->size;
+	gi->va_addr = o->imports ? 0 : o->va;	/* Linux: 0 for the import (not mapped by the driver) */
 	return 0;
 }
 
@@ -310,6 +444,10 @@ static long gpuobj_free(struct kdev *d, struct gpuobj_free *f)
 	uint64_t in[4] = { f->id, 0, 0, 0 };
 	if (!o)
 		return -E_INVAL;
+	if (o->imports > 1) {	/* another import of the same surface still uses it */
+		o->imports--;
+		return 0;
+	}
 	if (f->flags & KGSL_GPUOBJ_FREE_ON_EVENT) {
 		struct gpu_event_timestamp ev;
 		if (f->type != KGSL_GPU_EVENT_TIMESTAMP || f->len != sizeof(ev) || !f->priv)
@@ -377,6 +515,10 @@ static long gpu_command(struct kdev *d, struct gpu_command *c)
 		__asm__ volatile("dsb sy" ::: "memory");
 #endif
 	int rc = call(d, DRGPU_UC_SUBMIT, in, 3, n ? ibs : 0, n * sizeof(ibs[0]), out, 1, 0, 0);
+	if (rc == -E_DEADLK && !gpu_faulted) {
+		gpu_faulted = 1;
+		host_log("drgles: context %u invalidated by a GPU fault\n", c->context_id);
+	}
 	if (rc)
 		return rc;
 	c->timestamp = (uint32_t)out[0];
@@ -426,10 +568,19 @@ static long ioctl_(int fd, unsigned long req, void *arg)
 		uint64_t in[1] = { ((struct syncsource *)arg)->id };
 		return call(d, DRGPU_UC_SYNCSRC_DESTROY, in, 1, 0, 0, 0, 0, 0, 0);
 	}
+	case 0x07: {	/* DEVICE_WAITTIMESTAMP_CTXTID: {context, timestamp, timeout ms} (EGLImage path, TWRP) */
+		const uint32_t *w = arg;
+		uint64_t in[3] = { w[0], w[1], w[2] };
+		return call(d, DRGPU_UC_WAIT, in, 3, 0, 0, 0, 0, 0, 0);
+	}
 	case 0x45:	/* GPUOBJ_ALLOC */
 		return gpuobj_alloc(d, arg);
 	case 0x46:	/* GPUOBJ_FREE */
 		return gpuobj_free(d, arg);
+	case 0x47:	/* GPUOBJ_INFO */
+		return gpuobj_info(d, arg);
+	case 0x48:	/* GPUOBJ_IMPORT */
+		return gpuobj_import(d, arg);
 	case 0x4a:	/* GPU_COMMAND */
 		return gpu_command(d, arg);
 	default:

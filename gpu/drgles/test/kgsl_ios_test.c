@@ -19,7 +19,8 @@ static int fails, opened, closed;
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); fails++; } } while (0)
 
 /* ---- host.h stubs ---- */
-int host_open(const char *path, int flags, int mode) { (void)flags; (void)mode; CHECK(!strcmp(path, "/dev/null")); return 7; }
+static int next_fd = 7;
+int host_open(const char *path, int flags, int mode) { (void)flags; (void)mode; CHECK(!strcmp(path, "/dev/null")); return next_fd++; }
 int host_close(int fd) { CHECK(fd == 7); closed++; return 0; }
 void *host_alloc(size_t n) { return calloc(1, n); }
 void host_sleep_ns(int64_t ns) { (void)ns; }
@@ -35,6 +36,8 @@ static uint32_t next_id = 1, live_objs, pending_free;
 static uint64_t last_submit[3];
 static struct drgpu_uc_ib last_ibs[DRGPU_UC_MAX_IBS];
 static size_t last_nibs;
+static uint64_t set_options = ~0ull, last_wait[3];
+static int surface_maps, submit_fault;
 void *IOServiceMatching(const char *name) { CHECK(!strcmp(name, "DrgGPU")); return (void *)1; }
 mach_port_t IOServiceGetMatchingService(mach_port_t p, const void *m) { CHECK(p == 0 && m); return 0x200; }
 int IOServiceOpen(mach_port_t s, mach_port_t task, uint32_t type, mach_port_t *c) { CHECK(s == 0x200 && task == 0x103 && type == 0); *c = 0x300; opened++; return 0; }
@@ -71,12 +74,21 @@ int IOConnectCallMethod(mach_port_t c, uint32_t sel, const uint64_t *in, uint32_
 		return 0;
 	case DRGPU_UC_SUBMIT:
 		CHECK(nin == 3 && nsin % sizeof(struct drgpu_uc_ib) == 0);
+		if (submit_fault) return E(0x2ca);	/* kIOReturnIOError: context invalidated */
 		memcpy(last_submit, in, sizeof(last_submit));
 		last_nibs = nsin / sizeof(struct drgpu_uc_ib);
 		if (nsin) memcpy(last_ibs, sin, nsin);
 		out[0] = in[2];
 		return 0;
-	case DRGPU_UC_WAIT: CHECK(nin == 3); return 0;
+	case DRGPU_UC_WAIT: CHECK(nin == 3); memcpy(last_wait, in, sizeof(last_wait)); return 0;
+	case DRGPU_UC_SET_OPTIONS: CHECK(nin == 1 && *nout >= 1); set_options = in[0]; out[0] = in[0]; return 0;
+	case DRGPU_UC_SURFACE_MAP:	/* as DrgGPU: a new task mapping of the surface, 16 KiB aligned */
+		CHECK(nin == 1 && in[0] == 2 && *nout >= 3);
+		surface_maps++;
+		next_va -= 0xac4000;
+		out[0] = next_id++; out[1] = next_va; out[2] = 0xac4000;
+		live_objs++;
+		return 0;
 	default: CHECK(!"unexpected selector"); return E(0x2c7);
 	}
 }
@@ -89,11 +101,16 @@ struct gpu_command { uint64_t flags, cmdlist; uint32_t cmdsize, numcmds; uint64_
 		     uint64_t synclist; uint32_t syncsize, numsyncs, context_id, timestamp; };
 struct command_object { uint64_t offset, gpuaddr, size; uint32_t flags, id; };
 
+struct gpuobj_import { uint64_t priv, priv_len, flags; uint32_t type, id; };
+struct gpuobj_info { uint64_t gpuaddr, flags, size, va_len, va_addr; uint32_t id; };
+
 int main(void)
 {
 	int err;
+	kgsl_ios_framing(DRGPU_UC_OPT_KGSL_PREEMPT);
 	int fd = kgsl_open(0x80002);
 	CHECK(fd == 7 && kgsl_is_fd(7) && opened == 1);
+	CHECK(set_options == DRGPU_UC_OPT_KGSL_PREEMPT);	/* framing set on the new connection */
 
 	uint32_t ss[4] = { 0 };
 	CHECK(kgsl_ioctl(fd, 0xc0100940, ss) == 0 && ss[0] == 1);	/* SYNCSOURCE_CREATE */
@@ -150,6 +167,38 @@ int main(void)
 	CHECK(kgsl_ioctl(fd, 0x40200946, &f) == -22);			/* double free */
 	CHECK(kgsl_munmap((void *)0x12345000, 0x1000) == 0);		/* not ours: to the host */
 	CHECK(kgsl_munmap(ms, 0x2000) == 1);
+
+	/* an IOSurface as a dma-buf (TWRP: GPUOBJ_IMPORT type 3, then GPUOBJ_INFO), imported twice */
+	int sfd = kgsl_ios_surface_fd(2);
+	CHECK(sfd > 7 && kgsl_ios_surface_fd(2) == sfd && !kgsl_is_fd(sfd));
+	struct gpuobj_import im = { (uintptr_t)&sfd, 4, 0x10001200, 3, 0 };
+	CHECK(kgsl_ioctl(fd, 0xc0200948, &im) == 0 && surface_maps == 1);
+	unsigned al = 12;
+	while (al < 20 && !(next_va & (1ull << al)))
+		al++;
+	CHECK(al >= 14 && im.flags == 0x1280 + ((uint64_t)al << 16));	/* USE_CPU_MAP off, ION type, its alignment */
+	struct gpuobj_import im2 = { (uintptr_t)&sfd, 4, 0x10001200, 3, 0 };
+	CHECK(kgsl_ioctl(fd, 0xc0200948, &im2) == 0 && surface_maps == 1 && im2.id == im.id);	/* shared */
+	struct gpuobj_info gi = { 0, 0, 0, 0, 0, im.id };
+	CHECK(kgsl_ioctl(fd, 0xc0300947, &gi) == 0 && gi.gpuaddr == next_va && gi.size == 0xac4000 && gi.va_addr == 0);
+	CHECK(kgsl_mmap(0, 0xac4000, 3, 1, fd, (long)im.id << 12, &err) == (void *)(uintptr_t)next_va);
+	int bad = 99;
+	struct gpuobj_import im3 = { (uintptr_t)&bad, 4, 0x10001200, 3, 0 };
+	CHECK(kgsl_ioctl(fd, 0xc0200948, &im3) == -22);			/* not a surface token */
+	uint32_t w[3] = { 2, 0x2100, 10000 };
+	CHECK(kgsl_ioctl(fd, 0x400c0907, w) == 0 && last_wait[0] == 2 && last_wait[1] == 0x2100 && last_wait[2] == 10000);
+	uint32_t objs_before = live_objs;
+	f = (struct gpuobj_free){ 0, 0, im.id, 0, 0 };
+	CHECK(kgsl_ioctl(fd, 0x40200946, &f) == 0 && live_objs == objs_before);	/* the second import keeps it */
+	CHECK(kgsl_ioctl(fd, 0x40200946, &f) == 0 && live_objs == objs_before - 1);
+	CHECK(kgsl_ioctl(fd, 0xc0300947, &gi) == -22);			/* gone */
+
+	/* a fault-invalidated context: the submit fails and the fault is reported once */
+	CHECK(!kgsl_ios_faulted());
+	submit_fault = 1;
+	gc = (struct gpu_command){ 0x8, (uintptr_t)&co, sizeof(co), 1, 0, 0, 0, 0, 0, 0, 2, 0x4000 };
+	CHECK(kgsl_ioctl(fd, 0xc040094a, &gc) == -35 && kgsl_ios_faulted());
+	submit_fault = 0;
 
 	CHECK(kgsl_ioctl(fd, 0xc0080999, dc) == -22);			/* outside the measured set */
 	uint32_t dd[1] = { 2 };
