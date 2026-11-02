@@ -13,6 +13,7 @@
  * Output: test results, then "calls <count> <name>" for every import used.
  */
 #include "elf.h"
+#include "drgwin.h"
 #include "host.h"
 #include "rt.h"
 
@@ -613,6 +614,7 @@ static void anwb_ref(void *p)
  * display surfaces are 'BGRA').
  */
 static int gbuf_own, gbuf_fmt = 1, gbuf_keepmeta;	/* -gbufmeta: keep Nokia's metadata fd */
+static int gbuf_craft;	/* -gbufcraft: the handle built by drgwin_handle as on iOS (rows = h), not a copy */
 static uint64_t gbuf_usage = 1ULL << 8;	/* -gbufusage N: what our GetConsumerUsage answers */
 
 static int gbuf_test(EGLDisplay d)
@@ -684,6 +686,8 @@ static int gbuf_test(EGLDisplay d)
 		memcpy(own_handle, nh, (size_t)n * 4);
 		if (!gbuf_keepmeta)
 			own_handle[3 + 1] = -1;	/* no metadata buffer */
+		if (gbuf_craft)
+			drgwin_handle(own_handle, nh[3], (uint32_t)w, (uint32_t)h, st, (uint32_t)h, gbuf_fmt, (uint32_t)blen);
 		ehnd = own_handle;
 		b_gralloc_trace = 1;
 		/*
@@ -886,6 +890,68 @@ static int gbuf_test(EGLDisplay d)
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	int ok = check("gbuf: EGLImage render target linear at gralloc's stride", fs == GL_FRAMEBUFFER_COMPLETE &&
 		       linear == (long)w * (h - 1) && cleared == w);
+	if (gbuf_own && pad) {
+		/*
+		 * The other direction (CoreAnimation samples IOSurfaces apps drew
+		 * on the CPU): the CPU writes a pattern into the buffer, the GPU
+		 * samples the EGLImage texture (NEAREST, texel centres) into a
+		 * 256x256 ordinary FBO, glReadPixels compares. Memory row 0 is
+		 * expected at t = 0 (as for rendering); the flipped match is counted
+		 * too, to tell orientation from failure.
+		 */
+		for (int y = 0; y < h; y++)
+			for (int x = 0; x < w; x++) {
+				unsigned char *t = (unsigned char *)(pad + (size_t)y * st + x);
+				t[0] = (unsigned char)(x * 7 + y), t[1] = (unsigned char)(x + 3 * y), t[2] = (unsigned char)(x >> 3);
+				t[3] = 0xff;
+			}
+		__asm__ volatile("dsb sy" ::: "memory");
+		enum { S = 256 };
+		u32 t2, f2;
+		glGenTextures(1, &t2);
+		glBindTexture(GL_TEXTURE_2D, t2);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, S, S, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+		glGenFramebuffers(1, &f2);
+		glBindFramebuffer(GL_FRAMEBUFFER, f2);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t2, 0);
+		u32 fs2 = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+		char fsrc[256];
+		snprintf(fsrc, sizeof(fsrc), "precision highp float;\nuniform lowp sampler2D tex;\nvoid main() {\n"
+			 "  gl_FragColor = texture2D(tex, (floor(gl_FragCoord.xy) + 0.5) / vec2(%d.0, %d.0));\n}\n", w, h);
+		u32 ps = program("attribute vec4 p;\nvoid main() { gl_Position = p; }\n", fsrc);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, tex);	/* the EGLImage */
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glUseProgram(ps);
+		glUniform1i(glGetUniformLocation(ps, "tex"), 0);
+		glViewport(0, 0, S, S);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		glFinish();
+		unsigned char *got = host_alloc((size_t)S * S * 4);
+		glReadPixels(0, 0, S, S, GL_RGBA, GL_UNSIGNED_BYTE, got);
+		long same = 0, flipped = 0;
+		for (int y = 0; y < S; y++)
+			for (int x = 0; x < S; x++) {
+				const unsigned char *g = got + ((size_t)y * S + x) * 4;
+				for (int k = 0; k < 2; k++) {
+					int my = k ? h - 1 - y : y;
+					const unsigned char *m = (const unsigned char *)(pad + (size_t)my * st + x);
+					/* sampled RGBA from memory: RGBA_8888 as is, BGRA_8888 swaps R and B */
+					int r = gbuf_fmt == 5 ? m[2] : m[0], b = gbuf_fmt == 5 ? m[0] : m[2];
+					int eq = g[0] == r && g[1] == m[1] && g[2] == b && g[3] == m[3];
+					if (k)
+						flipped += eq;
+					else
+						same += eq;
+				}
+			}
+		host_log("gbuf: sample: fbo %x, GL error %x, texels matching memory row y: %ld, row h-1-y: %ld of %d; "
+			 "(0,0) got %02x%02x%02x%02x\n", fs2, glGetError(), same, flipped, S * S, got[0], got[1], got[2], got[3]);
+		host_free(got);
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		ok += check("gbuf: GPU samples CPU-written EGLImage texels (memory row 0 at t = 0)", same == S * S);
+	}
 	/*
 	 * TWRP 2026-11-02: the draw stays inside w x h; the clear also writes
 	 * columns w..align16(w)-1 (1125..1135) of every row, never a row >= h.
@@ -1134,6 +1200,10 @@ static int main_(int argc, char **argv, char **envp)
 		}
 		if (!strcmp(argv[i], "-gbufmeta")) {
 			gbuf_keepmeta = 1;
+			continue;
+		}
+		if (!strcmp(argv[i], "-gbufcraft")) {
+			gbuf_craft = 1;
 			continue;
 		}
 		if (!strcmp(argv[i], "-gbufusage") && i + 1 < argc) {
