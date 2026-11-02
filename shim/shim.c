@@ -739,15 +739,20 @@ static void delay_us(unsigned us)
  *   1. RCG to GPLL0: CFG (0x17811054) source = GPLL_SEL 0x400, CMD
  *      (0x17811050) = RCG_UPDATE 0x3, wait for RCG_UPDATE_SUCCESS 0x2
  *      (update bit clear). A glitch-free switch: it completes only once both
- *      sources run, else the core stays on the PLL (timeout: CFG restored).
+ *      sources run, else the core stays where it was (timeout: back to GPLL0).
+ *      Boot #48 read CFG 0x401: ABL already runs Gold on GPLL0 (the 600.1 MHz
+ *      measured since boot #18 is GPLL0, not the idle PLL's 614.4), so this
+ *      step is skipped then.
  *   2. PLL (0x17816000): MODE 0, L 0x5e, MODE 2, 10 us (PLL_WAIT_LOCK_TIME_US),
  *      MODE 6, 50-75 us, MODE 7. USER_CTL / CONFIG stay as ABL left them
  *      (Linux writes them only with qcom,osm-pll-setup, absent on this phone).
- *   3. RCG back to the original CFG, CMD 0x3, wait as in 1.
+ *   3. RCG to the PLL as the sequencer does: PLL_EARLY_SEL 0x500, then
+ *      PLL_MAIN_SEL 0x300, the divider bits of CFG kept.
  * Done only if all of these read as expected first: PLL MODE 7 and L 0x20,
- * the RCG source a PLL one (PLL_MAIN_SEL 0x300 / PLL_EARLY_SEL 0x500), S2
- * and S3 on with at least 840 mV, and the clock on GPLL0 measured in
- * 100-700 MHz. Every step is logged; the result is the measured clock.
+ * the RCG source GPLL0 or a PLL one, no update pending, S2 and S3 on with at
+ * least 840 mV, and the clock on GPLL0 measured in 100-700 MHz. On the PLL's
+ * early output the clock must measure 1.6-1.95 GHz, else back to GPLL0.
+ * Every step is logged; the result is the measured clock.
  */
 #define DRG_GOLD_CMD_RCGR	0x17811050UL
 #define DRG_GOLD_CFG_RCGR	0x17811054UL
@@ -776,7 +781,7 @@ static uint32_t drg_gold_speedup(void)
 	cpu_put("speed rcg cmd", DRG_GOLD_CMD_RCGR, cmd, 0);
 	cpu_put("speed rcg cfg", DRG_GOLD_CFG_RCGR, cfg, 0);
 	uint32_t src = cfg & 0x700;
-	if (mode != 0x7 || l != 0x20 || (src != 0x300 && src != 0x500) || (cmd & 1)) {
+	if (mode != 0x7 || l != 0x20 || (src != 0x400 && src != 0x300 && src != 0x500) || (cmd & 1)) {
 		cpu_put("speed SKIP state", 0, 1, 1);
 		return gold_khz();
 	}
@@ -797,7 +802,8 @@ static uint32_t drg_gold_speedup(void)
 		}
 	}
 
-	if (gold_rcg_switch((cfg & ~0x700u) | 0x400)) {
+	uint32_t gpll0 = (cfg & ~0x700u) | 0x400;
+	if (src != 0x400 && gold_rcg_switch(gpll0)) {
 		cpu_put("speed rcg->gpll0 timeout", DRG_GOLD_CMD_RCGR, rd32(DRG_GOLD_CMD_RCGR), 1);
 		(void)gold_rcg_switch(cfg);
 		return gold_khz();
@@ -805,7 +811,7 @@ static uint32_t drg_gold_speedup(void)
 	uint32_t khz = gold_khz();
 	cpu_put("speed kHz on gpll0", DRG_GOLD_CFG_RCGR, khz, 0);
 	if (khz < 100000 || khz > 700000) {
-		int rc = gold_rcg_switch(cfg);
+		int rc = src != 0x400 ? gold_rcg_switch(cfg) : 0;
 		cpu_put("speed SKIP gpll0 clock, back", 0, (uint32_t)rc, 1);
 		return gold_khz();
 	}
@@ -826,10 +832,27 @@ static uint32_t drg_gold_speedup(void)
 	cpu_put("speed pll mode new", DRG_PLL_GOLD, rd32(DRG_PLL_GOLD), 0);
 	cpu_put("speed pll L new", DRG_PLL_GOLD + 4, rd32(DRG_PLL_GOLD + 4), 0);
 
-	int rc = gold_rcg_switch(cfg);
-	cpu_put("speed rcg->pll", DRG_GOLD_CMD_RCGR, rd32(DRG_GOLD_CMD_RCGR), rc ? 1 : 0);
+	int rc = gold_rcg_switch((cfg & ~0x700u) | 0x500);
+	cpu_put("speed rcg->pll early", DRG_GOLD_CMD_RCGR, rd32(DRG_GOLD_CMD_RCGR), rc ? 1 : 0);
+	if (rc) {
+		cpu_put("speed back to gpll0", 0, (uint32_t)gold_rcg_switch(gpll0), 1);
+		return gold_khz();
+	}
 	khz = gold_khz();
-	cpu_put("speed kHz final", 0, khz, 0);
+	cpu_put("speed kHz on pll early", 0, khz, 0);
+	if (khz < 1600000 || khz > 1950000) {
+		cpu_put("speed back to gpll0", 0, (uint32_t)gold_rcg_switch(gpll0), 1);
+		return gold_khz();
+	}
+	rc = gold_rcg_switch((cfg & ~0x700u) | 0x300);
+	cpu_put("speed rcg->pll main", DRG_GOLD_CMD_RCGR, rd32(DRG_GOLD_CMD_RCGR), rc ? 1 : 0);
+	if (rc) {
+		cpu_put("speed back to gpll0", 0, (uint32_t)gold_rcg_switch(gpll0), 1);
+		return gold_khz();
+	}
+	khz = gold_khz();
+	cpu_put("speed kHz final", DRG_GOLD_CFG_RCGR, khz, 0);
+	cpu_put("speed rcg cfg final", DRG_GOLD_CFG_RCGR, rd32(DRG_GOLD_CFG_RCGR), 0);
 	return khz;
 }
 
