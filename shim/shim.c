@@ -630,10 +630,24 @@ static void drg_osm_probe(void)
  * PSCI refused). CPRh is not read: it needs its own core clock. Results go to
  * the userdata log area (emmc.c) for TWRP. Nothing is written to any of these
  * blocks.
+ *
+ * Boot #46 showed the SAW has never sent a level (VCTL, PMIC_STS 0), so the
+ * Gold rail sits at what ABL/RPM left. That level is in the PMIC: a buck
+ * scan over SPMI, read only through the observer channel (drg_spmi_read, as
+ * the keys and LDO probes). PM660 = SID 1, PM660L = SID 3 (regulators, boot
+ * #25); every peripheral reports TYPE 0x04 / SUBTYPE 0x05. Bucks, from HMD's
+ * spm-regulator.c: TYPE 0x1C (FTS2 0x08, FTS2.5 0x09, FTS426 0x0A), HF 0x03,
+ * ULT_HF 0x22. For each: STATUS1 0x08, voltage 0x40-0x43 (FTS426: setpoint
+ * LB/UB 0x40/0x41, valid LB/UB 0x42/0x43, in mV), MODE 0x45, EN_CTL 0x46,
+ * ULS 0x68/0x69, and the channel's owner EE (cnfg + 0x700 + 4 * apid, bits
+ * 2:0, as drg_l6_enable). Line: "buck" (ppid << 8 | reg) value.
  */
 #define DRG_SAW_GOLD		0x17812000UL
 
-static char cpu_log[2048];
+static int drg_spmi_read(unsigned int apid, uint8_t addr, uint8_t *val);
+static unsigned int drg_spmi_apid(uint32_t ppid);
+
+static char cpu_log[16384];
 static unsigned cpu_len;
 
 static void cpu_put(const char *label, uint32_t a, uint32_t v, int rc)
@@ -662,6 +676,30 @@ static void cpu_rd(const char *label, uintptr_t a)
 	cpu_put(label, (uint32_t)a, rd32(a), 0);
 }
 
+static void drg_buck_scan(void)
+{
+	static const uint8_t sids[2] = { 1, 3 };
+	static const uint8_t regs[] = { 0x08, 0x40, 0x41, 0x42, 0x43, 0x45, 0x46, 0x68, 0x69 };
+	for (unsigned int i = 0; i < 2; i++) {
+		for (unsigned int per = 0x10; per <= 0x3f; per++) {
+			uint32_t ppid = ((uint32_t)sids[i] << 8) | per;
+			unsigned int apid = drg_spmi_apid(ppid);
+			uint8_t type = 0, sub = 0;
+			if (apid == 0xffff || drg_spmi_read(apid, 0x04, &type) ||
+			    (type != 0x1c && type != 0x03 && type != 0x22))
+				continue;
+			int rc = drg_spmi_read(apid, 0x05, &sub);
+			cpu_put("buck type", ppid << 8 | 0x04, (uint32_t)type << 8 | sub, rc ? 1 : 0);
+			cpu_put("buck owner", ppid << 8, rd32(0x0800a000UL + 0x700 + 4 * apid), 0);
+			for (unsigned int r = 0; r < sizeof(regs); r++) {
+				uint8_t v = 0;
+				rc = drg_spmi_read(apid, regs[r], &v);
+				cpu_put("buck", ppid << 8 | regs[r], v, rc ? 1 : 0);
+			}
+		}
+	}
+}
+
 static void drg_cpu_probe(void)
 {
 	static const uint16_t saw[] = { 0xc04, 0xfd0, 0x00, 0x04, 0x0c, 0x900, 0x904, 0x908, 0x90c,
@@ -682,6 +720,7 @@ static void drg_cpu_probe(void)
 	uint64_t c1 = rsr("pmccntr_el0");
 	wsr("pmcr_el0", pmcr);
 	cpu_put("gold kHz (cycles/10ms)", 0, (uint32_t)((c1 - c0) / 10), 0);
+	drg_buck_scan();
 	int rc = drg_emmc_log_open();
 	if (rc == 0)
 		rc = drg_emmc_log_write(cpu_log, cpu_len);
