@@ -2038,10 +2038,10 @@ index 0000000..f24ec61
 +#endif
 diff --git a/iokit/Kernel/arm/DrgGPU.cpp b/iokit/Kernel/arm/DrgGPU.cpp
 new file mode 100755
-index 0000000..1cb9b7b
+index 0000000..906e634
 --- /dev/null
 +++ b/iokit/Kernel/arm/DrgGPU.cpp
-@@ -0,0 +1,1667 @@
+@@ -0,0 +1,1708 @@
 +/*
 + * DRG (Nokia 6.1 Plus) GPU: the Adreno 512 for iOS userland.
 + *
@@ -2154,6 +2154,10 @@ index 0000000..1cb9b7b
 +#define SMMU_CB0_FSYNR0         (0x8000 + 0x68)
 +#define SMMU_CB0_TTBR0_LO       (0x8000 + 0x20)
 +#define SMMU_CB0_TTBR0_HI       (0x8000 + 0x24)
++#define SMMU_CB0_PAR_LO         (0x8000 + 0x50)
++#define SMMU_CB0_PAR_HI         (0x8000 + 0x54)
++#define SMMU_CB0_ATS1PR         (0x8000 + 0x800)
++#define SMMU_CB0_ATSR           (0x8000 + 0x8f0)
 +#define INT_CP_HW_ERROR         (1u << 9)       /* A5XX_INT_CP_HW_ERROR */
 +#define INT_CACHE_FLUSH_TS      (1u << 20)
 +#define INT_MISC_HANG_DETECT    (1u << 23)
@@ -2251,6 +2255,7 @@ index 0000000..1cb9b7b
 +	void collapse(void);
 +	void setLevel(int level);
 +	void dumpFault(uint32_t status);
++	void faultPage(DrgGPUUserClient *c, struct drg_gpu_obj *o, uint64_t va, unsigned k);
 +	uint32_t regRead(uint32_t reg);
 +
 +	static void idleTimer(thread_call_param_t p0, thread_call_param_t p1);
@@ -3041,9 +3046,45 @@ index 0000000..1cb9b7b
 +			    o->pending ? ", free pending" : "",
 +			    n > 0 ? w[0] : 0, n > 1 ? w[1] : 0, n > 2 ? w[2] : 0, n > 3 ? w[3] : 0,
 +			    n > 4 ? w[4] : 0, n > 5 ? w[5] : 0, n > 6 ? w[6] : 0, n > 7 ? w[7] : 0);
++			faultPage(c, o, a, k + 1);
 +			break;
 +		}
 +	}
++}
++
++/*
++ * Boot #44: no SMMU fault, yet the PFP read 0 at IB1 start where the CPU sees
++ * commands. Which page the GPU reads there: the SMMU's own translation
++ * through its TLB (ATS1PR, poll ATSR, read PAR, as HMD's arm-smmu.c
++ * __arm_smmu_iova_to_phys_hard without the halt), the entry in our table
++ * (the walk done by the CPU), and the page the CPU writes (the object's
++ * physical view); then the word at the IB position in each. The physical
++ * addresses read are pages this driver mapped itself. No fault is expected
++ * from ATS: the faulting walk found nothing (FSR 0x400 only).
++ */
++void
++DrgGPU::faultPage(DrgGPUUserClient *c, struct drg_gpu_obj *o, uint64_t va, unsigned k)
++{
++	uintptr_t sm = fG.smmu;
++	drgpu_wr64(sm + SMMU_CB0_ATS1PR, va & ~0xfffull);
++	uint32_t atsr = 1;
++	for (int i = 0; i < 50 && (atsr & 1); i++) {
++		IODelay(1);
++		atsr = drgpu_rd(sm + SMMU_CB0_ATSR);
++	}
++	uint64_t par = drgpu_rd(sm + SMMU_CB0_PAR_LO) | (uint64_t)drgpu_rd(sm + SMMU_CB0_PAR_HI) << 32;
++	uint64_t hw = (atsr & 1) || (par & 1) ? ~0ull : (par & 0xfffffffff000ull) | (va & 0xfff);
++	uint64_t sw = c->fSpaceLive ? drgpu_pt_lookup(&c->fSpace.pt, va) : ~0ull;
++	IOByteCount seg = 0;
++	uint64_t off = va - o->gpuaddr;
++	uint64_t cpu = o->phys != NULL ? o->phys->getPhysicalSegment(off & ~0xfffull, &seg, kIOMemoryMapperNone) : 0;
++	cpu = cpu != 0 ? cpu | (off & 0xfff) : ~0ull;
++	va &= ~3ull;
++	uint32_t whw = hw != ~0ull ? ml_phys_read_word_64(hw & ~3ull) : 0;
++	uint32_t wsw = sw != ~0ull ? ml_phys_read_word_64(sw & ~3ull) : 0;
++	uint32_t wcpu = cpu != ~0ull ? ml_phys_read_word_64(cpu & ~3ull) : 0;
++	IOLog("DRG GPU: fault ib%u page: smmu atsr 0x%x par 0x%llx -> 0x%llx [%08x], table -> 0x%llx [%08x], "
++	    "cpu -> 0x%llx [%08x]\n", k, atsr, par, hw, whw, sw, wsw, cpu, wcpu);
 +}
 +
 +/*
