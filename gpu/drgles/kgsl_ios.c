@@ -145,6 +145,26 @@ void kgsl_ios_framing(uint32_t opts)
 	opt_framing = opts;
 }
 
+/*
+ * CPU read-back before each submit (boot #51: every framing still faults on
+ * back-to-back work; #40-#42: a capture, which reads every object before
+ * each submit, passes even without waiting, a barrier does not). 1: the
+ * command objects and the object list of the submit; 2: every live object.
+ */
+static int opt_readback;
+void kgsl_ios_readback(int mode)
+{
+	opt_readback = mode;
+}
+
+static uint64_t read_range(uint64_t va, uint64_t len)
+{
+	uint64_t s = 0;
+	for (const volatile uint64_t *p = (const volatile uint64_t *)(uintptr_t)va; len >= 8; len -= 8)
+		s += *p++;
+	return s;
+}
+
 /* a submission was refused because a GPU fault invalidated its context */
 static volatile int gpu_faulted;
 int kgsl_ios_faulted(void)
@@ -508,6 +528,28 @@ static long gpu_command(struct kdev *d, struct gpu_command *c)
 		ibs[n].gpuaddr = co.gpuaddr;	/* as adreno_ringbuffer: the IB's own address */
 		ibs[n].bytes = co.size;
 		n++;
+	}
+	if (opt_readback) {
+		static volatile uint64_t sink __attribute__((used));
+		uint64_t s = 0;
+		for (uint32_t i = 0; i < d->nobjs; i++) {
+			struct kobj *o = &d->objs[i];
+			if (!o->live)
+				continue;
+			int want = opt_readback >= 2;
+			for (unsigned k = 0; k < n && !want; k++)
+				want = ibs[k].gpuaddr >= o->va && ibs[k].gpuaddr < o->va + o->size;
+			for (uint32_t k = 0; k < c->numobjs && !want; k++) {
+				struct command_object ob;
+				memcpy(&ob, (const uint8_t *)(uintptr_t)c->objlist + (uint64_t)k * c->objsize,
+				       c->objsize < sizeof(ob) ? c->objsize : sizeof(ob));
+				want = ob.gpuaddr >= o->va && ob.gpuaddr < o->va + o->size;
+			}
+			if (want)
+				s += read_range(o->va, o->size);
+		}
+		sink = s;	/* keeps the reads */
+		(void)sink;
 	}
 	uint64_t in[3] = { c->context_id, c->flags, c->timestamp }, out[1] = { 0 };
 #if defined(__aarch64__)	/* (the host test builds this file for x86) */

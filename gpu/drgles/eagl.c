@@ -748,8 +748,8 @@ static int gpu_up(void)
 	b[0] = 0;
 	for (int i = 0; i < MODE_WAIT_S * 2 && mode < 0; i++) {
 		if (read_small(MODE_FILE, b, sizeof(b)) == 0) {
-			if (!strncmp(b, "mode ", 5) && b[5] >= '0' && b[5] <= '3')
-				mode = b[5] - '0';
+			if (!strncmp(b, "mode ", 5) && b[5] >= '0' && b[5] <= '9')
+				mode = (int)atol(b + 5);
 			else
 				break;
 		} else {
@@ -761,7 +761,8 @@ static int gpu_up(void)
 		return 0;
 	}
 	LOG("self-test passed with framing %d (waited %.0f ms)\n", mode, now_ms() - t0);
-	kgsl_ios_framing((uint32_t)mode);
+	kgsl_ios_framing((uint32_t)mode & 3);	/* mode: framing bits 0-1, CPU read-back << 2 (bench -selftest) */
+	kgsl_ios_readback(mode >> 2);
 	if (load_gl() || build_stubs())
 		return 0;
 	gpu_state = 1;
@@ -917,6 +918,14 @@ __attribute__((constructor)) static void drgeagl_init(void)
 	int fd = open(LOG_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
 	if (fd >= 0)
 		host_log_to(fd);
+	/* also on the console (the kernel log): proof of the insertion even if the file cannot be written */
+	int con = open("/dev/console", O_WRONLY);
+	if (con >= 0) {
+		char m[96];
+		int n = snprintf(m, sizeof(m), "drgeagl: loaded into backboardd (pid %d), log fd %d\n", getpid(), fd);
+		write(con, m, (size_t)n);
+		close(con);
+	}
 	LOG("loaded into backboardd (pid %d)\n", getpid());
 	Class k = (Class)(void *)&eagl_class;
 	Class super = k ? class_getSuperclass(k) : 0;

@@ -1295,15 +1295,20 @@ static int selftest_child = -1;
 /* the parent: one child per mode, the verdict into `out` */
 static int selftest(const char *self, const char *out, char **envp)
 {
-	static const int order[4] = { 0, 1, 3, 2 };	/* runs: the old framing first, as the control */
-	static const int prefer[4] = { 1, 3, 2, 0 };	/* the verdict: closest to Linux first */
-	int pass[4] = { 0, 0, 0, 0 };
-	for (int i = 0; i < 4; i++) {
-		char m[2] = { (char)('0' + order[i]), 0 };
+	/*
+	 * mode = framing (DRGPU_UC_OPT_*, bits 0-1) | CPU read-back << 2 (kgsl_ios_readback). Boot #51:
+	 * framings 0-3 alone all fault. Runs: read-back of the submit's objects, then of every object;
+	 * the verdict is the cheaper one that passes.
+	 */
+	enum { NRUN = 2 };
+	static const int order[NRUN] = { 4, 8 };
+	int pass[16] = { 0 };
+	for (int i = 0; i < NRUN; i++) {
+		char m[3] = { (char)('0' + order[i] / 10), (char)('0' + order[i] % 10), 0 };
 		char *argv[] = { (char *)self, "-selftest-child", m, "/usr/local/drgles/adreno", 0 };
 		pid_t pid = 0;
 		int st = 0;
-		host_log("selftest: mode %d (kgsl preempt %d, wfi %d) starting\n", order[i], order[i] & 1, order[i] >> 1);
+		host_log("selftest: mode %d (framing %d, read-back %d) starting\n", order[i], order[i] & 3, order[i] >> 2);
 		if (posix_spawn(&pid, self, 0, 0, argv, envp) != 0 || waitpid(pid, &st, 0) != pid) {
 			host_log("selftest: mode %d: could not run\n", order[i]);
 			continue;
@@ -1312,9 +1317,9 @@ static int selftest(const char *self, const char *out, char **envp)
 		host_log("selftest: mode %d: %s (status 0x%x)\n", order[i], pass[order[i]] ? "PASS" : "FAIL", st);
 	}
 	char verdict[16] = "none\n";
-	for (int i = 0; i < 4; i++)
-		if (pass[prefer[i]]) {
-			snprintf(verdict, sizeof(verdict), "mode %d\n", prefer[i]);
+	for (int i = 0; i < NRUN; i++)
+		if (pass[order[i]]) {
+			snprintf(verdict, sizeof(verdict), "mode %d\n", order[i]);
 			break;
 		}
 	int fd = open(out, 0x0601 /* O_WRONLY | O_CREAT | O_TRUNC */, 0644);
@@ -1322,7 +1327,8 @@ static int selftest(const char *self, const char *out, char **envp)
 		write(fd, verdict, strlen(verdict));
 		close(fd);
 	}
-	host_log("selftest: passed %d %d %d %d (modes 0-3); verdict %s", pass[0], pass[1], pass[2], pass[3], verdict);
+	host_log("selftest: mode 4 %s, mode 8 %s; verdict %s", pass[4] ? "PASS" : "FAIL", pass[8] ? "PASS" : "FAIL",
+		 verdict);
 	return 0;
 }
 #endif
@@ -1477,11 +1483,15 @@ static int main_(int argc, char **argv, char **envp)
 		if (!strcmp(argv[i], "-selftest") && i + 1 < argc)	/* the boot job: children do the work */
 			return selftest(argv[0], argv[i + 1], envp);
 		if (!strcmp(argv[i], "-selftest-child") && i + 1 < argc) {
-			selftest_child = argv[++i][0] - '0';
-			if (selftest_child < 0 || selftest_child > 3)
+			selftest_child = 0;
+			for (const char *p = argv[++i]; *p >= '0' && *p <= '9'; p++)
+				selftest_child = selftest_child * 10 + (*p - '0');
+			if (selftest_child > 15)
 				return 2;
-			kgsl_ios_framing((uint32_t)selftest_child);
-			host_log("selftest child: framing %d\n", selftest_child);
+			kgsl_ios_framing((uint32_t)selftest_child & 3);
+			kgsl_ios_readback(selftest_child >> 2);
+			host_log("selftest child: mode %d (framing %d, read-back %d)\n", selftest_child, selftest_child & 3,
+				 selftest_child >> 2);
 			continue;
 		}
 		if (!strcmp(argv[i], "-dsb") || !strcmp(argv[i], "-deferfree")) {	/* boot #42 */

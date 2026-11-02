@@ -1,0 +1,51 @@
+drg: the vsync notification after the panel copy (patch 0915)
+
+The vsync timer sent IOMobileFramebuffer's vsync notification to its
+clients first and copied the latest swap to the panel afterwards (9-11 ms
+at 1.8 GHz). Clients take the vsync as the point where buffers they
+swapped before may be drawn into again, so at 60 Hz (a copy on every tick)
+they drew into surfaces still being read: boot #51, the wallpaper broke up
+while swiping (lines, white, half old). Copy first, then notify. The
+power-off fade keeps its order.
+
+diff --git a/iokit/Kernel/arm/DrgFramebuffer.cpp b/iokit/Kernel/arm/DrgFramebuffer.cpp
+--- a/iokit/Kernel/arm/DrgFramebuffer.cpp
++++ b/iokit/Kernel/arm/DrgFramebuffer.cpp
+@@ -236,12 +236,12 @@
+ 	};
+ 
+ 	IOLockLock(fb->fLock);
+-	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
+-		IOMobileFramebufferUserClient *client =
+-		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+-		client->notify(DRG_FB_NOTIFY_VSYNC, values, 6);
+-	}
+ 	if (fb->fPowerOff) {
++		for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
++			IOMobileFramebufferUserClient *client =
++			    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
++			client->notify(DRG_FB_NOTIFY_VSYNC, values, 6);
++		}
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
+ 		if (step <= 6) {
+@@ -275,6 +275,19 @@
+ 		drg_perf_fb(mach_absolute_time() - t0);
+ 		IOFreeData(rec, DRG_FB_SWAP_REC_SIZE);
+ 	}
++	/*
++	 * Boot #51 (60 Hz, a copy every tick): the wallpaper broke up (lines,
++	 * white, half old) while swiping. Clients take the vsync as leave to draw
++	 * into buffers they swapped earlier; it went out before the copy, so they
++	 * drew into surfaces the copy was still reading. Now after it.
++	 */
++	IOLockLock(fb->fLock);
++	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
++		IOMobileFramebufferUserClient *client =
++		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
++		client->notify(DRG_FB_NOTIFY_VSYNC, values, 6);
++	}
++	IOLockUnlock(fb->fLock);
+ 	sender->setTimeoutUS(DRG_FB_VSYNC_US);
+ }
+ 

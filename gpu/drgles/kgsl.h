@@ -29,6 +29,7 @@ void kgsl_ios_options(int dsb, int deferfree);	/* kgsl_ios.c only: boot #42 isol
 /* kgsl_ios.c only: DrgGPU submission framing (DRGPU_UC_OPT_*) for connections opened later */
 void kgsl_ios_framing(uint32_t opts);
 int kgsl_ios_faulted(void);			/* a submit was refused: GPU fault */
+void kgsl_ios_readback(int mode);	/* CPU read-back before submits: 1 its objects, 2 all */
 /* kgsl_ios.c only: a placeholder fd that stands for an IOSurface as a dma-buf (GPUOBJ_IMPORT type 3) */
 int kgsl_ios_surface_fd(uint32_t surface);			/* capture without waiting for each submit (phase 1 = right after it) */
 /* kgsl_cap.c, called by each platform's layer around every ioctl and mmap */
