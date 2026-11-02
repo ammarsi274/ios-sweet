@@ -565,7 +565,9 @@ static struct drg_dso *egl_dso;
  * native_handle (fds and ints), its stride, which gralloc1 functions EGL
  * itself asks for and calls ("gralloc1 fn N" in the call counts), the KGSL
  * import (kgsl_bench.c), and whether the rendered position pattern is
- * linear at gralloc's stride, read back through gralloc's own lock.
+ * linear at gralloc's stride, read back through gralloc's own lock. Also
+ * whether a clear + draw write anything outside the w x h image (gralloc's
+ * padding rows and columns hold a marker).
  *
  * gralloc1 function ids: Nokia's GrallocImpl::GetFunction (gralloc.sdm660.so
  * 0xcfcc: id - 1 indexes 25 cases; resolved through its GOT relocations):
@@ -673,6 +675,34 @@ static int gbuf_test(EGLDisplay d)
 	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
 	u32 fs = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+
+	/*
+	 * Padding check (drg/GPU-DRAW-PLAN.md): gralloc allocates aligned rows
+	 * (2464 for 1125x2436) at st pixels per row, the iOS surface has only h
+	 * rows. Fill everything outside the w x h image (rows h.. and columns
+	 * w..st-1 of each row) with a marker through a writable mapping of the
+	 * dma-buf before the draw; afterwards count what the GPU overwrote. The
+	 * marker's top byte 0xa5 never occurs in the pattern (y >> 8 <= 9).
+	 */
+	const uint32_t marker = 0xa55aa55a;
+	size_t blen = (size_t)(uint32_t)nh[3 + 10];	/* the handle's size field */
+	int ah = st ? (int)(blen / ((size_t)st * 4)) : 0;	/* rows gralloc allocated */
+	int perr = 0;
+	uint32_t *pad = st ? host_mmap_fd(0, blen, HOST_PROT_R | HOST_PROT_W, 1 /* MAP_SHARED */, nh[3], 0, &perr) : 0;
+	if (perr)
+		pad = 0;
+	long pad_words = 0, pad_kept_before = 0;
+	if (pad) {
+		for (int y = 0; y < ah; y++)
+			for (int x = y < h ? w : 0; x < (int)st; x++)
+				pad[(size_t)y * st + x] = marker, pad_words++;
+		for (int y = 0; y < ah; y++)
+			for (int x = y < h ? w : 0; x < (int)st; x++)
+				pad_kept_before += pad[(size_t)y * st + x] == marker;
+	}
+	host_log("gbuf: padding: buffer %zu bytes = %u px x %d rows; %ld marker words outside %dx%d, %ld read back before the draw (map err %d)\n",
+		 blen, st, ah, pad_words, w, h, pad_kept_before, perr);
+
 	u32 pw = program("attribute vec4 p;\nvoid main() { gl_Position = p; }\n",
 			 "precision highp float;\nvoid main() {\n"
 			 "  vec2 c = floor(gl_FragCoord.xy);\n"
@@ -684,9 +714,82 @@ static int gbuf_test(EGLDisplay d)
 	glEnableVertexAttribArray(0);
 	glDisableVertexAttribArray(1);
 	glViewport(0, 0, w, h);
+	/*
+	 * A clear first (CoreAnimation clears too): 0x33 bytes, neither marker nor
+	 * pattern. The draw then leaves out the last GL row (viewport h - 1 rows;
+	 * gl_FragCoord is unchanged), so that row must show the clear colour:
+	 * proof that the clear ran and went through the same buffer.
+	 */
+	glClearColor(0.2f, 0.2f, 0.2f, 0.2f);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glViewport(0, 0, w, h - 1);
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 	glFinish();
 	host_log("gbuf: fbo status %x, GL error %x\n", fs, glGetError());
+
+	/* what the draw did to the padding: kept marker, a pattern texel, or something else */
+	long row_kept = 0, row_pat = 0, row_other = 0, col_kept = 0, col_pat = 0, col_other = 0;
+	int last_row = -1;	/* last padding row with any word changed */
+	if (pad) {
+		for (int y = 0; y < ah; y++)
+			for (int x = y < h ? w : 0; x < (int)st; x++) {
+				uint32_t v = pad[(size_t)y * st + x];
+				const unsigned char *t = (const unsigned char *)&v;
+				int kept = v == marker, pat = !kept && t[3] <= 9;
+				if (y >= h) {
+					row_kept += kept, row_pat += pat, row_other += !kept && !pat;
+					if (!kept)
+						last_row = y;
+				} else {
+					col_kept += kept, col_pat += pat, col_other += !kept && !pat;
+				}
+			}
+		for (int y = h; y < ah; y += ah - h > 1 ? (ah - h - 1) / 2 : 1) {
+			const uint32_t *r = pad + (size_t)y * st;
+			host_log("gbuf: padding row %d: x0 %08x x%d %08x x%u %08x\n", y, r[0], w - 1, r[w - 1], st - 1, r[st - 1]);
+		}
+		host_log("gbuf: padding rows %d..%d after the draw: kept %ld, pattern-like %ld, other %ld; last changed row %d\n",
+			 h, ah - 1, row_kept, row_pat, row_other, last_row);
+		host_log("gbuf: padding columns %d..%u (rows 0..%d) after the draw: kept %ld, pattern-like %ld, other %ld\n",
+			 w, st - 1, h - 1, col_kept, col_pat, col_other);
+		/* which columns and rows changed, and to what (first two distinct values) */
+		int cfirst = -1, clast = -1, rfirst = -1, rlast = -1, rows_changed = 0;
+		uint32_t vals[2] = { 0, 0 };
+		long nval[3] = { 0, 0, 0 };
+		for (int y = 0; y < h; y++) {
+			int any = 0;
+			for (int x = w; x < (int)st; x++) {
+				uint32_t v = pad[(size_t)y * st + x];
+				if (v == marker)
+					continue;
+				any = 1;
+				if (cfirst < 0 || x < cfirst)
+					cfirst = x;
+				if (x > clast)
+					clast = x;
+				int k = nval[0] && v == vals[0] ? 0 : nval[1] && v == vals[1] ? 1 : !nval[0] ? 0 : !nval[1] ? 1 : 2;
+				if (k < 2)
+					vals[k] = v;
+				nval[k]++;
+			}
+			if (any) {
+				rows_changed++;
+				if (rfirst < 0)
+					rfirst = y;
+				rlast = y;
+			}
+		}
+		host_log("gbuf: padding columns changed: x %d..%d, %d rows between %d and %d; values %08x x%ld, %08x x%ld, others x%ld\n",
+			 cfirst, clast, rows_changed, rfirst, rlast, vals[0], nval[0], vals[1], nval[1], nval[2]);
+		for (int y = 0; y < h; y += y < 40 ? 1 : 256) {	/* changed columns: rows 0-39, then every 256th */
+			char line[200];
+			int n = snprintf(line, sizeof(line), "gbuf:   row %4d cols", y);
+			for (int x = w; x < (int)st && n < (int)sizeof(line) - 4; x++)
+				n += snprintf(line + n, sizeof(line) - n, "%c", pad[(size_t)y * st + x] == marker ? '.' : '#');
+			host_log("%s\n", line);
+		}
+		host_munmap(pad, blen);
+	}
 
 	/* the pattern through gralloc's own CPU mapping, rows st pixels apart */
 	void *cpu = 0;
@@ -711,9 +814,13 @@ static int gbuf_test(EGLDisplay d)
 		host_log("gbuf: dma-buf sync start rc %ld\n", host_ioctl(nh[3], 0x40086200UL, &sync));
 		r = 0;
 	}
-	long linear = 0, first_bad_x = -1, first_bad_y = -1;
+	long linear = 0, first_bad_x = -1, first_bad_y = -1, cleared = 0;
 	if (!r && cpu) {
-		for (int y = 0; y < h; y++)
+		const uint32_t *last = (const uint32_t *)cpu + (size_t)(h - 1) * st;	/* left out of the draw */
+		for (int x = 0; x < w; x++)
+			cleared += last[x] == 0x33333333;
+		host_log("gbuf: row %d (cleared, not drawn): %ld of %d texels 33333333, x0 %08x\n", h - 1, cleared, w, last[0]);
+		for (int y = 0; y < h - 1; y++)
 			for (int x = 0; x < w; x++) {
 				const unsigned char *t = (const unsigned char *)cpu + ((size_t)y * st + x) * 4;
 				/* GL's row 0 is the bottom one; gralloc's row 0 the top: check both orders */
@@ -725,7 +832,7 @@ static int gbuf_test(EGLDisplay d)
 			}
 		const unsigned char *t0 = cpu;
 		host_log("gbuf: lock %p, first texel %02x%02x%02x%02x, linear texels %ld of %d (first other (%ld,%ld))\n",
-			 cpu, t0[0], t0[1], t0[2], t0[3], linear, w * h, first_bad_x, first_bad_y);
+			 cpu, t0[0], t0[1], t0[2], t0[3], linear, w * (h - 1), first_bad_x, first_bad_y);
 		int32_t fence = -1;
 		if (lock_ok)
 			unlock(dev, hnd, &fence);
@@ -733,8 +840,14 @@ static int gbuf_test(EGLDisplay d)
 		host_log("gbuf: lock rc %d\n", r);
 	}
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	return check("gbuf: EGLImage render target linear at gralloc's stride", fs == GL_FRAMEBUFFER_COMPLETE &&
-		     linear == (long)w * h);
+	int ok = check("gbuf: EGLImage render target linear at gralloc's stride", fs == GL_FRAMEBUFFER_COMPLETE &&
+		       linear == (long)w * (h - 1) && cleared == w);
+	/*
+	 * TWRP 2026-11-02: the draw stays inside w x h; the clear also writes
+	 * columns w..align16(w)-1 (1125..1135) of every row, never a row >= h.
+	 * What the iOS display surface (h rows of st pixels) needs is the latter.
+	 */
+	return ok + check("gbuf: GPU wrote no row past h - 1 (inside an h-row surface)", pad && row_kept == (long)(ah - h) * st);
 }
 #endif
 
