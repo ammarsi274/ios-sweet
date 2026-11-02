@@ -394,6 +394,10 @@ typedef unsigned int u32;
 #define GL_NEAREST 0x2600
 #define GL_MAX_TEXTURE_IMAGE_UNITS 0x8872
 
+#define GL_FRAMEBUFFER 0x8D40
+#define GL_COLOR_ATTACHMENT0 0x8CE0
+#define GL_FRAMEBUFFER_COMPLETE 0x8CD5
+
 #define W 64
 #define H 64
 static unsigned char px[W * H * 4];
@@ -438,6 +442,10 @@ G(void, glBindTexture, (u32, u32))
 G(void, glActiveTexture, (u32))
 G(void, glTexImage2D, (u32, int, int, int, int, int, u32, u32, const void *))
 G(void, glTexParameteri, (u32, u32, int))
+G(void, glGenFramebuffers, (int, u32 *))
+G(void, glBindFramebuffer, (u32, u32))
+G(void, glFramebufferTexture2D, (u32, u32, u32, u32, int))
+G(u32, glCheckFramebufferStatus, (u32))
 
 static int load_gl(struct drg_dso *egl, struct drg_dso *gles)
 {
@@ -456,6 +464,8 @@ static int load_gl(struct drg_dso *egl, struct drg_dso *gles)
 	L(gles, glVertexAttribPointer) L(gles, glEnableVertexAttribArray) L(gles, glDisableVertexAttribArray)
 	L(gles, glDrawArrays) L(gles, glGenTextures) L(gles, glBindTexture) L(gles, glActiveTexture)
 	L(gles, glTexImage2D) L(gles, glTexParameteri)
+	L(gles, glGenFramebuffers) L(gles, glBindFramebuffer) L(gles, glFramebufferTexture2D)
+	L(gles, glCheckFramebufferStatus)
 	(void)gl;
 	return 0;
 }
@@ -509,6 +519,89 @@ static int check(const char *what, int ok)
 {
 	host_log("%s: %s\n", what, ok ? "OK" : "WRONG");
 	return ok ? 0 : 1;
+}
+
+/*
+ * -layout W H (with -capture FILE): how Nokia's driver lays out a W x H
+ * RGBA8 texture in GPU memory, for rendering straight into an iOS display
+ * IOSurface (drg/GPU-DRAW-PLAN.md). Every texel encodes its own position:
+ * R = x & 0xff, G = x >> 8, B = y & 0xff, A = y >> 8.
+ *   1. texture A uploaded with that pattern (glTexImage2D), drawn once so a
+ *      GPU command captures it;
+ *   2. texture B, no data, as an FBO colour attachment; a shader writes the
+ *      same pattern from gl_FragCoord.
+ * tools/cap-layout.py then finds both objects in the capture and reads off
+ * tiling and row pitch.
+ */
+static int layout_w, layout_h;
+
+static int layout_test(void)
+{
+	int w = layout_w, h = layout_h;
+	unsigned char *pat = host_alloc((size_t)w * h * 4);
+	for (int y = 0; y < h; y++)
+		for (int x = 0; x < w; x++) {
+			unsigned char *t = pat + ((size_t)y * w + x) * 4;
+			t[0] = x & 0xff, t[1] = x >> 8, t[2] = y & 0xff, t[3] = y >> 8;
+		}
+	u32 tex[2], fbo;
+	glGenTextures(2, tex);
+	glBindTexture(GL_TEXTURE_2D, tex[0]);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pat);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	/* a draw that samples texture A, so its upload is in GPU memory at a captured command */
+	static const float quad[] = { -1, -1, 0, 1, 1, -1, 0, 1, -1, 1, 0, 1, 1, 1, 0, 1 };
+	static const float uv[] = { 0, 0, 1, 0, 0, 1, 1, 1 };
+	u32 ps = program("attribute vec4 p;\nattribute vec2 t;\nvarying highp vec2 uv;\n"
+			 "void main() { gl_Position = p; uv = t; }\n",
+			 "varying highp vec2 uv;\nuniform lowp sampler2D tex;\n"
+			 "void main() { gl_FragColor = texture2D(tex, uv); }\n");
+	u32 pw = program("attribute vec4 p;\nvoid main() { gl_Position = p; }\n",
+			 "precision highp float;\nvoid main() {\n"
+			 "  vec2 c = floor(gl_FragCoord.xy);\n"
+			 "  gl_FragColor = vec4(mod(c.x, 256.0), floor(c.x / 256.0), mod(c.y, 256.0), floor(c.y / 256.0)) / 255.0;\n"
+			 "}\n");
+	if (!ps || !pw)
+		return 1;
+	glUseProgram(ps);
+	glUniform1i(glGetUniformLocation(ps, "tex"), 0);
+	glVertexAttribPointer(0, 4, GL_FLOAT, 0, 0, quad);
+	glVertexAttribPointer(1, 2, GL_FLOAT, 0, 0, uv);
+	glEnableVertexAttribArray(0);
+	glEnableVertexAttribArray(1);
+	glViewport(0, 0, W, H);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	glFinish();
+
+	glBindTexture(GL_TEXTURE_2D, tex[1]);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glGenFramebuffers(1, &fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex[1], 0);
+	u32 st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	glUseProgram(pw);
+	glDisableVertexAttribArray(1);
+	glViewport(0, 0, w, h);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	glFinish();
+	/* a few pixels back through GL, as the reference for the script */
+	unsigned char got[4 * 4];
+	static const int at[3][2] = { { 0, 0 }, { 1, 0 }, { 0, 1 } };
+	int ok = st == GL_FRAMEBUFFER_COMPLETE;
+	for (int i = 0; i < 3; i++)
+		glReadPixels(at[i][0], at[i][1], 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, got + 4 * i);
+	glReadPixels(w - 1, h - 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, got + 12);
+	ok = ok && got[0] == 0 && got[4] == 1 && got[10] == 1 && got[12] == ((w - 1) & 0xff) &&
+	     got[13] == (w - 1) >> 8 && got[14] == ((h - 1) & 0xff) && got[15] == (h - 1) >> 8;
+	host_log("layout %dx%d: fbo status %x, readback %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
+		 "%02x%02x%02x%02x, GL error %x\n", w, h, st, got[0], got[1], got[2], got[3], got[4], got[5], got[6],
+		 got[7], got[8], got[9], got[10], got[11], got[12], got[13], got[14], got[15], glGetError());
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	host_free(pat);
+	return check("layout render target pattern", ok);
 }
 
 static int run(void)
@@ -615,6 +708,8 @@ static int run(void)
 	fails += check("texture quadrants", q && count(0xff0000ff) == 1024 && count(0x00ff00ff) == 1024 &&
 					       count(0x0000ffff) == 1024 && count(0xffffffff) == 1024);
 	host_log("GL error %x\n", glGetError());
+	if (layout_w)
+		fails += layout_test();
 	eglTerminate(d);
 	return fails;
 }
@@ -653,6 +748,15 @@ static int main_(int argc, char **argv, char **envp)
 			continue;
 		}
 #endif
+		if (!strcmp(argv[i], "-layout") && i + 2 < argc) {	/* drg/GPU-DRAW-PLAN.md */
+			int v[2] = { 0, 0 };
+			for (int k = 0; k < 2; k++)
+				for (const char *p = argv[++i]; *p >= '0' && *p <= '9'; p++)
+					v[k] = v[k] * 10 + (*p - '0');
+			layout_w = v[0], layout_h = v[1];
+			host_log("layout test %dx%d\n", layout_w, layout_h);
+			continue;
+		}
 		if (!strcmp(argv[i], "-trace")) {
 			kgsl_trace();
 			continue;
