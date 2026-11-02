@@ -251,6 +251,21 @@ static struct { int (*open)(const struct hw_module *, const char *, void **); } 
 static int (*gr_real_open)(const struct hw_module *, const char *, void **);
 static void *(*gr_real_get)(void *, int32_t);
 static int (*real_hw_get_module)(const char *, const struct hw_module **);
+static const struct hw_module *gr_real_mod;	/* Nokia's module itself (-gbuf allocates through it) */
+
+/*
+ * Qualcomm's gralloc1 Perform (id 0x1000, variadic): which operations EGL
+ * asks for (-gbuf). AAPCS64 passes the variadic integer arguments in x2..x7
+ * as fixed ones, so forwarding six of them is exact for up to six.
+ */
+static int (*gr_real_perform)(void *, int, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+static int gr_perform(void *dev, int op, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f)
+{
+	int r = gr_real_perform(dev, op, a, b, c, d, e, f);
+	host_log("gralloc1 Perform(op %d, %#llx, %#llx, %#llx, %#llx) -> %d\n", op, (unsigned long long)a,
+		 (unsigned long long)b, (unsigned long long)c, (unsigned long long)d, r);
+	return r;
+}
 
 static void *gr_get(void *dev, int32_t desc)
 {
@@ -258,6 +273,10 @@ static void *gr_get(void *dev, int32_t desc)
 	host_log("gralloc1 getFunction(%d) -> %s\n", desc, f ? "fn" : "null");
 	if (!f)
 		return 0;
+	if (desc == 0x1000) {
+		gr_real_perform = f;
+		return (void *)gr_perform;
+	}
 	char *name = host_alloc(24);
 	snprintf(name, 24, "gralloc1 fn %d", desc);
 	if (nfwd == MAXFWD)
@@ -304,6 +323,7 @@ static int gr_hw_get_module(const char *id, const struct hw_module **out)
 	host_log("gralloc module tag %08x api %04x hal %04x id %s name \"%s\" author \"%s\"\n", m->tag, m->mver, m->hver,
 		 m->id, m->name, m->author);
 	gr_mod = *m;
+	gr_real_mod = m;
 	gr_real_open = m->methods->open;
 	gr_methods.open = gr_open;
 	gr_mod.methods = (void *)&gr_methods;
@@ -534,6 +554,189 @@ static int check(const char *what, int ok)
  * tiling and row pitch.
  */
 static int layout_w, layout_h;
+static int gbuf_w __attribute__((unused)), gbuf_h __attribute__((unused));	/* TWRP only */
+static struct drg_dso *egl_dso;
+
+#ifndef __APPLE__
+/*
+ * -gbuf W H (TWRP, with -nokiagralloc): a W x H RGBA_8888 buffer from
+ * Nokia's own gralloc (gralloc.sdm660.so) as an EGLImage render target, the
+ * way Android hands a display buffer to the GPU. Logged: the buffer's
+ * native_handle (fds and ints), its stride, which gralloc1 functions EGL
+ * itself asks for and calls ("gralloc1 fn N" in the call counts), the KGSL
+ * import (kgsl_bench.c), and whether the rendered position pattern is
+ * linear at gralloc's stride, read back through gralloc's own lock.
+ *
+ * gralloc1 function ids: Nokia's GrallocImpl::GetFunction (gralloc.sdm660.so
+ * 0xcfcc: id - 1 indexes 25 cases; resolved through its GOT relocations):
+ * 2 CreateBufferDescriptor, 3 Destroy, 4 SetConsumerUsage, 5 SetBufferDimensions,
+ * 6 SetColorFormat, 7 SetProducerUsage, 13 GetBufferStride, 14 AllocateBuffers,
+ * 16 ReleaseBuffer, 18 LockBuffer, 20 UnlockBuffer.
+ * ANativeWindowBuffer: eglSubDriverAndroid.so 0x54a4 checks magic '_bfr' at
+ * +0 and loads the handle from +0x60 for target EGL_NATIVE_BUFFER_ANDROID
+ * (0x3140); the rest is Android's layout around those (base 56 bytes,
+ * width/height/stride/format/usage at 56..72, layerCount 80, handle 96,
+ * usage64 104, 168 bytes in all).
+ */
+struct anwb {
+	int32_t magic, version;
+	void *reserved[4];
+	void (*inc)(void *), (*dec)(void *);
+	int32_t width, height, stride, format, usage_deprecated;
+	uint64_t layer_count;
+	void *reserved2;
+	const void *handle;
+	uint64_t usage;
+	void *reserved_proc[7];
+};
+_Static_assert(__builtin_offsetof(struct anwb, handle) == 0x60, "ANativeWindowBuffer handle");
+_Static_assert(sizeof(struct anwb) == 168, "ANativeWindowBuffer size");
+
+static void anwb_ref(void *p)
+{
+	(void)p;
+}
+
+#define GR_PROD_CPU_READ_OFTEN	(1ULL << 2)
+#define GR_PROD_GPU_RENDER	(1ULL << 10)
+#define GR_CONS_GPU_TEXTURE	(1ULL << 8)
+
+static int gbuf_test(EGLDisplay d)
+{
+	int w = gbuf_w, h = gbuf_h;
+	if (!gr_real_mod) {
+		host_log("gbuf: needs -nokiagralloc\n");
+		return 1;
+	}
+	void *dev = 0;
+	int r = gr_real_open(gr_real_mod, "gralloc", &dev);
+	if (r || !dev)
+		return check("gbuf: own gralloc device", 0);
+	void *(*get)(void *, int32_t) = ((struct gr1_dev *)dev)->get;
+	int (*create)(void *, uint64_t *) = get(dev, 2);
+	int (*cons)(void *, uint64_t, uint64_t) = get(dev, 4);
+	int (*dims)(void *, uint64_t, uint32_t, uint32_t) = get(dev, 5);
+	int (*fmt)(void *, uint64_t, int32_t) = get(dev, 6);
+	int (*prod)(void *, uint64_t, uint64_t) = get(dev, 7);
+	int (*stride)(void *, const void *, uint32_t *) = get(dev, 13);
+	int (*alloc)(void *, uint32_t, const uint64_t *, const void **) = get(dev, 14);
+	int (*lock)(void *, const void *, uint64_t, uint64_t, const void *, void **, int32_t) = get(dev, 18);
+	int (*unlock)(void *, const void *, int32_t *) = get(dev, 20);
+	uint64_t desc = 0;
+	const void *hnd = 0;
+	r = create(dev, &desc);
+	r = r ? r : dims(dev, desc, (uint32_t)w, (uint32_t)h);
+	r = r ? r : fmt(dev, desc, 1);	/* HAL_PIXEL_FORMAT_RGBA_8888 */
+	r = r ? r : prod(dev, desc, GR_PROD_GPU_RENDER | GR_PROD_CPU_READ_OFTEN);
+	r = r ? r : cons(dev, desc, GR_CONS_GPU_TEXTURE);
+	r = r ? r : alloc(dev, 1, &desc, &hnd);
+	uint32_t st = 0;
+	if (!r)
+		r = stride(dev, hnd, &st);
+	host_log("gbuf: gralloc allocate rc %d handle %p stride %u px\n", r, hnd, st);
+	if (r || !hnd)
+		return check("gbuf: gralloc allocate", 0);
+	const int32_t *nh = hnd;	/* native_handle: version, numFds, numInts, data[] */
+	host_log("gbuf: native_handle version %d fds %d ints %d\n", nh[0], nh[1], nh[2]);
+	for (int i = 0; i < nh[1] + nh[2] && i < 48; i += 8) {
+		char line[128];
+		int n = snprintf(line, sizeof(line), "gbuf:   data[%2d]", i);
+		for (int k = i; k < i + 8 && k < nh[1] + nh[2]; k++)
+			n += snprintf(line + n, sizeof(line) - n, " %08x", (uint32_t)nh[3 + k]);
+		host_log("%s\n", line);
+	}
+
+	static struct anwb b;
+	b.magic = 0x5f626672;	/* '_bfr' */
+	b.version = sizeof(b);
+	b.inc = b.dec = anwb_ref;
+	b.width = w, b.height = h, b.stride = (int32_t)st, b.format = 1;
+	b.usage_deprecated = (int32_t)(GR_PROD_GPU_RENDER | GR_CONS_GPU_TEXTURE);
+	b.layer_count = 1;
+	b.handle = hnd;
+	b.usage = GR_PROD_GPU_RENDER | GR_CONS_GPU_TEXTURE;
+	void *(*gpa)(const char *) = (void *(*)(const char *))drg_elf_sym(egl_dso, "eglGetProcAddress");
+	void *(*mkimg)(EGLDisplay, void *, u32, void *, const int *) = gpa ? gpa("eglCreateImageKHR") : 0;
+	void (*target)(u32, void *) = gpa ? gpa("glEGLImageTargetTexture2DOES") : 0;
+	if (!mkimg || !target)
+		return check("gbuf: eglCreateImageKHR / glEGLImageTargetTexture2DOES", 0);
+	static const int ia[] = { 0x30D2 /* EGL_IMAGE_PRESERVED_KHR */, 1, EGL_NONE };
+	void *img = mkimg(d, 0, 0x3140 /* EGL_NATIVE_BUFFER_ANDROID */, &b, ia);
+	host_log("gbuf: eglCreateImageKHR -> %p, EGL error %x\n", img, eglGetError());
+	if (!img)
+		return check("gbuf: EGLImage", 0);
+	u32 tex, fbo;
+	glGenTextures(1, &tex);
+	glBindTexture(GL_TEXTURE_2D, tex);
+	target(GL_TEXTURE_2D, img);
+	glGenFramebuffers(1, &fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+	u32 fs = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	u32 pw = program("attribute vec4 p;\nvoid main() { gl_Position = p; }\n",
+			 "precision highp float;\nvoid main() {\n"
+			 "  vec2 c = floor(gl_FragCoord.xy);\n"
+			 "  gl_FragColor = vec4(mod(c.x, 256.0), floor(c.x / 256.0), mod(c.y, 256.0), floor(c.y / 256.0)) / 255.0;\n"
+			 "}\n");
+	static const float quad[] = { -1, -1, 0, 1, 1, -1, 0, 1, -1, 1, 0, 1, 1, 1, 0, 1 };
+	glUseProgram(pw);
+	glVertexAttribPointer(0, 4, GL_FLOAT, 0, 0, quad);
+	glEnableVertexAttribArray(0);
+	glDisableVertexAttribArray(1);
+	glViewport(0, 0, w, h);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	glFinish();
+	host_log("gbuf: fbo status %x, GL error %x\n", fs, glGetError());
+
+	/* the pattern through gralloc's own CPU mapping, rows st pixels apart */
+	void *cpu = 0;
+	int lock_ok;
+	const int32_t rect[4] = { 0, 0, w, h };	/* gralloc1_rect {left, top, width, height} (a 0 rect: rc 3) */
+	r = lock(dev, hnd, GR_PROD_CPU_READ_OFTEN, 0, rect, &cpu, -1);
+	lock_ok = r == 0;
+	if (r) {
+		/*
+		 * lock refused the usage bits (rc 3, TWRP 2026-11-02), and the base in
+		 * the handle is not mapped here (SIGSEGV): map the buffer's dma-buf
+		 * (the handle's first fd) and read it between DMA_BUF_IOCTL_SYNC
+		 * start/end (_IOW('b', 0, u64 flags), READ = 1, END = 4).
+		 */
+		size_t len = (size_t)(uint32_t)nh[3 + 10];	/* the handle's size field */
+		int err = 0;
+		cpu = host_mmap_fd(0, len, HOST_PROT_R, 1 /* MAP_SHARED */, nh[3], 0, &err);
+		host_log("gbuf: lock rc %d; dma-buf fd %d mapped (%zu bytes) at %p, err %d\n", r, nh[3], len, cpu, err);
+		if (err)
+			cpu = 0;
+		uint64_t sync = 1;
+		host_log("gbuf: dma-buf sync start rc %ld\n", host_ioctl(nh[3], 0x40086200UL, &sync));
+		r = 0;
+	}
+	long linear = 0, first_bad_x = -1, first_bad_y = -1;
+	if (!r && cpu) {
+		for (int y = 0; y < h; y++)
+			for (int x = 0; x < w; x++) {
+				const unsigned char *t = (const unsigned char *)cpu + ((size_t)y * st + x) * 4;
+				/* GL's row 0 is the bottom one; gralloc's row 0 the top: check both orders */
+				int ok = t[0] == (x & 0xff) && t[1] == (x >> 8) && t[2] == (y & 0xff) && t[3] == (y >> 8);
+				if (ok)
+					linear++;
+				else if (first_bad_x < 0)
+					first_bad_x = x, first_bad_y = y;
+			}
+		const unsigned char *t0 = cpu;
+		host_log("gbuf: lock %p, first texel %02x%02x%02x%02x, linear texels %ld of %d (first other (%ld,%ld))\n",
+			 cpu, t0[0], t0[1], t0[2], t0[3], linear, w * h, first_bad_x, first_bad_y);
+		int32_t fence = -1;
+		if (lock_ok)
+			unlock(dev, hnd, &fence);
+	} else {
+		host_log("gbuf: lock rc %d\n", r);
+	}
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	return check("gbuf: EGLImage render target linear at gralloc's stride", fs == GL_FRAMEBUFFER_COMPLETE &&
+		     linear == (long)w * h);
+}
+#endif
 
 static int layout_test(void)
 {
@@ -613,6 +816,7 @@ static int run(void)
 		return 1;
 	}
 	host_log("loaded; %u TPIDR_EL0 reads rewritten\n", drg_elf_tp_rewrites());
+	egl_dso = egl;
 	if (load_gl(egl, gles))
 		return 1;
 
@@ -710,6 +914,10 @@ static int run(void)
 	host_log("GL error %x\n", glGetError());
 	if (layout_w)
 		fails += layout_test();
+#ifndef __APPLE__
+	if (gbuf_w)
+		fails += gbuf_test(d);
+#endif
 	eglTerminate(d);
 	return fails;
 }
@@ -745,6 +953,17 @@ static int main_(int argc, char **argv, char **envp)
 			deferfree |= !strcmp(argv[i], "-deferfree");
 			kgsl_ios_options(dsb, deferfree);
 			host_log("isolation: dsb %d deferfree %d\n", dsb, deferfree);
+			continue;
+		}
+#endif
+#ifndef __APPLE__
+		if (!strcmp(argv[i], "-gbuf") && i + 2 < argc) {	/* drg/GPU-DRAW-PLAN.md */
+			int v[2] = { 0, 0 };
+			for (int k = 0; k < 2; k++)
+				for (const char *p = argv[++i]; *p >= '0' && *p <= '9'; p++)
+					v[k] = v[k] * 10 + (*p - '0');
+			gbuf_w = v[0], gbuf_h = v[1];
+			host_log("gbuf test %dx%d\n", gbuf_w, gbuf_h);
 			continue;
 		}
 #endif

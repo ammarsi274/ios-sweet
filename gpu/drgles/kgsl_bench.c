@@ -20,8 +20,37 @@ static const struct {
 } known[] = {
 	{ 0x02, "DEVICE_GETPROPERTY" }, { 0x13, "DRAWCTXT_CREATE" }, { 0x14, "DRAWCTXT_DESTROY" },
 	{ 0x40, "SYNCSOURCE_CREATE" }, { 0x41, "SYNCSOURCE_DESTROY" }, { 0x45, "GPUOBJ_ALLOC" },
-	{ 0x46, "GPUOBJ_FREE" }, { 0x4a, "GPU_COMMAND" },
+	{ 0x46, "GPUOBJ_FREE" }, { 0x4a, "GPU_COMMAND" }, { 0x15, "MAP_USER_MEM" }, { 0x47, "GPUOBJ_INFO" },
+	{ 0x48, "GPUOBJ_IMPORT" }, { 0x49, "GPUOBJ_SYNC" },
 };
+
+/*
+ * Buffer imports (bench -gbuf, drg/GPU-DRAW-PLAN.md): how Nokia's EGL brings a
+ * gralloc buffer to the GPU. kgsl_gpuobj_import {priv, priv_len, flags,
+ * type, id} with priv -> {int fd} (dma-buf) or {u64 virtaddr}; then
+ * kgsl_gpuobj_info for the new id. HMD's msm_kgsl.h.
+ */
+static void log_import(unsigned nr, const void *arg, long rc, int after)
+{
+	const uint64_t *q = arg;
+	if (nr == 0x48) {
+		const uint32_t *t = (const uint32_t *)(q + 3);
+		uint64_t first = 0;
+		if (q[0] && q[1] >= 4)
+			memcpy(&first, (const void *)(uintptr_t)q[0], q[1] >= 8 ? 8 : 4);
+		host_log("kgsl GPUOBJ_IMPORT %s: priv_len %llu flags %#llx type %u id %u priv[0] %#llx rc %ld\n",
+			 after ? "after" : "before", (unsigned long long)q[1], (unsigned long long)q[2], t[0], t[1],
+			 (unsigned long long)first, rc);
+	} else if (nr == 0x47 && after) {
+		host_log("kgsl GPUOBJ_INFO: %llx %llx %llx %llx %llx %llx rc %ld\n", (unsigned long long)q[0],
+			 (unsigned long long)q[1], (unsigned long long)q[2], (unsigned long long)q[3],
+			 (unsigned long long)q[4], (unsigned long long)q[5], rc);
+	} else if (nr == 0x15) {
+		host_log("kgsl MAP_USER_MEM %s: %llx %llx %llx %llx %llx rc %ld\n", after ? "after" : "before",
+			 (unsigned long long)q[0], (unsigned long long)q[1], (unsigned long long)q[2],
+			 (unsigned long long)q[3], (unsigned long long)q[4], rc);
+	}
+}
 
 int kgsl_open(int flags)
 {
@@ -73,9 +102,14 @@ long kgsl_ioctl(int fd, unsigned long req, void *arg)
 		seen_req[nseen++] = req;
 	if (i < 64)
 		seen_count[i]++;
+	unsigned nr = req & 0xff;
+	if (((req >> 8) & 0xff) == 0x09)
+		log_import(nr, arg, 0, 0);
 	kgsl_cap_before(fd, req, arg);
 	long rc = host_ioctl(fd, req, arg);
 	kgsl_cap_after(fd, req, arg, rc);
+	if (((req >> 8) & 0xff) == 0x09)
+		log_import(nr, arg, rc, 1);
 	return rc;
 }
 
