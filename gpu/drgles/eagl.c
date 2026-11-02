@@ -228,13 +228,34 @@ static EGLSurface pbuf;
 static struct ectx *ctxs[8];
 static __thread struct ectx *cur;	/* the context current on this thread */
 
+/*
+ * An EGL context can be current on one thread at a time; initWithAPI:
+ * releases it again, so the thread that draws (CoreAnimation's render
+ * thread) can take it. Each new thread is logged once.
+ */
+static uint64_t threads_seen[8];
 static void make_current(struct ectx *c)
 {
+	static unsigned failed;
 	if (cur == c)
 		return;
-	if (!n_eglMakeCurrent(dpy, pbuf, pbuf, c->egl))
-		LOG("eglMakeCurrent failed: EGL error %x\n", n_eglGetError());
+	if (!n_eglMakeCurrent(dpy, pbuf, pbuf, c->egl)) {
+		if (failed++ < 8)
+			LOG("eglMakeCurrent failed on thread %llu: EGL error %x\n", (unsigned long long)host_thread_self(),
+			    n_eglGetError());
+		return;
+	}
 	cur = c;
+	uint64_t t = host_thread_self();
+	for (int i = 0; i < 8; i++) {
+		if (threads_seen[i] == t)
+			break;
+		if (!threads_seen[i]) {
+			threads_seen[i] = t;
+			LOG("context %p current on thread %llu\n", (void *)c, (unsigned long long)t);
+			break;
+		}
+	}
 }
 
 /* ---- frames: flush = finish (the panel copy must see a whole frame), fault check, timing ---- */
@@ -724,6 +745,7 @@ static int gpu_up(void)
 	/* the self-test's verdict: "mode N" (DRGPU_UC_OPT_* bits that passed) or "none" */
 	int mode = -1;
 	double t0 = now_ms();
+	b[0] = 0;
 	for (int i = 0; i < MODE_WAIT_S * 2 && mode < 0; i++) {
 		if (read_small(MODE_FILE, b, sizeof(b)) == 0) {
 			if (!strncmp(b, "mode ", 5) && b[5] >= '0' && b[5] <= '3')
@@ -794,6 +816,8 @@ static id m_initWithAPI(id self, SEL cmd, uint64_t api, id props)
 	n_glGetIntegerv(0x8872 /* GL_MAX_TEXTURE_IMAGE_UNITS */, &units);
 	LOG("EAGLContext %p: ES3 context, GL \"%s\" \"%s\", %d texture units\n", (void *)self,
 	    n_glGetString(0x1F01), n_glGetString(0x1F02), units);
+	n_eglMakeCurrent(dpy, 0, 0, 0);	/* free for whichever thread draws */
+	cur = 0;
 	return self;
 }
 
