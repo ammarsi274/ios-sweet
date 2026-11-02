@@ -700,6 +700,139 @@ static void drg_buck_scan(void)
 	}
 }
 
+/* real clock: PMU cycle counter (PMCR.E, PMCNTENSET bit 31) over 10 ms of the generic timer */
+static uint32_t gold_khz(void)
+{
+	uint64_t pmcr = rsr("pmcr_el0");
+	wsr("pmcr_el0", (pmcr | 1) & ~(1UL << 3));	/* E on, D off (count every cycle), as drg_perf.c */
+	wsr("pmcntenset_el0", 1UL << 31);
+	__asm__ volatile("isb");
+	uint64_t c0 = rsr("pmccntr_el0");
+	delay_ms(10);
+	uint64_t c1 = rsr("pmccntr_el0");
+	wsr("pmcr_el0", pmcr);
+	return (uint32_t)((c1 - c0) / 10);
+}
+
+static void delay_us(unsigned us)
+{
+	uint64_t frq, t0, t;
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frq));
+	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t0));
+	uint64_t n = (frq * us + 999999) / 1000000;
+	do {
+		__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t));
+	} while (t - t0 < n);
+}
+
+/*
+ * Gold clock 600 MHz -> 1,804.8 MHz (PLL L 0x20 -> 0x5e), the voltage left as
+ * it is. Facts (drg/CPU-SPEED.md, boots #46/#47): the Gold rail is one of the
+ * PM660 bucks S2/S3 (the CPU rails: the only bucks neither the RPM nor anyone
+ * else manages), both at 868 mV, and the SAW/CPRh never change it under iOS;
+ * this chip needs at most 824 mV at 1,804.8 MHz (CPR corner 5 ceiling, fuse
+ * combo 26), Linux runs it there. The cache memory settings (mem-acc, APM)
+ * follow the voltage, which does not change.
+ *
+ * Sequence, from HMD's clk-cpu-osm.c (the OSM sequencer's own steps and
+ * clk_osm_setup_cluster_pll):
+ *   1. RCG to GPLL0: CFG (0x17811054) source = GPLL_SEL 0x400, CMD
+ *      (0x17811050) = RCG_UPDATE 0x3, wait for RCG_UPDATE_SUCCESS 0x2
+ *      (update bit clear). A glitch-free switch: it completes only once both
+ *      sources run, else the core stays on the PLL (timeout: CFG restored).
+ *   2. PLL (0x17816000): MODE 0, L 0x5e, MODE 2, 10 us (PLL_WAIT_LOCK_TIME_US),
+ *      MODE 6, 50-75 us, MODE 7. USER_CTL / CONFIG stay as ABL left them
+ *      (Linux writes them only with qcom,osm-pll-setup, absent on this phone).
+ *   3. RCG back to the original CFG, CMD 0x3, wait as in 1.
+ * Done only if all of these read as expected first: PLL MODE 7 and L 0x20,
+ * the RCG source a PLL one (PLL_MAIN_SEL 0x300 / PLL_EARLY_SEL 0x500), S2
+ * and S3 on with at least 840 mV, and the clock on GPLL0 measured in
+ * 100-700 MHz. Every step is logged; the result is the measured clock.
+ */
+#define DRG_GOLD_CMD_RCGR	0x17811050UL
+#define DRG_GOLD_CFG_RCGR	0x17811054UL
+#define DRG_GOLD_L_FAST		0x5e
+
+static int gold_rcg_switch(uint32_t cfg)
+{
+	wr32(DRG_GOLD_CFG_RCGR, cfg);
+	__asm__ volatile("dsb sy" ::: "memory");
+	wr32(DRG_GOLD_CMD_RCGR, 0x3);
+	__asm__ volatile("dsb sy" ::: "memory");
+	for (int i = 0; i < 1000; i++) {
+		if (!(rd32(DRG_GOLD_CMD_RCGR) & 1))
+			return 0;
+		delay_us(1);
+	}
+	return 1;
+}
+
+static uint32_t drg_gold_speedup(void)
+{
+	uint32_t mode = rd32(DRG_PLL_GOLD), l = rd32(DRG_PLL_GOLD + 4);
+	uint32_t cmd = rd32(DRG_GOLD_CMD_RCGR), cfg = rd32(DRG_GOLD_CFG_RCGR);
+	cpu_put("speed pll mode", DRG_PLL_GOLD, mode, 0);
+	cpu_put("speed pll L", DRG_PLL_GOLD + 4, l, 0);
+	cpu_put("speed rcg cmd", DRG_GOLD_CMD_RCGR, cmd, 0);
+	cpu_put("speed rcg cfg", DRG_GOLD_CFG_RCGR, cfg, 0);
+	uint32_t src = cfg & 0x700;
+	if (mode != 0x7 || l != 0x20 || (src != 0x300 && src != 0x500) || (cmd & 1)) {
+		cpu_put("speed SKIP state", 0, 1, 1);
+		return gold_khz();
+	}
+	static const uint32_t rails[2] = { 0x117, 0x11a };	/* PM660 S2, S3 */
+	for (unsigned i = 0; i < 2; i++) {
+		unsigned int apid = drg_spmi_apid(rails[i]);
+		uint8_t en = 0, lb = 0, ub = 0;
+		int rc = apid == 0xffff ? -1 : drg_spmi_read(apid, 0x46, &en);
+		if (!rc)
+			rc = drg_spmi_read(apid, 0x42, &lb);
+		if (!rc)
+			rc = drg_spmi_read(apid, 0x43, &ub);
+		uint32_t mv = (uint32_t)ub << 8 | lb;
+		cpu_put("speed rail mV", rails[i] << 8 | 0x42, mv, rc ? 1 : 0);
+		if (rc || !(en & 0x80) || mv < 840) {
+			cpu_put("speed SKIP rail", 0, 2, 1);
+			return gold_khz();
+		}
+	}
+
+	if (gold_rcg_switch((cfg & ~0x700u) | 0x400)) {
+		cpu_put("speed rcg->gpll0 timeout", DRG_GOLD_CMD_RCGR, rd32(DRG_GOLD_CMD_RCGR), 1);
+		(void)gold_rcg_switch(cfg);
+		return gold_khz();
+	}
+	uint32_t khz = gold_khz();
+	cpu_put("speed kHz on gpll0", DRG_GOLD_CFG_RCGR, khz, 0);
+	if (khz < 100000 || khz > 700000) {
+		int rc = gold_rcg_switch(cfg);
+		cpu_put("speed SKIP gpll0 clock, back", 0, (uint32_t)rc, 1);
+		return gold_khz();
+	}
+
+	wr32(DRG_PLL_GOLD, 0x0);
+	__asm__ volatile("dsb sy" ::: "memory");
+	wr32(DRG_PLL_GOLD + 4, DRG_GOLD_L_FAST);
+	__asm__ volatile("dsb sy" ::: "memory");
+	wr32(DRG_PLL_GOLD, 0x2);
+	__asm__ volatile("dsb sy" ::: "memory");
+	delay_us(10);
+	wr32(DRG_PLL_GOLD, 0x6);
+	__asm__ volatile("dsb sy" ::: "memory");
+	delay_us(75);
+	wr32(DRG_PLL_GOLD, 0x7);
+	__asm__ volatile("dsb sy" ::: "memory");
+	delay_us(100);
+	cpu_put("speed pll mode new", DRG_PLL_GOLD, rd32(DRG_PLL_GOLD), 0);
+	cpu_put("speed pll L new", DRG_PLL_GOLD + 4, rd32(DRG_PLL_GOLD + 4), 0);
+
+	int rc = gold_rcg_switch(cfg);
+	cpu_put("speed rcg->pll", DRG_GOLD_CMD_RCGR, rd32(DRG_GOLD_CMD_RCGR), rc ? 1 : 0);
+	khz = gold_khz();
+	cpu_put("speed kHz final", 0, khz, 0);
+	return khz;
+}
+
 static void drg_cpu_probe(void)
 {
 	static const uint16_t saw[] = { 0xc04, 0xfd0, 0x00, 0x04, 0x0c, 0x900, 0x904, 0x908, 0x90c,
@@ -710,21 +843,19 @@ static void drg_cpu_probe(void)
 		cpu_rd("saw4", DRG_SAW_GOLD + saw[i]);
 	for (unsigned o = 0; o < 0x40; o += 4)
 		cpu_rd("pll gold", DRG_PLL_GOLD + o);
-	/* real clock: PMU cycle counter (PMCR.E, PMCNTENSET bit 31) over 10 ms of the generic timer */
-	uint64_t pmcr = rsr("pmcr_el0");
-	wsr("pmcr_el0", (pmcr | 1) & ~(1UL << 3));	/* E on, D off (count every cycle), as drg_perf.c */
-	wsr("pmcntenset_el0", 1UL << 31);
-	__asm__ volatile("isb");
-	uint64_t c0 = rsr("pmccntr_el0");
-	delay_ms(10);
-	uint64_t c1 = rsr("pmccntr_el0");
-	wsr("pmcr_el0", pmcr);
-	cpu_put("gold kHz (cycles/10ms)", 0, (uint32_t)((c1 - c0) / 10), 0);
+	uint32_t khz = gold_khz();
+	cpu_put("gold kHz (cycles/10ms)", 0, khz, 0);
 	drg_buck_scan();
+	/* the log goes out before the speed-up too, so a hang there still leaves the readings */
 	int rc = drg_emmc_log_open();
 	if (rc == 0)
 		rc = drg_emmc_log_write(cpu_log, cpu_len);
-	con_hex2("CPU PROBE", "log=", (uint32_t)rc, "kHz=", (uint32_t)((c1 - c0) / 10));
+	con_hex2("CPU PROBE", "log=", (uint32_t)rc, "kHz=", khz);
+	if (rc == 0) {
+		khz = drg_gold_speedup();
+		rc = drg_emmc_log_write(cpu_log, cpu_len);
+		con_hex2("CPU SPEED", "log=", (uint32_t)rc, "kHz=", khz);
+	}
 }
 
 /*
