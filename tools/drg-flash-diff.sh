@@ -2,13 +2,15 @@
 # Flash a new iOS root image by writing only the 1 MiB chunks that differ from
 # what the phone holds now. Run in Git Bash with the phone in TWRP (RAM boot).
 #   drg-flash-diff.sh NEW_IMAGE_WSL
-# NEW_IMAGE_WSL without .img plus .chunks must exist (tools/chunkhash NEW 16384). Steps:
+# NEW_IMAGE_WSL without .img plus .chunks must exist (tools/chunkhash NEW CHUNKS: 16384 for the 16 GiB
+# images, the whole partition (49399) once the volume grew, boot #46). Steps:
 #   1. the phone hashes its userdata in 1 MiB chunks (tools/chunkhash, ~1 min)
 #   2. chunkdiff-simg.py builds a sparse image of NEW's differing chunks
 #   3. reboot to the bootloader, fastboot flash userdata (no boot afterwards)
 set -euo pipefail
 NEW=$1
-N=16384
+N=$(MSYS_NO_PATHCONV=1 wsl -d Ubuntu -u root -e sh -c "wc -l < ${NEW%.img}.chunks" | tr -cd '0-9')
+[ "$N" -gt 0 ] || { echo "no chunk list ${NEW%.img}.chunks"; exit 1; }
 WORK=/f/Nokia-HackiOs/logs/flash
 mkdir -p $WORK
 DEV=$(MSYS_NO_PATHCONV=1 adb shell 'readlink -f /dev/block/bootdevice/by-name/userdata' | tr -d '\r')

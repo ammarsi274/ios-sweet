@@ -35,9 +35,9 @@
 #include "../drgpu/drgpu_uc.h"
 
 #define LIBS_DIR	"/usr/local/drgles/adreno"
-#define LOG_FILE	"/private/var/log/drgeagl.log"
+#define LOG_FILE	"/private/var/tmp/drgeagl.log"	/* backboardd runs as mobile: /var/log and /var/run are root's */
 #define MODE_FILE	"/private/var/run/drg-gpu-mode"
-#define BOOT_FILE	"/private/var/run/drgeagl-boot"
+#define BOOT_FILE	"/private/var/tmp/drgeagl-boot"
 #define MODE_WAIT_S	150
 
 /* ---- libSystem, libobjc, IOSurface (declarations as the SDK has them) ---- */

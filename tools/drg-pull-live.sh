@@ -59,6 +59,7 @@ echo "$(date +%T) changed: $(awk '{s+=$2} END {print s+0}' $WORK/runs.txt) MiB i
 
 # runs.txt comes from Windows Python: strip CR, or count= gets "9\r" and dd sends nothing
 tr -d '\r' < $WORK/runs.txt | while read -r s n; do
+	[ -n "$s" ] || continue	# nothing changed: python printed one empty line
 	MSYS_NO_PATHCONV=1 adb exec-out "dd if=$DEV bs=1048576 skip=$s count=$n 2>/dev/null" > $WORK/run.bin
 	[ "$(stat -c %s $WORK/run.bin)" -eq $((n * 1048576)) ] || { echo "short pull at chunk $s"; exit 1; }
 	dd if=$WORK/run.bin of="$COPY" bs=1048576 seek=$s conv=notrunc status=none
