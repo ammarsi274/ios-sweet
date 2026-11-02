@@ -623,17 +623,15 @@ static void drg_osm_probe(void)
  * Gold cluster's SAW4 ("gold-l2", 0x17812000; register offsets from HMD's
  * msm-spm.c msm_spm_reg_offsets_saw2_v4_1), the CPRh status (cprh-ctrl
  * 0x179c4000, PERF_CPRH_STATUS 0x179c7aa4 from the device tree's panic list),
- * the Gold PLL (perfcl_pll 0x17816000) and apcs_common (0x179d1000), and the
- * Gold cores' real clock from the cycle counter over 10 ms. Blocks never read
- * before go through a spare Gold core (drg_probe_read), so a read that never
- * completes cannot stop the boot; that core powers itself off after each read.
- * Results go to the userdata log area (emmc.c) for TWRP. Nothing is written
- * to any of these blocks.
+ * the Gold PLL (perfcl_pll 0x17816000), and the Gold cores' real clock from
+ * the cycle counter over 10 ms. Plain reads, as drg_osm_probe's of the OSM
+ * block next to them: boot #45 tried a spare core (drg_probe_read) and every
+ * CPU_ON was refused at this point of the boot (core never started, then
+ * PSCI refused). CPRh is not read: it needs its own core clock. Results go to
+ * the userdata log area (emmc.c) for TWRP. Nothing is written to any of these
+ * blocks.
  */
 #define DRG_SAW_GOLD		0x17812000UL
-#define DRG_CPRH_GOLD		0x179c4000UL
-#define DRG_APCS_COMMON		0x179d1000UL
-#define DRG_PROBE_CORE		3
 
 static char cpu_log[2048];
 static unsigned cpu_len;
@@ -659,12 +657,9 @@ static void cpu_put(const char *label, uint32_t a, uint32_t v, int rc)
 		cpu_log[cpu_len++] = t[i];
 }
 
-static void cpu_safe(const char *label, uintptr_t a)
+static void cpu_rd(const char *label, uintptr_t a)
 {
-	uint32_t v = 0;
-	uint64_t esr = 0;
-	int rc = drg_probe_read(DRG_PROBE_CORE, a, &v, &esr, 20000);
-	cpu_put(label, (uint32_t)a, rc ? (uint32_t)esr : v, rc);
+	cpu_put(label, (uint32_t)a, rd32(a), 0);
 }
 
 static void drg_cpu_probe(void)
@@ -674,13 +669,9 @@ static void drg_cpu_probe(void)
 	cpu_len = 0;
 	cpu_put("PLL L gold (direct)", (uint32_t)(DRG_PLL_GOLD + 4), rd32(DRG_PLL_GOLD + 4), 0);
 	for (unsigned i = 0; i < sizeof(saw) / sizeof(saw[0]); i++)
-		cpu_safe("saw4", DRG_SAW_GOLD + saw[i]);
-	cpu_safe("cprh status", 0x179c7aa4);
-	cpu_safe("cprh version", DRG_CPRH_GOLD + 0x0);
+		cpu_rd("saw4", DRG_SAW_GOLD + saw[i]);
 	for (unsigned o = 0; o < 0x40; o += 4)
-		cpu_safe("pll gold", DRG_PLL_GOLD + o);
-	for (unsigned o = 0; o < 0x20; o += 4)
-		cpu_safe("apcs common", DRG_APCS_COMMON + o);
+		cpu_rd("pll gold", DRG_PLL_GOLD + o);
 	/* real clock: PMU cycle counter (PMCR.E, PMCNTENSET bit 31) over 10 ms of the generic timer */
 	uint64_t pmcr = rsr("pmcr_el0");
 	wsr("pmcr_el0", (pmcr | 1) & ~(1UL << 3));	/* E on, D off (count every cycle), as drg_perf.c */

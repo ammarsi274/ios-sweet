@@ -8,14 +8,29 @@
 # next to it; seed it once from a verified pull (drg-pull-changed.sh's
 # logs/pull/phone.txt). drg-pull-changed.sh copied 16 GiB and hashed 16 GiB
 # for each pull (boot #36: 19 min for 102 MiB of changes).
+#
+# The whole userdata partition is covered (whole MiB chunks; the iOS volume
+# grows to it, tools/ios/drg-growfs.c). A list shorter than the partition
+# (a copy made while the volume was 16 GiB) is extended once with --extend,
+# which must run BEFORE iOS writes beyond the old end (before the first boot
+# with drg-growfs): the new chunks are taken as the phone has them then,
+# without copying them (iOS has not written there: free space for HFS), so
+# later pulls bring over only what iOS writes there.
+#   drg-pull-live.sh COPY_IMAGE_GITBASH [--extend]
 set -euo pipefail
 COPY=$1
+EXTEND=${2:-}
 LIST=$COPY.chunks
-N=16384                                  # 16 GiB in 1 MiB chunks
 WORK=/f/Nokia-HackiOs/logs/pull
 mkdir -p $WORK
-[ -s "$LIST" ] && [ "$(wc -l < "$LIST")" = $N ] || { echo "no hash list $LIST"; exit 1; }
 DEV=$(MSYS_NO_PATHCONV=1 adb shell 'readlink -f /dev/block/bootdevice/by-name/userdata' | tr -d '\r')
+SECTORS=$(MSYS_NO_PATHCONV=1 adb shell "cat /sys/class/block/${DEV##*/}/size" | tr -d '\r')
+N=$((SECTORS * 512 / 1048576))           # whole 1 MiB chunks of userdata
+HAVE=$( [ -s "$LIST" ] && wc -l < "$LIST" || echo 0)
+[ "$HAVE" -gt 0 ] || { echo "no hash list $LIST"; exit 1; }
+if [ "$HAVE" != $N ] && [ "$EXTEND" != --extend ]; then
+	echo "hash list has $HAVE chunks, userdata $N: run once with --extend before booting with drg-growfs"; exit 1
+fi
 [ "$(MSYS_NO_PATHCONV=1 adb shell "grep -c $DEV /proc/mounts" | tr -d '\r')" = 0 ] || { echo "userdata is mounted"; exit 1; }
 MSYS_NO_PATHCONV=1 adb push F:/Nokia-HackiOs/ios-sweet/tools/chunkhash.arm64 /tmp/chunkhash >/dev/null
 MSYS_NO_PATHCONV=1 adb shell chmod 755 /tmp/chunkhash
@@ -23,6 +38,12 @@ MSYS_NO_PATHCONV=1 adb shell chmod 755 /tmp/chunkhash
 echo "$(date +%T) hashing on the phone"
 MSYS_NO_PATHCONV=1 adb shell "/tmp/chunkhash $DEV $N" | tr -d '\r' > $WORK/phone.txt
 [ "$(wc -l < $WORK/phone.txt)" = $N ] || { echo "phone list incomplete"; exit 1; }
+if [ "$HAVE" -lt $N ]; then
+	# --extend: chunks HAVE..N-1 as the phone has them now, not copied (see above)
+	tail -n +$((HAVE + 1)) $WORK/phone.txt >> "$LIST"
+	truncate -s $((N * 1048576)) "$COPY"
+	echo "$(date +%T) extended the list from $HAVE to $N chunks (copy is now $N MiB, the new part not copied)"
+fi
 python -c "
 import sys
 b=[l.split()[1] for l in open(sys.argv[1])]; p=[l.split()[1] for l in open(sys.argv[2])]

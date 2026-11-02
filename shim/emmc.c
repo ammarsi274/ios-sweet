@@ -11,7 +11,7 @@
  * interrupt status bits and issues CMD17 (READ_SINGLE_BLOCK), polled; if
  * the command queue engine is enabled it sends nothing and just reports
  * that. R6 adds ONE card write: write_test() writes a single block in the
- * unused part of userdata (past the 16 GiB iOS image), verifies it and
+ * shim's scratch area (userdata's last 64 MiB), verifies it and
  * writes the original contents back.
  *
  * Data path, from measurements (drg/BOOTLOG.md #10, #11): reading through
@@ -68,13 +68,18 @@
 #define XFER_WRITE_ONE_DMA	((1U << 1) | (1U << 0))
 
 /*
- * R6 write test target, from measurements: the iOS root image flashed to
- * userdata is exactly 16 GiB (0x2000000 sectors); the test block lies
- * 0x3000000 sectors (24 GiB) into userdata, 8 GiB past the image's end.
+ * R6 write test target: the first block of the scratch area below.
  */
-#define IOS_IMAGE_SECTORS	0x2000000ULL
-#define WTEST_OFFSET		0x3000000ULL
-#define WTEST_MARGIN		0x100000ULL	/* 512 MiB that must stay between image and test block */
+#define SCRATCH_SECTORS		0x20000ULL	/* 64 MiB at the end of userdata, never part of the iOS volume */
+/*
+ * The shim's scratch area: the last 64 MiB of userdata. The iOS HFS+ volume
+ * starts at the partition's first sector and is grown (tools/ios/drg-growfs.c)
+ * to the partition size minus exactly this much, so the R6 test block, the
+ * log and the multi-block test region below never overlap it. (Until
+ * 2026-11-01 they sat 24 GiB in, past the then 16 GiB volume.)
+ */
+#define SCRATCH(first, last)	((last) + 1 - SCRATCH_SECTORS)
+#define WTEST_IN_SCRATCH	0x0ULL
 
 /* ADMA2 descriptor attributes: valid, end, action = transfer */
 #define ADMA2_VALID		(1U << 0)
@@ -225,13 +230,13 @@ static unsigned count_diff(const uint32_t *want)
 static void write_test(uint64_t first, uint64_t last)
 {
 	static uint32_t pattern[128];
-	uint64_t lba = first + WTEST_OFFSET;
+	uint64_t lba = SCRATCH(first, last) + WTEST_IN_SCRATCH;
 	uint32_t resp = 0, st = 0;
 	int rc;
 
 	con_skip();
 	con_hex("WTEST lba", lba);
-	if (lba < first + IOS_IMAGE_SECTORS + WTEST_MARGIN || lba > last || lba > 0xffffffffULL) {
+	if (last - first + 1 <= SCRATCH_SECTORS || lba < SCRATCH(first, last) || lba > last || lba > 0xffffffffULL) {
 		con_str("WTEST", "refused: block not in the safe range");
 		return;
 	}
@@ -336,11 +341,10 @@ void drg_emmc_probe(void)
 /*
  * GPU bring-up log (G2): up to LOG_BLOCKS blocks of text written to the
  * unused part of userdata, right after the R6 test block, so TWRP can read
- * the result back (dd from userdata at LOG_OFFSET). Same safety rule as the
- * R6 test: only past the 16 GiB iOS image plus the margin (the iOS HFS+
- * volume measured 2026-10-30: block size 4096, 4194304 blocks = 16 GiB).
+ * the result back (dd from userdata's last 64 MiB + LOG_IN_SCRATCH). Same
+ * safety rule as the R6 test: only inside the scratch area.
  */
-#define LOG_OFFSET		(WTEST_OFFSET + 0x100ULL)
+#define LOG_IN_SCRATCH		(WTEST_IN_SCRATCH + 0x100ULL)
 #define LOG_BLOCKS		64
 
 static uint64_t log_lba;	/* 0: not found / not safe */
@@ -368,10 +372,10 @@ int drg_emmc_log_open(void)
 		if (!name_is(off, "userdata"))
 			continue;
 		uint64_t first = u64_at(off + 32), last = u64_at(off + 40);
-		uint64_t lba = first + LOG_OFFSET;
+		uint64_t lba = SCRATCH(first, last) + LOG_IN_SCRATCH;
 		ud_first = first;
 		ud_last = last;
-		if (lba < first + IOS_IMAGE_SECTORS + WTEST_MARGIN || lba + LOG_BLOCKS - 1 > last ||
+		if (last - first + 1 <= SCRATCH_SECTORS || lba < SCRATCH(first, last) || lba + LOG_BLOCKS - 1 > last ||
 		    lba + LOG_BLOCKS > 0xffffffffULL)
 			return -5;
 		log_lba = lba;
@@ -432,7 +436,7 @@ int drg_emmc_log_write(const char *buf, unsigned len)
 #define MB_ORIG			0x84b00000UL
 #define MB_WORK			0x84d00000UL
 #define MB_SECTORS		4096U		/* 2 MiB */
-#define MB_OFFSET		(WTEST_OFFSET + 0x1000ULL)	/* past the R6 block and the log */
+#define MB_IN_SCRATCH		(WTEST_IN_SCRATCH + 0x1000ULL)	/* past the R6 block and the log */
 
 static uint32_t mb_acmd_err;
 
@@ -550,9 +554,9 @@ void drg_emmc_mb_test(void)
 	con_str("EMMC", "multi-block test (CMD18/CMD25 + Auto-CMD23)");
 	mb_len = 0;
 	mb_put("MB log open rc", (uint32_t)drg_emmc_log_open());
-	uint64_t lba = ud_first + MB_OFFSET;
+	uint64_t lba = SCRATCH(ud_first, ud_last) + MB_IN_SCRATCH;
 	mb_put("MB lba", (uint32_t)lba);
-	if (!log_lba || lba < ud_first + IOS_IMAGE_SECTORS + WTEST_MARGIN || lba + MB_SECTORS - 1 > ud_last ||
+	if (!log_lba || lba < SCRATCH(ud_first, ud_last) || lba + MB_SECTORS - 1 > ud_last ||
 	    lba + MB_SECTORS > 0xffffffffULL) {
 		mb_put("MB refused: not in the safe range", 0);
 		goto out;
