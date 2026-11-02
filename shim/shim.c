@@ -619,6 +619,85 @@ static void drg_osm_probe(void)
 }
 
 /*
+ * Gold CPU voltage path, read-only (drg/CPU-SPEED.md): what ABL leaves in the
+ * Gold cluster's SAW4 ("gold-l2", 0x17812000; register offsets from HMD's
+ * msm-spm.c msm_spm_reg_offsets_saw2_v4_1), the CPRh status (cprh-ctrl
+ * 0x179c4000, PERF_CPRH_STATUS 0x179c7aa4 from the device tree's panic list),
+ * the Gold PLL (perfcl_pll 0x17816000) and apcs_common (0x179d1000), and the
+ * Gold cores' real clock from the cycle counter over 10 ms. Blocks never read
+ * before go through a spare Gold core (drg_probe_read), so a read that never
+ * completes cannot stop the boot; that core powers itself off after each read.
+ * Results go to the userdata log area (emmc.c) for TWRP. Nothing is written
+ * to any of these blocks.
+ */
+#define DRG_SAW_GOLD		0x17812000UL
+#define DRG_CPRH_GOLD		0x179c4000UL
+#define DRG_APCS_COMMON		0x179d1000UL
+#define DRG_PROBE_CORE		3
+
+static char cpu_log[2048];
+static unsigned cpu_len;
+
+static void cpu_put(const char *label, uint32_t a, uint32_t v, int rc)
+{
+	static const char hex[] = "0123456789abcdef";
+	char t[64];
+	unsigned n = 0;
+	while (*label && n < 24)
+		t[n++] = *label++;
+	t[n++] = ' ';
+	for (int sh = 28; sh >= 0; sh -= 4)
+		t[n++] = hex[(a >> sh) & 15];
+	t[n++] = ' ';
+	for (int sh = 28; sh >= 0; sh -= 4)
+		t[n++] = hex[(v >> sh) & 15];
+	t[n++] = ' ';
+	t[n++] = rc == 0 ? 'o' : 'x';
+	t[n++] = rc == 0 ? 'k' : (char)('0' - rc);
+	t[n++] = '\n';
+	for (unsigned i = 0; i < n && cpu_len < sizeof(cpu_log); i++)
+		cpu_log[cpu_len++] = t[i];
+}
+
+static void cpu_safe(const char *label, uintptr_t a)
+{
+	uint32_t v = 0;
+	uint64_t esr = 0;
+	int rc = drg_probe_read(DRG_PROBE_CORE, a, &v, &esr, 20000);
+	cpu_put(label, (uint32_t)a, rc ? (uint32_t)esr : v, rc);
+}
+
+static void drg_cpu_probe(void)
+{
+	static const uint16_t saw[] = { 0xc04, 0xfd0, 0x00, 0x04, 0x0c, 0x900, 0x904, 0x908, 0x90c,
+					0x40, 0x44, 0x48, 0x4c, 0x50, 0x54, 0xc0c, 0xc10, 0xc14, 0xc18 };
+	cpu_len = 0;
+	cpu_put("PLL L gold (direct)", (uint32_t)(DRG_PLL_GOLD + 4), rd32(DRG_PLL_GOLD + 4), 0);
+	for (unsigned i = 0; i < sizeof(saw) / sizeof(saw[0]); i++)
+		cpu_safe("saw4", DRG_SAW_GOLD + saw[i]);
+	cpu_safe("cprh status", 0x179c7aa4);
+	cpu_safe("cprh version", DRG_CPRH_GOLD + 0x0);
+	for (unsigned o = 0; o < 0x40; o += 4)
+		cpu_safe("pll gold", DRG_PLL_GOLD + o);
+	for (unsigned o = 0; o < 0x20; o += 4)
+		cpu_safe("apcs common", DRG_APCS_COMMON + o);
+	/* real clock: PMU cycle counter (PMCR.E, PMCNTENSET bit 31) over 10 ms of the generic timer */
+	uint64_t pmcr = rsr("pmcr_el0");
+	wsr("pmcr_el0", (pmcr | 1) & ~(1UL << 3));	/* E on, D off (count every cycle), as drg_perf.c */
+	wsr("pmcntenset_el0", 1UL << 31);
+	__asm__ volatile("isb");
+	uint64_t c0 = rsr("pmccntr_el0");
+	delay_ms(10);
+	uint64_t c1 = rsr("pmccntr_el0");
+	wsr("pmcr_el0", pmcr);
+	cpu_put("gold kHz (cycles/10ms)", 0, (uint32_t)((c1 - c0) / 10), 0);
+	int rc = drg_emmc_log_open();
+	if (rc == 0)
+		rc = drg_emmc_log_write(cpu_log, cpu_len);
+	con_hex2("CPU PROBE", "log=", (uint32_t)rc, "kHz=", (uint32_t)((c1 - c0) / 10));
+}
+
+/*
  * Nokia buttons, read-only, watched for 15 s so they can be pressed (boot #21).
  * From this phone's device tree: PM660 (SPMI SID 0) qcom,power-on@800 with
  * kpdpwr = power (code 0x74) and resin = volume up (code 0x73, pon_2);
@@ -845,6 +924,8 @@ static void __attribute__((noreturn)) drg_gold_main(void)
 
 	stage = "gold osm";
 	drg_osm_probe();
+	stage = "gold cpu probe";
+	drg_cpu_probe();
 	stage = "gold touch";
 	drg_touch_probe();
 	stage = "gold ldo";
