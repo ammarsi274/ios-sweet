@@ -263,6 +263,7 @@ private:
 	uint64_t            fBytes;
 	IOMemoryMap        *fMemstore;
 	uint32_t            fSyncSrc;
+	uint32_t            fOpts;              /* DRGPU_UC_OPT_* */
 
 	IOReturn kgslProperty(uint32_t type, IOExternalMethodArguments *args);
 	IOReturn objInsert(IOMemoryDescriptor *md, uint64_t size, bool ro, bool surface, uint64_t *out);
@@ -1175,7 +1176,18 @@ DrgGPU::submit(DrgGPUUserClient *c, uint32_t ctx, uint32_t flags, uint32_t *ts,
 	if (rc != kIOReturnSuccess) {
 		return rc;
 	}
-	if (drgpu_submit(&fG, &c->fSpace, ctx, kib, n, *ts) == 0) {
+	/* KGSL_CONTEXT_PREEMPT_STYLE_MASK 0x0E000000 >> 25 == FINEGRAIN (2), msm_kgsl.h */
+	uint32_t sflags = 0;
+	if (c->fOpts & DRGPU_UC_OPT_KGSL_PREEMPT) {
+		sflags |= DRGPU_SUBMIT_KGSL_PREEMPT;
+		if (((fCtx[ctx].flags & 0x0E000000u) >> 25) == 2) {
+			sflags |= DRGPU_SUBMIT_FINEGRAIN;
+		}
+	}
+	if (c->fOpts & DRGPU_UC_OPT_WFI) {
+		sflags |= DRGPU_SUBMIT_WFI;
+	}
+	if (drgpu_submit_ex(&fG, &c->fSpace, ctx, kib, n, *ts, sflags) == 0) {
 		IOLog("DRG GPU: submit failed: %s\n", drgpu_err(&fG));
 		return kIOReturnNoResources;
 	}
@@ -1696,6 +1708,22 @@ DrgGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a
 		out[0] = DRGPU_UC_VERSION;
 		outCount = 1;
 		break;
+	case DRGPU_UC_SET_OPTIONS: {
+		if (nin < 1 || (in[0] & ~(uint64_t)DRGPU_UC_OPT_ALL) != 0) {
+			rc = kIOReturnBadArgument;
+			break;
+		}
+		IOLockLock(fGPU->fLock);
+		fOpts = (uint32_t)in[0];
+		IOLockUnlock(fGPU->fLock);
+		char name[32];
+		proc_selfname(name, sizeof(name));
+		IOLog("DRG GPU: %s options 0x%x (kgsl preempt %u, wfi %u)\n", name, fOpts,
+		    (fOpts & DRGPU_UC_OPT_KGSL_PREEMPT) != 0, (fOpts & DRGPU_UC_OPT_WFI) != 0);
+		out[0] = fOpts;
+		outCount = 1;
+		break;
+	}
 	default:
 		rc = kIOReturnUnsupported;
 		break;

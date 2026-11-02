@@ -33,6 +33,11 @@ struct drgpu_fw {
 #define DRGPU_VA_PM4		0xf8058000ULL
 #define DRGPU_VA_PFP		0xf805d000ULL
 #define DRGPU_VA_SMMU_INFO	0xf80e8000ULL	/* 4 KiB, struct a5xx_cp_smmu_info (0x840) */
+/* ours (KGSL allocates them among its globals): ring 0's a5xx_cp_preemption_record and its counters */
+#define DRGPU_VA_PREEMPT	0xf80e9000ULL	/* A5XX_CP_CTXRECORD_SIZE_IN_BYTES */
+#define DRGPU_VA_PREEMPT_CNT	0xf80f9000ULL	/* 4 KiB, A5XX_CP_CTXRECORD_PREEMPTION_COUNTER_SIZE used */
+#define DRGPU_VA_GLOBAL_END	0xf80fa000ULL
+#define DRGPU_PREEMPT_SIZE	0x10000
 #define DRGPU_MEMSTORE_SIZE	0x2000
 #define DRGPU_RING_DWORDS	8192		/* RB_CNTL 0x20c */
 
@@ -64,7 +69,8 @@ struct drgpu {
 	struct drgpu_os os;
 	struct drgpu_fw fw;
 	uintptr_t gcc, gpucc, gpu, smmu, ldo, tcsr, rpm_ram, rpm_ipc;
-	struct drgpu_mem ring, memstore, scratch, pm4, pfp, setstate, smmu_info;
+	struct drgpu_mem ring, memstore, scratch, pm4, pfp, setstate, smmu_info, preempt, preempt_cnt;
+	int preempt_inited;		/* _preemption_init sent since the last CP start */
 	struct drgpu_space kspace;	/* the kernel's: CB0's TTBR0 after attach */
 	struct drgpu_space *cur_space;	/* the one the CP has selected */
 	uint8_t asid_used[256];
@@ -99,6 +105,22 @@ uint32_t drgpu_gpu_khz(struct drgpu *g);	/* measured with an RBBM counter */
 struct drgpu_ib { uint64_t gpuaddr; uint32_t dwords; };
 uint32_t drgpu_submit(struct drgpu *g, struct drgpu_space *s, uint32_t ctx, const struct drgpu_ib *ibs, unsigned n,
 		      uint32_t ts);
+/*
+ * The same with options (flags 0 = drgpu_submit):
+ *   KGSL_PREEMPT  the framing KGSL adds with preemption enabled (HMD
+ *                 adreno_ringbuffer.c / adreno_a5xx_preempt.c): pre-IB
+ *                 save address and preemption enables, SET_RENDER_MODE null
+ *                 and yield after the IBs, CONTEXT_SWITCH_YIELD after the
+ *                 timestamp; _preemption_init (a5xx_post_start) before the
+ *                 first such submission after each CP start
+ *   FINEGRAIN     the context's preemption style is fine-grain (2)
+ *   WFI           CP_WAIT_FOR_IDLE + CP_WAIT_FOR_ME right before the IBs
+ */
+#define DRGPU_SUBMIT_KGSL_PREEMPT	0x1u
+#define DRGPU_SUBMIT_FINEGRAIN		0x2u
+#define DRGPU_SUBMIT_WFI		0x4u
+uint32_t drgpu_submit_ex(struct drgpu *g, struct drgpu_space *s, uint32_t ctx, const struct drgpu_ib *ibs,
+			 unsigned n, uint32_t ts, uint32_t flags);
 uint32_t drgpu_retired(struct drgpu *g, uint32_t ctx);	/* memstore eoptimestamp */
 int drgpu_wait(struct drgpu *g, uint32_t ctx, uint32_t ts, uint32_t timeout_us);	/* 0 or -1 */
 uint32_t drgpu_irq(struct drgpu *g);		/* reads and clears RBBM_INT_0_STATUS */

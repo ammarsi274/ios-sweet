@@ -15,7 +15,7 @@
 #include <stdint.h>
 
 #define DRGPU_UC_SERVICE	"DrgGPU"
-#define DRGPU_UC_VERSION	1
+#define DRGPU_UC_VERSION	2	/* 2: SET_OPTIONS */
 
 enum drgpu_uc_selector {
 	/* in: KGSL property type; struct out: its bytes, exactly the size KGSL returns */
@@ -47,8 +47,20 @@ enum drgpu_uc_selector {
 	DRGPU_UC_OBJ_SYNC = 11,
 	/* out: DRGPU_UC_VERSION */
 	DRGPU_UC_GET_VERSION = 12,
+	/* in: DRGPU_UC_OPT_* bits for this connection's later submissions; out: the bits in effect */
+	DRGPU_UC_SET_OPTIONS = 13,
 	DRGPU_UC_COUNT
 };
+
+/*
+ * Submission framing per connection (drg/GPU-DRAW-PLAN.md, the back-to-back
+ * fault): KGSL_PREEMPT = what KGSL adds with preemption enabled (a context
+ * created with preemption style 2 gets the fine-grain variant), WFI = the CP
+ * waits for idle before the IBs. 0 = the framing of boots #36-#44.
+ */
+#define DRGPU_UC_OPT_KGSL_PREEMPT	0x1u
+#define DRGPU_UC_OPT_WFI		0x2u
+#define DRGPU_UC_OPT_ALL		0x3u
 
 struct drgpu_uc_ib {
 	uint64_t gpuaddr;	/* 4-byte aligned */

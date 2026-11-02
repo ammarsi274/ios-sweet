@@ -91,7 +91,26 @@
 #define CP_SET_DRAW_STATE	0x43
 #define CP_SMMU_TABLE_UPDATE	0x53
 #define CP_SET_PROTECTED_MODE	0x5f
+#define CP_YIELD_ENABLE		0x1c
+#define CP_PREEMPT_ENABLE_GLOBAL 0x69
+#define CP_PREEMPT_ENABLE_LOCAL	0x6a
+#define CP_CONTEXT_SWITCH_YIELD	0x6b
+#define CP_SET_RENDER_MODE	0x6c
+#define CP_CONTEXT_SWITCH_SAVE_ADDR_LO 0x83e	/* a5xx_reg.h */
+#define CP_CONTEXT_SWITCH_SAVE_ADDR_HI 0x83f
 #define CACHE_FLUSH_TS		4
+
+/* struct a5xx_cp_preemption_record (HMD adreno_a5xx.h), byte offsets */
+#define PREC_MAGIC		0
+#define PREC_INFO		4
+#define PREC_DATA		8
+#define PREC_CNTL		12
+#define PREC_RPTR		16
+#define PREC_WPTR		20
+#define PREC_RPTR_ADDR		24
+#define PREC_RBASE		32
+#define PREC_COUNTER		40
+#define A5XX_CP_CTXRECORD_MAGIC_REF 0x27C4BAFCU
 #define CP_CNTL			0x831	/* a5xx_reg.h: APRIV */
 #define UCHE_INVALIDATE0	0xe95
 
@@ -275,8 +294,20 @@ int drgpu_init(struct drgpu *g, const struct drgpu_os *os, const struct drgpu_fw
 	    os->alloc(os->ctx, 0x1000, 0x1000, &g->scratch) ||
 	    os->alloc(os->ctx, 0x1000, 0x1000, &g->setstate) ||
 	    os->alloc(os->ctx, 0x1000, 0x1000, &g->smmu_info) ||
+	    os->alloc(os->ctx, DRGPU_PREEMPT_SIZE, 0x1000, &g->preempt) ||
+	    os->alloc(os->ctx, 0x1000, 0x1000, &g->preempt_cnt) ||
 	    alloc_fw(g, fw->pm4, fw->pm4_len, &g->pm4) || alloc_fw(g, fw->pfp, fw->pfp_len, &g->pfp))
 		return fail(g, "drgpu: memory");
+	/* a5xx_preemption_ringbuffer_init for ring 0 (the memory comes zeroed) */
+	volatile uint32_t *rec = g->preempt.va;
+	rec[PREC_MAGIC / 4] = A5XX_CP_CTXRECORD_MAGIC_REF;
+	rec[PREC_CNTL / 4] = A5XX_CP_RB_CNTL_DEFAULT;
+	rec[PREC_RPTR_ADDR / 4] = (uint32_t)DRGPU_VA_SCRATCH;	/* SCRATCH_RPTR_GPU_ADDR(ring 0) */
+	rec[PREC_RPTR_ADDR / 4 + 1] = (uint32_t)(DRGPU_VA_SCRATCH >> 32);
+	rec[PREC_RBASE / 4] = (uint32_t)DRGPU_VA_RING;
+	rec[PREC_RBASE / 4 + 1] = (uint32_t)(DRGPU_VA_RING >> 32);
+	rec[PREC_COUNTER / 4] = (uint32_t)DRGPU_VA_PREEMPT_CNT;
+	rec[PREC_COUNTER / 4 + 1] = (uint32_t)(DRGPU_VA_PREEMPT_CNT >> 32);
 	/* the NOP IB the pagetable switch runs to stall prefetch (adreno_iommu.c) */
 	((volatile uint32_t *)g->setstate.va)[256] = pkt7(CP_NOP, 1);
 	((volatile uint32_t *)g->setstate.va)[257] = 0;
@@ -361,7 +392,9 @@ static int map_globals(struct drgpu *g, struct drgpu_pt *pt)
 	       drgpu_pt_map(pt, DRGPU_VA_RING, g->ring.pa, 4 * DRGPU_RING_DWORDS, DRGPU_PT_RO) ||
 	       drgpu_pt_map(pt, DRGPU_VA_PM4, g->pm4.pa, g->pm4.size, DRGPU_PT_RO) ||
 	       drgpu_pt_map(pt, DRGPU_VA_PFP, g->pfp.pa, g->pfp.size, DRGPU_PT_RO) ||
-	       drgpu_pt_map(pt, DRGPU_VA_SMMU_INFO, g->smmu_info.pa, 0x1000, DRGPU_PT_RW) ? -1 : 0;
+	       drgpu_pt_map(pt, DRGPU_VA_SMMU_INFO, g->smmu_info.pa, 0x1000, DRGPU_PT_RW) ||
+	       drgpu_pt_map(pt, DRGPU_VA_PREEMPT, g->preempt.pa, DRGPU_PREEMPT_SIZE, DRGPU_PT_RW) ||
+	       drgpu_pt_map(pt, DRGPU_VA_PREEMPT_CNT, g->preempt_cnt.pa, 0x1000, DRGPU_PT_RW) ? -1 : 0;
 }
 
 static int space_init(struct drgpu *g, struct drgpu_space *s, uint32_t asid)
@@ -444,7 +477,7 @@ int drgpu_map(struct drgpu *g, struct drgpu_space *s, uint64_t gpuaddr, uint64_t
 	if (!s)
 		s = &g->kspace;
 	/* the global region belongs to the kernel in every space */
-	if (gpuaddr < DRGPU_VA_SMMU_INFO + 0x1000 && gpuaddr + len > DRGPU_VA_SETSTATE && s != &g->kspace)
+	if (gpuaddr < DRGPU_VA_GLOBAL_END && gpuaddr + len > DRGPU_VA_SETSTATE && s != &g->kspace)
 		return fail(g, "drgpu: mapping over the global region");
 	return drgpu_pt_map(&s->pt, gpuaddr, pa, len, ro ? DRGPU_PT_RO : DRGPU_PT_RW);
 }
@@ -664,6 +697,11 @@ int drgpu_cp_start(struct drgpu *g)
 	si[3] = (uint32_t)(ttbr0 >> 32);
 	si[4] = 0xDECAFBAD;
 	si[5] = 0;		/* CONTEXTIDR of the kernel's space (CB0 attach leaves it 0) */
+	/* a5xx_preemption_start: the ring's record starts from rptr = wptr = 0 */
+	volatile uint32_t *rec = g->preempt.va;
+	rec[PREC_RPTR / 4] = 0;
+	rec[PREC_WPTR / 4] = 0;
+	g->preempt_inited = 0;
 	__asm__ volatile("dsb sy" ::: "memory");
 	for (unsigned i = 0; i < sizeof(a5xx_start_seq) / sizeof(a5xx_start_seq[0]); i++)
 		drgpu_wr(R(g, a5xx_start_seq[i][0]), a5xx_start_seq[i][1]);
@@ -761,17 +799,60 @@ static void emit_space_switch(struct drgpu *g, struct drgpu_space *s)
 	g->cur_space = s;
 }
 
+/* CP_CONTEXT_SWITCH_SAVE_ADDR = the ring's record, register protection off around it */
+static void emit_save_addr(struct drgpu *g)
+{
+	emit(g, pkt7(CP_SET_PROTECTED_MODE, 1));
+	emit(g, 0);
+	emit(g, pkt4(CP_CONTEXT_SWITCH_SAVE_ADDR_LO, 1));
+	emit(g, (uint32_t)DRGPU_VA_PREEMPT);
+	emit(g, pkt4(CP_CONTEXT_SWITCH_SAVE_ADDR_HI, 1));
+	emit(g, (uint32_t)(DRGPU_VA_PREEMPT >> 32));
+	emit(g, pkt7(CP_SET_PROTECTED_MODE, 1));
+	emit(g, 1);
+}
+
+/* CP_CONTEXT_SWITCH_YIELD with a NULL address (no data write) */
+static void emit_switch_yield(struct drgpu *g, uint32_t v)
+{
+	emit(g, pkt7(CP_CONTEXT_SWITCH_YIELD, 4));
+	emit(g, 0);
+	emit(g, 0);
+	emit(g, v);
+	emit(g, 1);	/* interrupt on preemption completion */
+}
+
+#define PREEMPT_DWORDS	(19 + 14 + 8 + 5 + 2)	/* init, pre-IB, yield enable, post-IB, WFI */
+
 uint32_t drgpu_submit(struct drgpu *g, struct drgpu_space *s, uint32_t ctx, const struct drgpu_ib *ibs, unsigned n,
 		      uint32_t ts)
 {
+	return drgpu_submit_ex(g, s, ctx, ibs, n, ts, 0);
+}
+
+uint32_t drgpu_submit_ex(struct drgpu *g, struct drgpu_space *s, uint32_t ctx, const struct drgpu_ib *ibs,
+			 unsigned n, uint32_t ts, uint32_t flags)
+{
 	uint64_t msva = DRGPU_VA_MEMSTORE;
+	int kp = (flags & DRGPU_SUBMIT_KGSL_PREEMPT) != 0, fine = kp && (flags & DRGPU_SUBMIT_FINEGRAIN);
 	if (!s)
 		s = &g->kspace;
 	if (!g->cp_running || !s->live || ctx == 0 || ctx >= DRGPU_MS_RB)
 		return 0;
-	if (ring_space(g, 4 * n + 32 + SWITCH_DWORDS + 2))
+	if (ring_space(g, 4 * n + 32 + SWITCH_DWORDS + 2 + PREEMPT_DWORDS))
 		return 0;
 	g->rb_ts++;
+	if (kp && !g->preempt_inited) {	/* a5xx_post_start -> _preemption_init */
+		emit_save_addr(g);
+		emit(g, pkt7(CP_PREEMPT_ENABLE_GLOBAL, 1));
+		emit(g, 0);
+		emit(g, pkt7(CP_PREEMPT_ENABLE_LOCAL, 1));
+		emit(g, 1);
+		emit(g, pkt7(CP_YIELD_ENABLE, 1));	/* yield in the ring only */
+		emit(g, 1);
+		emit_switch_yield(g, 0);
+		g->preempt_inited = 1;
+	}
 	if (s != g->cur_space)
 		emit_space_switch(g, s);
 	if (ctx != g->cur_ctx) {	/* adreno_drawctxt_switch / __add_curr_ctxt_cmds */
@@ -781,13 +862,36 @@ uint32_t drgpu_submit(struct drgpu *g, struct drgpu_space *s, uint32_t ctx, cons
 		emit(g, 0x12);
 		g->cur_ctx = ctx;
 	}
+	if (kp) {	/* a5xx_preemption_pre_ibsubmit */
+		emit(g, pkt7(CP_PREEMPT_ENABLE_GLOBAL, 1));
+		emit(g, fine ? 2 : 0);
+		emit_save_addr(g);
+		emit(g, pkt7(CP_PREEMPT_ENABLE_LOCAL, 1));
+		emit(g, fine ? 1 : 0);
+		emit(g, pkt7(CP_YIELD_ENABLE, 1));	/* CONTEXT_SWITCH_YIELD in the IB2s */
+		emit(g, 2);
+	}
 	emit_mem_write(g, msva + ctx * DRGPU_MS_ENTRY + DRGPU_MS_SOP, ts);
 	emit_mem_write(g, msva + DRGPU_MS_RB * DRGPU_MS_ENTRY + DRGPU_MS_SOP, g->rb_ts);
+	if (flags & DRGPU_SUBMIT_WFI) {
+		emit(g, pkt7(CP_WAIT_FOR_IDLE, 0));
+		emit(g, pkt7(CP_WAIT_FOR_ME, 0));
+	}
 	for (unsigned i = 0; i < n; i++) {
 		emit(g, pkt7(CP_INDIRECT_BUFFER_PFE, 3));
 		emit(g, (uint32_t)ibs[i].gpuaddr);
 		emit(g, (uint32_t)(ibs[i].gpuaddr >> 32));
 		emit(g, ibs[i].dwords);
+	}
+	if (kp) {	/* a5xx_preemption_yield_enable: the IB's render mode ends here */
+		emit(g, pkt7(CP_SET_RENDER_MODE, 5));
+		emit(g, 0);
+		emit(g, 0);
+		emit(g, 0);
+		emit(g, 0);
+		emit(g, 0);
+		emit(g, pkt7(CP_YIELD_ENABLE, 1));
+		emit(g, 1);
 	}
 	emit(g, pkt7(CP_EVENT_WRITE, 4));	/* end of pipe: per-context timestamp, interrupt */
 	emit(g, CACHE_FLUSH_TS | 1U << 31);
@@ -795,6 +899,8 @@ uint32_t drgpu_submit(struct drgpu *g, struct drgpu_space *s, uint32_t ctx, cons
 	emit(g, (uint32_t)((msva + ctx * DRGPU_MS_ENTRY + DRGPU_MS_EOP) >> 32));
 	emit(g, ts);
 	emit_mem_write(g, msva + DRGPU_MS_RB * DRGPU_MS_ENTRY + DRGPU_MS_EOP, g->rb_ts);
+	if (kp)		/* a5xx_preemption_post_ibsubmit */
+		emit_switch_yield(g, 1);
 	kick(g);
 	return ts;
 }
