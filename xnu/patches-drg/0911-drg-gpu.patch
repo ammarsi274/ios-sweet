@@ -2038,10 +2038,10 @@ index 0000000..f24ec61
 +#endif
 diff --git a/iokit/Kernel/arm/DrgGPU.cpp b/iokit/Kernel/arm/DrgGPU.cpp
 new file mode 100755
-index 0000000..f15c0fb
+index 0000000..1cb9b7b
 --- /dev/null
 +++ b/iokit/Kernel/arm/DrgGPU.cpp
-@@ -0,0 +1,1661 @@
+@@ -0,0 +1,1667 @@
 +/*
 + * DRG (Nokia 6.1 Plus) GPU: the Adreno 512 for iOS userland.
 + *
@@ -3094,8 +3094,14 @@ index 0000000..f15c0fb
 +int
 +DrgGPU::ctxCreate(DrgGPUUserClient *owner, uint32_t flags)
 +{
++	/*
++	 * Not the ring's current context: KGSL's ring holds a reference on its
++	 * active context (adreno_drawctxt_switch), so that id stays taken until
++	 * another context runs, and a new context always gets the switch
++	 * commands (current context in the memstore, UCHE invalidate).
++	 */
 +	for (uint32_t i = 1; i < DRG_GPU_KCTX; i++) {
-+		if (fCtx[i].owner == NULL) {
++		if (fCtx[i].owner == NULL && i != fG.cur_ctx) {
 +			bzero(&fCtx[i], sizeof(fCtx[i]));
 +			fCtx[i].owner = owner;
 +			fCtx[i].flags = flags;

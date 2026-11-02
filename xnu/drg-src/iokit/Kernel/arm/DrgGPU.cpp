@@ -1050,8 +1050,14 @@ DrgGPU::recover(thread_call_param_t p0, thread_call_param_t p1 __unused)
 int
 DrgGPU::ctxCreate(DrgGPUUserClient *owner, uint32_t flags)
 {
+	/*
+	 * Not the ring's current context: KGSL's ring holds a reference on its
+	 * active context (adreno_drawctxt_switch), so that id stays taken until
+	 * another context runs, and a new context always gets the switch
+	 * commands (current context in the memstore, UCHE invalidate).
+	 */
 	for (uint32_t i = 1; i < DRG_GPU_KCTX; i++) {
-		if (fCtx[i].owner == NULL) {
+		if (fCtx[i].owner == NULL && i != fG.cur_ctx) {
 			bzero(&fCtx[i], sizeof(fCtx[i]));
 			fCtx[i].owner = owner;
 			fCtx[i].flags = flags;

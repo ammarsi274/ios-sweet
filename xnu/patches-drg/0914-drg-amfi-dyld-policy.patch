@@ -1,0 +1,65 @@
+drg: answer dyld's AMFI policy query (patch 0914)
+
+dyld asks AMFI which DYLD_* variables a process may use:
+amfi_check_dyld_policy_self() -> __mac_syscall("AMFI", 0x5a,
+&{uint64_t input; uint64_t *output}) (iOS 16.7.16 dyld 0x5cc0c). __mac_syscall
+only calls a policy named exactly "AMFI" with mpo_policy_syscall; ours was
+"DRG AMFI" without one, so dyld got ENOPOLICY, took flags 0 and skipped every
+DYLD_* variable (Security.allowEnvVarsPath gates the env loop in
+PathOverrides). Name the policy "AMFI" and answer 0x5a with path variables
+(bit 1, DYLD_INSERT_LIBRARIES) and non-fatal failed inserts (bit 5). Other
+AMFI calls still get ENOPOLICY. Needed to load our EAGL into backboardd
+(drg/GPU-DRAW-PLAN.md).
+
+diff --git a/bsd/kern/drg_amfi.c b/bsd/kern/drg_amfi.c
+--- a/bsd/kern/drg_amfi.c
++++ b/bsd/kern/drg_amfi.c
+@@ -305,7 +305,39 @@
+ 	}
+ }
+ 
++/*
++ * dyld's policy query (dyld amfi_check_dyld_policy_self: __mac_syscall("AMFI",
++ * 0x5a, &{uint64_t input; uint64_t *output})): the DYLD_* environment flags a
++ * process may use. Without an answer dyld gets ENOPOLICY and ignores every
++ * DYLD_* variable. Granted: path variables (bit 1, DYLD_INSERT_LIBRARIES) and
++ * a failed insert not being fatal (bit 5), so a missing library cannot stop
++ * the process it was meant for.
++ */
++#define DRG_AMFI_DYLD_POLICY            0x5a
++#define DRG_AMFI_DYLD_ALLOW_PATH_VARS   0x02ULL
++#define DRG_AMFI_DYLD_ALLOW_FAILED_INSERT 0x20ULL
++
++static int
++drg_amfi_syscall(struct proc *p __unused, int call, user_addr_t arg)
++{
++	struct {
++		uint64_t input;
++		uint64_t output;        /* user address of the flags */
++	} a;
++	uint64_t flags = DRG_AMFI_DYLD_ALLOW_PATH_VARS | DRG_AMFI_DYLD_ALLOW_FAILED_INSERT;
++
++	if (call != DRG_AMFI_DYLD_POLICY) {
++		return ENOPOLICY;      /* as before: only the dyld query is answered */
++	}
++	int error = copyin(arg, &a, sizeof(a));
++	if (error == 0) {
++		error = copyout(&flags, (user_addr_t)a.output, sizeof(flags));
++	}
++	return error;
++}
++
+ static const struct mac_policy_ops drg_amfi_mac_ops = {
++	.mpo_policy_syscall = drg_amfi_syscall,
+ 	.mpo_vnode_check_signature = drg_amfi_vnode_check_signature,
+ };
+ 
+@@ -360,7 +392,7 @@
+ static mac_policy_handle_t drg_sandbox_mac_handle;
+ 
+ static struct mac_policy_conf drg_amfi_mac_conf = {
+-	.mpc_name = "DRG AMFI",
++	.mpc_name = "AMFI",      /* the name dyld's __mac_syscall asks for */
+ 	.mpc_fullname = "DRG built-in Mobile File Integrity",
+ 	.mpc_ops = &drg_amfi_mac_ops,
+ };
