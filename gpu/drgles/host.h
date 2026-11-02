@@ -27,6 +27,7 @@ void host_unmap(void *addr, size_t len);
 void host_sync_icache(void *addr, size_t len);
 
 void host_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void host_log_to(int fd);	/* iOS host: host_log and host_die write to fd (default stdout, stderr) */
 __attribute__((noreturn)) void host_die(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 uint64_t host_random64(void);
 

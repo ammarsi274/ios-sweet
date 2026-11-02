@@ -298,6 +298,14 @@ void host_sync_icache(void *addr, size_t len)
 	sys_icache_invalidate(addr, len);	/* cleans the D-cache to PoU first */
 }
 
+/* where host_log goes: stdout for the bench; a log file inside another process (libdrgeagl) */
+static int log_fd = 1, die_fd = 2;
+
+void host_log_to(int fd)
+{
+	log_fd = die_fd = fd;
+}
+
 static void out(int fd, const char *fmt, va_list ap)
 {
 	char b[1024];
@@ -312,7 +320,7 @@ void host_log(const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
-	out(1, fmt, ap);
+	out(log_fd, fmt, ap);
 	va_end(ap);
 }
 
@@ -320,7 +328,7 @@ void host_die(const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
-	out(2, fmt, ap);
+	out(die_fd, fmt, ap);
 	va_end(ap);
 	exit(99);
 }

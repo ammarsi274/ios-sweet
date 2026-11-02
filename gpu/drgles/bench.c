@@ -469,6 +469,8 @@ G(void, glGenFramebuffers, (int, u32 *))
 G(void, glBindFramebuffer, (u32, u32))
 G(void, glFramebufferTexture2D, (u32, u32, u32, u32, int))
 G(u32, glCheckFramebufferStatus, (u32))
+G(void, glFlush, (void))
+G(void, glTexSubImage2D, (u32, int, int, int, int, int, u32, u32, const void *))
 
 static int load_gl(struct drg_dso *egl, struct drg_dso *gles)
 {
@@ -488,7 +490,7 @@ static int load_gl(struct drg_dso *egl, struct drg_dso *gles)
 	L(gles, glDrawArrays) L(gles, glGenTextures) L(gles, glBindTexture) L(gles, glActiveTexture)
 	L(gles, glTexImage2D) L(gles, glTexParameteri)
 	L(gles, glGenFramebuffers) L(gles, glBindFramebuffer) L(gles, glFramebufferTexture2D)
-	L(gles, glCheckFramebufferStatus)
+	L(gles, glCheckFramebufferStatus) L(gles, glFlush) L(gles, glTexSubImage2D)
 	(void)gl;
 	return 0;
 }
@@ -1030,6 +1032,301 @@ static int layout_test(void)
 	return check("layout render target pattern", ok);
 }
 
+/*
+ * -frames (both hosts; part 1 of the iOS -selftest): FRAMES frames back to
+ * back, each a texture upload, a clear, a textured quad and glFlush, no
+ * wait; every 50th frame two pixels are read back (that read waits). Run on
+ * TWRP's KGSL it checks the test itself.
+ */
+static int frames_test(u32 *fbo_out)
+{
+	int fails = 0;
+	enum { S = 256, T = 64, FRAMES = 200 };
+	static const float quad[] = { -1, -1, 0, 1, 1, -1, 0, 1, -1, 1, 0, 1, 1, 1, 0, 1 };
+	static const float uv[] = { 0, 0, 1, 0, 0, 1, 1, 1 };
+	u32 ptex = program("attribute vec4 p;\nattribute vec2 t;\nvarying highp vec2 uv;\n"
+			   "void main() { gl_Position = p; uv = t; }\n",
+			   "varying highp vec2 uv;\nuniform lowp sampler2D tex;\n"
+			   "void main() { gl_FragColor = texture2D(tex, uv); }\n");
+	if (!ptex)
+		return 1;
+	/* 1. FRAMES frames back to back: a texture upload, a clear, a textured quad, glFlush; every 50th read back */
+	u32 tex, ftex, fbo;
+	glGenTextures(1, &tex);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, tex);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, T, T, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glGenTextures(1, &ftex);
+	glBindTexture(GL_TEXTURE_2D, ftex);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, S, S, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+	glGenFramebuffers(1, &fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, ftex, 0);
+	glUseProgram(ptex);
+	glUniform1i(glGetUniformLocation(ptex, "tex"), 0);
+	glVertexAttribPointer(0, 4, GL_FLOAT, 0, 0, quad);
+	glVertexAttribPointer(1, 2, GL_FLOAT, 0, 0, uv);
+	glEnableVertexAttribArray(0);
+	glEnableVertexAttribArray(1);
+	glViewport(0, 0, S, S);
+	static uint32_t texels[T * T];
+	int wrong = 0, checked = 0;
+	for (int f = 0; f < FRAMES; f++) {
+		uint32_t v = 0xff000000u | (uint32_t)(f * 0x010305 + 0x203040) % 0x1000000;
+		for (int i = 0; i < T * T; i++)
+			texels[i] = v;
+		glBindTexture(GL_TEXTURE_2D, tex);
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, T, T, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+		glClearColor(1, 0, 1, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		glFlush();
+		if (f % 50 == 49) {
+			uint32_t got[2] = { 0, 0 };
+			glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &got[0]);
+			glReadPixels(S / 2, S / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &got[1]);
+			checked++;
+			if (got[0] != v || got[1] != v) {
+				wrong++;
+				host_log("selftest: frame %d: read %08x %08x, want %08x\n", f, got[0], got[1], v);
+			}
+		}
+	}
+	fails += check("selftest: 200 frames back to back, texture upload each frame", !wrong && checked == FRAMES / 50);
+
+	*fbo_out = fbo;
+	return fails;
+}
+
+static int frames_on;
+
+#ifdef __APPLE__
+/*
+ * -selftest FILE (boot job com.drg.gpuselftest, drg/GPU-DRAW-PLAN.md): which
+ * DrgGPU submission framing survives work submitted back to back. Each mode
+ * runs in its own process (a fresh connection and context, as an app
+ * would): the stage tests above (their readbacks wait), then stress_test().
+ * FILE gets "mode N" for the first passing mode in the order closest to
+ * Linux (KGSL framing first), or "none"; libdrgeagl.dylib in backboardd
+ * waits for it and uses that framing, or stays off.
+ */
+typedef int pid_t;
+int posix_spawn(pid_t *, const char *, const void *, const void *, char *const[], char *const[]);
+pid_t waitpid(pid_t, int *, int);
+int open(const char *, int, ...);
+int close(int);
+long write(int, const void *, unsigned long);
+
+typedef const void *CFTypeRef;
+typedef const struct __CFDictionary *CFDictionaryRef;
+typedef struct __CFDictionary *CFMutableDictionaryRef;
+typedef const struct __CFString *CFStringRef;
+typedef struct __IOSurface *IOSurfaceRef;
+extern const char kCFTypeDictionaryKeyCallBacks[], kCFTypeDictionaryValueCallBacks[];
+extern CFStringRef kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement, kIOSurfaceBytesPerRow,
+	kIOSurfacePixelFormat;
+CFMutableDictionaryRef CFDictionaryCreateMutable(void *, long, const void *, const void *);
+void CFDictionarySetValue(CFMutableDictionaryRef, const void *, const void *);
+CFTypeRef CFNumberCreate(void *, long, const void *);
+void CFRelease(CFTypeRef);
+IOSurfaceRef IOSurfaceCreate(CFDictionaryRef);
+uint32_t IOSurfaceGetID(IOSurfaceRef);
+int IOSurfaceLock(IOSurfaceRef, uint32_t, uint32_t *);
+int IOSurfaceUnlock(IOSurfaceRef, uint32_t, uint32_t *);
+void *IOSurfaceGetBaseAddress(IOSurfaceRef);
+unsigned long IOSurfaceGetBytesPerRow(IOSurfaceRef);
+unsigned long IOSurfaceGetAllocSize(IOSurfaceRef);
+
+static IOSurfaceRef make_surface(int w, int h, int bpr)
+{
+	CFMutableDictionaryRef d = CFDictionaryCreateMutable(0, 0, kCFTypeDictionaryKeyCallBacks,
+							     kCFTypeDictionaryValueCallBacks);
+	int32_t v[5] = { w, h, 4, bpr, 0x42475241 /* 'BGRA', as backboardd's display surfaces */ };
+	CFStringRef k[5] = { kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement, kIOSurfaceBytesPerRow,
+			     kIOSurfacePixelFormat };
+	for (int i = 0; i < 5; i++) {
+		CFTypeRef n = CFNumberCreate(0, 3 /* kCFNumberSInt32Type */, &v[i]);
+		CFDictionarySetValue(d, k[i], n);
+		CFRelease(n);
+	}
+	IOSurfaceRef s = IOSurfaceCreate(d);
+	CFRelease(d);
+	return s;
+}
+
+/* an IOSurface as an EGLImage texture, the way libdrgeagl does it (drgwin.c, our gralloc, KGSL import) */
+static u32 surface_texture(EGLDisplay d, IOSurfaceRef s, int w, int h)
+{
+	static int32_t handles[2][DRGWIN_HANDLE_INTS];
+	static struct drgwin_anwb bufs[2];
+	static int n;
+	if (n == 2)
+		return 0;
+	int32_t *hd = handles[n];
+	struct drgwin_anwb *b = &bufs[n++];
+	uint32_t bpr = (uint32_t)IOSurfaceGetBytesPerRow(s), size = (uint32_t)IOSurfaceGetAllocSize(s);
+	int fd = kgsl_ios_surface_fd(IOSurfaceGetID(s));
+	if (fd < 0)
+		return 0;
+	drgwin_handle(hd, fd, (uint32_t)w, (uint32_t)h, bpr / 4, (uint32_t)h, DRGWIN_FMT_BGRA_8888, size);
+	drgwin_anwb(b, hd, (uint32_t)w, (uint32_t)h, bpr / 4, DRGWIN_FMT_BGRA_8888,
+		    DRGWIN_USAGE_GPU_RENDER | DRGWIN_USAGE_GPU_TEXTURE);
+	b_gralloc_register(hd, 0, (uint32_t)w, (uint32_t)h, bpr / 4, DRGWIN_FMT_BGRA_8888, DRGWIN_USAGE_GPU_TEXTURE);
+	void *(*gpa)(const char *) = (void *(*)(const char *))drg_elf_sym(egl_dso, "eglGetProcAddress");
+	void *(*mkimg)(EGLDisplay, void *, u32, void *, const int *) = gpa ? gpa("eglCreateImageKHR") : 0;
+	void (*target)(u32, void *) = gpa ? gpa("glEGLImageTargetTexture2DOES") : 0;
+	static const int ia[] = { 0x30D2 /* EGL_IMAGE_PRESERVED_KHR */, 1, EGL_NONE };
+	void *img = mkimg && target ? mkimg(d, 0, 0x3140 /* EGL_NATIVE_BUFFER_ANDROID */, b, ia) : 0;
+	host_log("selftest: IOSurface %u %dx%d bpr %u size %u -> EGLImage %p (EGL error %x)\n", IOSurfaceGetID(s), w, h,
+		 bpr, size, img, eglGetError());
+	if (!img)
+		return 0;
+	u32 tex;
+	glGenTextures(1, &tex);
+	glBindTexture(GL_TEXTURE_2D, tex);
+	target(GL_TEXTURE_2D, img);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	return tex;
+}
+
+static int stress_test(EGLDisplay d)
+{
+	int fails = 0;
+	enum { S = 256, SF = 60, SW = 1125, SH = 2436, SBPR = 4608 };
+	static const float quad[] = { -1, -1, 0, 1, 1, -1, 0, 1, -1, 1, 0, 1, 1, 1, 0, 1 };
+	static const float uv[] = { 0, 0, 1, 0, 0, 1, 1, 1 };
+	u32 ptex = program("attribute vec4 p;\nattribute vec2 t;\nvarying highp vec2 uv;\n"
+			   "void main() { gl_Position = p; uv = t; }\n",
+			   "varying highp vec2 uv;\nuniform lowp sampler2D tex;\n"
+			   "void main() { gl_FragColor = texture2D(tex, uv); }\n");
+	u32 ppat = program("attribute vec4 p;\nvoid main() { gl_Position = p; }\n",
+			   "precision highp float;\nuniform int k;\nvoid main() {\n  vec2 c = floor(gl_FragCoord.xy);\n"
+			   "  gl_FragColor = vec4(mod(c.x, 256.0), floor(c.x / 256.0), mod(c.y + float(k), 256.0),"
+			   " floor(c.y / 256.0)) / 255.0;\n}\n");
+	if (!ptex || !ppat)
+		return 1;
+
+	u32 fbo = 0;
+	fails += frames_test(&fbo);
+	/* 2. a 1125x2436 BGRA IOSurface as render target (backboardd's display size), SF frames, CPU check */
+	IOSurfaceRef ds = make_surface(SW, SH, SBPR);
+	u32 dtex = ds ? surface_texture(d, ds, SW, SH) : 0;
+	u32 dfbo = 0, st = 0;
+	if (dtex) {
+		glGenFramebuffers(1, &dfbo);
+		glBindFramebuffer(GL_FRAMEBUFFER, dfbo);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dtex, 0);
+		st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+		glUseProgram(ppat);
+		glVertexAttribPointer(0, 4, GL_FLOAT, 0, 0, quad);
+		glEnableVertexAttribArray(0);
+		glDisableVertexAttribArray(1);
+		glViewport(0, 0, SW, SH);
+		int kl = glGetUniformLocation(ppat, "k");
+		for (int f = 0; f < SF; f++) {
+			glClearColor(0.2f, 0.2f, 0.2f, 0.2f);
+			glClear(GL_COLOR_BUFFER_BIT);
+			glUniform1i(kl, f);
+			glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+			glFlush();
+		}
+		glFinish();
+	}
+	long good = 0;
+	if (dtex && !IOSurfaceLock(ds, 1 /* read-only */, 0)) {
+		const uint8_t *m = IOSurfaceGetBaseAddress(ds);
+		for (int y = 0; y < SH; y++)
+			for (int x = 0; x < SW; x++) {
+				const uint8_t *t = m + (size_t)y * SBPR + (size_t)x * 4;
+				good += t[0] == ((y + SF - 1) & 0xff) && t[1] == (x >> 8) && t[2] == (x & 0xff) && t[3] == (y >> 8);
+			}
+		IOSurfaceUnlock(ds, 1, 0);
+	}
+	host_log("selftest: IOSurface render target: fbo %x, %ld of %d texels as frame %d drew them\n", st, good,
+		 SW * SH, SF - 1);
+	fails += check("selftest: IOSurface render target, frames back to back", good == (long)SW * SH);
+
+	/* 3. the CPU writes an IOSurface, the GPU samples it (CoreAnimation's app layers) */
+	IOSurfaceRef cs = make_surface(S, S, S * 4);
+	u32 ctex = cs ? surface_texture(d, cs, S, S) : 0;
+	long same = 0;
+	if (ctex && !IOSurfaceLock(cs, 0, 0)) {
+		uint8_t *m = IOSurfaceGetBaseAddress(cs);
+		for (int y = 0; y < S; y++)
+			for (int x = 0; x < S; x++) {
+				uint8_t *t = m + (size_t)y * S * 4 + (size_t)x * 4;
+				t[0] = (uint8_t)(x * 7 + y), t[1] = (uint8_t)(x + 3 * y), t[2] = (uint8_t)(x >> 3), t[3] = 0xff;
+			}
+		IOSurfaceUnlock(cs, 0, 0);
+		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+		glUseProgram(ptex);
+		glUniform1i(glGetUniformLocation(ptex, "tex"), 0);
+		glVertexAttribPointer(0, 4, GL_FLOAT, 0, 0, quad);
+		glVertexAttribPointer(1, 2, GL_FLOAT, 0, 0, uv);
+		glEnableVertexAttribArray(0);
+		glEnableVertexAttribArray(1);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, ctex);
+		glViewport(0, 0, S, S);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		glFinish();
+		uint8_t *got = host_alloc((size_t)S * S * 4);
+		glReadPixels(0, 0, S, S, GL_RGBA, GL_UNSIGNED_BYTE, got);
+		for (int y = 0; y < S; y++)
+			for (int x = 0; x < S; x++) {
+				const uint8_t *g = got + ((size_t)y * S + x) * 4, *t = m + (size_t)y * S * 4 + (size_t)x * 4;
+				same += g[0] == t[2] && g[1] == t[1] && g[2] == t[0] && g[3] == t[3];	/* BGRA memory */
+			}
+		host_free(got);
+	}
+	host_log("selftest: sampled IOSurface: %ld of %d texels\n", same, S * S);
+	fails += check("selftest: GPU samples a CPU-written IOSurface", same == (long)S * S);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	if (kgsl_ios_faulted())
+		fails += check("selftest: no GPU fault", 0);
+	return fails;
+}
+
+static int selftest_child = -1;
+
+/* the parent: one child per mode, the verdict into `out` */
+static int selftest(const char *self, const char *out, char **envp)
+{
+	static const int order[4] = { 0, 1, 3, 2 };	/* runs: the old framing first, as the control */
+	static const int prefer[4] = { 1, 3, 2, 0 };	/* the verdict: closest to Linux first */
+	int pass[4] = { 0, 0, 0, 0 };
+	for (int i = 0; i < 4; i++) {
+		char m[2] = { (char)('0' + order[i]), 0 };
+		char *argv[] = { (char *)self, "-selftest-child", m, "/usr/local/drgles/adreno", 0 };
+		pid_t pid = 0;
+		int st = 0;
+		host_log("selftest: mode %d (kgsl preempt %d, wfi %d) starting\n", order[i], order[i] & 1, order[i] >> 1);
+		if (posix_spawn(&pid, self, 0, 0, argv, envp) != 0 || waitpid(pid, &st, 0) != pid) {
+			host_log("selftest: mode %d: could not run\n", order[i]);
+			continue;
+		}
+		pass[order[i]] = (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0;
+		host_log("selftest: mode %d: %s (status 0x%x)\n", order[i], pass[order[i]] ? "PASS" : "FAIL", st);
+	}
+	char verdict[16] = "none\n";
+	for (int i = 0; i < 4; i++)
+		if (pass[prefer[i]]) {
+			snprintf(verdict, sizeof(verdict), "mode %d\n", prefer[i]);
+			break;
+		}
+	int fd = open(out, 0x0601 /* O_WRONLY | O_CREAT | O_TRUNC */, 0644);
+	if (fd >= 0) {
+		write(fd, verdict, strlen(verdict));
+		close(fd);
+	}
+	host_log("selftest: passed %d %d %d %d (modes 0-3); verdict %s", pass[0], pass[1], pass[2], pass[3], verdict);
+	return 0;
+}
+#endif
+
 static int run(void)
 {
 	struct drg_dso *egl = drg_elf_open("libEGL_adreno.so");
@@ -1137,9 +1434,16 @@ static int run(void)
 	host_log("GL error %x\n", glGetError());
 	if (layout_w)
 		fails += layout_test();
+	if (frames_on) {
+		u32 fbo;
+		fails += frames_test(&fbo);
+	}
 #ifndef __APPLE__
 	if (gbuf_w)
 		fails += gbuf_test(d);
+#else
+	if (selftest_child >= 0)
+		fails += stress_test(d);
 #endif
 	eglTerminate(d);
 	return fails;
@@ -1170,6 +1474,16 @@ static int main_(int argc, char **argv, char **envp)
 			continue;
 		}
 #ifdef __APPLE__
+		if (!strcmp(argv[i], "-selftest") && i + 1 < argc)	/* the boot job: children do the work */
+			return selftest(argv[0], argv[i + 1], envp);
+		if (!strcmp(argv[i], "-selftest-child") && i + 1 < argc) {
+			selftest_child = argv[++i][0] - '0';
+			if (selftest_child < 0 || selftest_child > 3)
+				return 2;
+			kgsl_ios_framing((uint32_t)selftest_child);
+			host_log("selftest child: framing %d\n", selftest_child);
+			continue;
+		}
 		if (!strcmp(argv[i], "-dsb") || !strcmp(argv[i], "-deferfree")) {	/* boot #42 */
 			static int dsb, deferfree;
 			dsb |= !strcmp(argv[i], "-dsb");
@@ -1224,6 +1538,10 @@ static int main_(int argc, char **argv, char **envp)
 		}
 		if (!strcmp(argv[i], "-trace")) {
 			kgsl_trace();
+			continue;
+		}
+		if (!strcmp(argv[i], "-frames")) {
+			frames_on = 1;
 			continue;
 		}
 		if (!strcmp(argv[i], "-capture-nowait") && i + 1 < argc) {	/* boot #40: the race test */
