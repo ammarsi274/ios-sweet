@@ -1,0 +1,10 @@
+drg: battery from the PM660 fuel gauge and charger (patch 0916)
+
+DrgBattery published a static 100 % once. It now reads the PM660's
+monotonic SOC (with its copy), battery voltage, current, temperature,
+USB plug-in and charger state over the SPMI arbiter's observer
+channels (plain reads, nothing written, no fuel gauge SRAM), every
+30 s and the plug-in bit every 5 s, and publishes them as an iOS power
+source. Registers and conversions from HMD's qpnp-fg-gen3.c, fg-reg.h,
+smb-reg.h and smb-lib.c (research/reports/battery.md). A bad sample is
+dropped; until the first good one the static values stay.

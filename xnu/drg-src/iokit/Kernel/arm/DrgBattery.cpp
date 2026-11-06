@@ -1,21 +1,50 @@
 /*
- * DRG (Nokia 6.1 Plus) battery as an iOS power source.
+ * DRG (Nokia 6.1 Plus) battery as an iOS power source, read from the PM660's
+ * fuel gauge and charger (research/reports/battery.md, from HMD's
+ * qpnp-fg-gen3.c, fg-reg.h, smb-reg.h, smb-lib.c and this phone's device
+ * tree). Plain register reads over the SPMI arbiter's observer channels (as
+ * drg_keys.c: v3 arbiter, APID map at core + 0x800 + 4n, observer of EE 0 at
+ * 0x9400000 + 0x8000 * apid); nothing is written to the PMIC, no fuel gauge
+ * SRAM. PM660 = SPMI SID 0, so a register 0xPPRR is PPID 0x0PP, offset 0xRR.
  *
- * Static until the Nokia's fuel gauge (PM660 FG) is ported: 100%, external
- * power, not charging. Every published value says it was not measured
- * (DrgBatteryFallback, DrgBatteryHardwareSampleValid = false). The design
- * capacity is this phone's battery profile from its device tree:
- * qcom,battery-type "DRG_alt_3000mah_100k", qcom,nom-batt-capacity-mah 3000,
- * qcom,max-voltage-uv 4400000. No PMIC register is read or written.
+ *   state of charge  0x4009 (monotonic SOC) and its copy 0x400a, used only
+ *                    when equal; 255 -> 100, 0 -> 0, else
+ *                    round((raw - 1) * 98 / 253) + 1          (fg-gen3.c 734-787)
+ *   voltage          0x41a0..a1, unsigned, 122.070 uV per bit
+ *   current          0x41a2..a3, signed, 488.281 uA per bit, + = discharging
+ *   temperature      0x4150..51, 11 bits, 0.25 K per bit; valid with 0x4106 bit 0
+ *   USB plugged in   0x1310 bit 4 (USBIN plug-in RT_STS)
+ *   charger state    0x1006 bits 2:0: 0-4 charging, 5-6 terminated, 7 disabled
+ *
+ * Polled every 30 s (and the plug-in bit every 5 s). A sample that fails a
+ * read or the SOC copy check is dropped: the last good one stays, and until
+ * the first good one the old static values (100 %, external) stay with
+ * DrgBatteryFallback set. Never publishes 0 % or a critical level from a
+ * single sample. The design capacity is this phone's profile in its device
+ * tree: "DRG_alt_3000mah_100k" / "DRG_coslight_3000mah_200k", 3000 mAh, 4.4 V.
  */
 #if defined(ARM64_BOARD_CONFIG_DRG)
 #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
 #include <IOKit/IOLib.h>
+#include <IOKit/IOTimerEventSource.h>
+#include <IOKit/IOWorkLoop.h>
 #include <IOKit/pwr_mgt/IOPMPowerSource.h>
 #include <libkern/c++/OSCollectionIterator.h>
+#include <machine/machine_routines.h>
+
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);   /* as DrgGPU.cpp */
 
 #define DRG_BATTERY_MAH         3000u   /* qcom,nom-batt-capacity-mah */
 #define DRG_BATTERY_FULL_MV     4400u   /* qcom,max-voltage-uv */
+
+#define SPMI_CORE_PA            0x0800f000u
+#define SPMI_OBS_PA             0x09400000u
+#define SPMI_OBS_STRIDE         0x8000u
+#define SPMI_APIDS              512u
+#define SPMI_NO_APID            0xffffu
+
+enum { P_SOC, P_BATT, P_CHG, P_USB, P_COUNT };
+static const uint16_t drg_bat_ppid[P_COUNT] = { 0x040, 0x041, 0x010, 0x013 };
 
 class DrgBattery : public IOPMPowerSource {
 	OSDeclareDefaultStructors(DrgBattery);
@@ -25,7 +54,22 @@ public:
 private:
 	void putNumber(const char *key, UInt32 value);
 	void putBool(const char *key, bool value);
-	void publish(void);
+	void publishStatic(void);
+	void legacy(UInt32 mah, UInt32 mv, SInt32 ma, bool plugged, bool charging);
+	bool spmiSetup(void);
+	bool rd(unsigned p, uint8_t reg, unsigned bytes, uint32_t *out);
+	void sample(bool full);
+	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+
+	vm_offset_t fCore = 0;
+	vm_offset_t fObs[P_COUNT] = {};
+	IOWorkLoop *fWL = NULL;
+	IOTimerEventSource *fTimer = NULL;
+	unsigned fTicks = 0;
+	bool fHaveGood = false;
+	bool fLastPlugged = true;
+	unsigned fPercent = 100;
+	bool fLogged = false;
 };
 OSDefineMetaClassAndStructors(DrgBattery, IOPMPowerSource);
 
@@ -83,7 +127,30 @@ DrgBattery::putBool(const char *key, bool value)
 }
 
 void
-DrgBattery::publish(void)
+DrgBattery::legacy(UInt32 mah, UInt32 mv, SInt32 ma, bool plugged, bool charging)
+{
+	OSDictionary *d = OSDictionary::withCapacity(7);
+	if (!d) {
+		return;
+	}
+	const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+	    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+	    kIOBatteryFlagsKey};
+	UInt32 flags = kIOBatteryInstalled | (plugged ? kIOBatteryChargerConnect : 0) | (charging ? kIOBatteryCharge : 0);
+	UInt32 values[] = {mah, DRG_BATTERY_MAH, mv, (UInt32)ma, 0, flags};
+	for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+		OSNumber *number = OSNumber::withNumber(values[i], 32);
+		if (number) {
+			d->setObject(keys[i], number);
+			number->release();
+		}
+	}
+	setLegacyIOBatteryInfo(d);
+	d->release();
+}
+
+void
+DrgBattery::publishStatic(void)
 {
 	setBatteryInstalled(true);
 	setCurrentCapacity(DRG_BATTERY_MAH);
@@ -107,28 +174,147 @@ DrgBattery::publish(void)
 	putBool("DrgBatteryHardwareSampleValid", false);
 	putBool("DrgBatteryFallback", true);
 	putNumber("DrgBatteryPercent", 100);
+	legacy(DRG_BATTERY_MAH, DRG_BATTERY_FULL_MV, 0, true, false);
+	updateStatus();
+}
 
-	/* IOPMCopyBatteryInfo's per-source compatibility dictionary. */
-	OSDictionary *legacy = OSDictionary::withCapacity(7);
-	if (legacy) {
-		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
-		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
-		    kIOBatteryFlagsKey};
-		UInt32 values[] = {DRG_BATTERY_MAH, DRG_BATTERY_MAH, DRG_BATTERY_FULL_MV, 0, 0,
-		    (UInt32)(kIOBatteryInstalled | kIOBatteryChargerConnect)};
-		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
-			OSNumber *number = OSNumber::withNumber(values[i], 32);
-			if (number) {
-				legacy->setObject(keys[i], number);
-				number->release();
+bool
+DrgBattery::spmiSetup(void)
+{
+	fCore = ml_io_map(SPMI_CORE_PA, 0x1000);
+	if (!fCore) {
+		return false;
+	}
+	uint32_t version = *(volatile uint32_t *)fCore;
+	if (version != 0x30000000u) {   /* measured (drg_keys.c) */
+		IOLog("DRG BATTERY: unexpected SPMI arbiter version %#x\n", version);
+		return false;
+	}
+	for (unsigned p = 0; p < P_COUNT; p++) {
+		uint32_t apid = SPMI_NO_APID;
+		for (uint32_t n = 0; n < SPMI_APIDS; n++) {
+			if (((*(volatile uint32_t *)(fCore + 0x800u + 4u * n) >> 8) & 0xfffu) == drg_bat_ppid[p]) {
+				apid = n;
+				break;
 			}
 		}
-		setLegacyIOBatteryInfo(legacy);
-		legacy->release();
+		if (apid == SPMI_NO_APID) {
+			IOLog("DRG BATTERY: PPID %#x not in the arbiter's map\n", drg_bat_ppid[p]);
+			return false;
+		}
+		fObs[p] = ml_io_map(SPMI_OBS_PA + SPMI_OBS_STRIDE * apid, 0x1000);
+		if (!fObs[p]) {
+			return false;
+		}
 	}
+	return true;
+}
+
+/* bytes (1..4) from reg of peripheral p through its observer channel, little endian */
+bool
+DrgBattery::rd(unsigned p, uint8_t reg, unsigned bytes, uint32_t *out)
+{
+	vm_offset_t ch = fObs[p];
+	__asm__ volatile("dmb oshst" ::: "memory");
+	*(volatile uint32_t *)ch = (1u << 27) | ((uint32_t)reg << 4) | (bytes - 1);
+	__asm__ volatile("dsb osh" ::: "memory");
+	for (unsigned i = 0; i < 1000; ++i) {
+		uint32_t st = *(volatile uint32_t *)(ch + 0x08u);
+		__asm__ volatile("dmb oshld" ::: "memory");
+		if (st & 1u) {
+			if (st & 0x0eu) {
+				return false;
+			}
+			uint32_t v = *(volatile uint32_t *)(ch + 0x18u);
+			*out = bytes == 4 ? v : v & ((1u << (8 * bytes)) - 1);
+			return true;
+		}
+		IODelay(1);
+	}
+	return false;
+}
+
+void
+DrgBattery::sample(bool full)
+{
+	uint32_t usb = 0;
+	if (!rd(P_USB, 0x10, 1, &usb)) {
+		return;
+	}
+	bool plugged = (usb >> 4) & 1;
+	if (!full && plugged == fLastPlugged) {
+		return;
+	}
+	fLastPlugged = plugged;
+
+	uint32_t soc = 0, vraw = 0, iraw = 0, traw = 0, tok = 0, chg = 0;
+	bool ok = rd(P_SOC, 0x09, 2, &soc) && rd(P_BATT, 0xa0, 2, &vraw) && rd(P_BATT, 0xa2, 2, &iraw) &&
+	    rd(P_BATT, 0x50, 2, &traw) && rd(P_BATT, 0x06, 1, &tok) && rd(P_CHG, 0x06, 1, &chg);
+	if (!fLogged && ok) {
+		uint32_t a = 0, b = 0, c = 0, d = 0;
+		(void)rd(P_BATT, 0x5c, 3, &a);   /* Linux writes a3 50 ff (thermistor coefficients) */
+		(void)rd(P_BATT, 0x73, 1, &b);   /* Linux writes 1 (external sense resistor) */
+		(void)rd(P_SOC, 0x46, 1, &c);    /* bit 7: profile loaded */
+		(void)rd(P_BATT, 0x10, 1, &d);   /* bit 3: battery missing */
+		IOLog("DRG BATTERY: first sample raw soc %#x v %#x i %#x t %#x tok %#x chg %#x usb %#x; "
+		    "therm %#x sense %#x prof %#x missing %#x\n", soc, vraw, iraw, traw, tok, chg, usb, a, b, c, d);
+		fLogged = true;
+	}
+	if (!ok || (soc & 0xff) != (soc >> 8)) {
+		return;                          /* keep the last good sample */
+	}
+	uint32_t raw = soc & 0xff;
+	unsigned pct = raw == 255 ? 100 : raw == 0 ? 0 : (unsigned)(((raw - 1) * 98 + 126) / 253 + 1);
+	if (pct == 0 && fHaveGood && fPercent > 5) {
+		return;                          /* a jump to 0: not from one sample */
+	}
+	unsigned mv = (unsigned)((uint64_t)vraw * 122070 / 1000000);
+	int32_t ma = (int32_t)((int64_t)(int16_t)iraw * 488281 / 1000000);
+	bool tvalid = tok & 1;
+	int32_t centic = tvalid ? (int32_t)(traw & 0x7ff) * 25 - 27315 : 2500;
+	unsigned state = chg & 7;
+	bool charging = plugged && state <= 4;
+	bool full_ = plugged && (state == 5 || state == 6 || pct == 100);
+	UInt32 mah = DRG_BATTERY_MAH * pct / 100;
+
+	setCurrentCapacity(mah);
+	setMaxCapacity(DRG_BATTERY_MAH);
+	setExternalConnected(plugged);
+	setExternalChargeCapable(plugged);
+	setIsCharging(charging && !full_);
+	setAtWarnLevel(pct <= 10);
+	setAtCriticalLevel(pct <= 3 && fHaveGood);
+	setVoltage(mv);
+	setAmperage(-ma);                        /* iOS: positive while charging */
+	putBool("FullyCharged", full_);
+	putBool("AppleRawExternalConnected", plugged);
+	putNumber("AppleRawCurrentCapacity", mah);
+	putNumber("AppleRawMaxCapacity", DRG_BATTERY_MAH);
+	putNumber("InstantAmperage", (UInt32)(-ma));
+	putNumber("Temperature", (UInt32)centic);
+	putBool("DrgBatteryHardwareSampleValid", true);
+	putBool("DrgBatteryTemperatureValid", tvalid);
+	putBool("DrgBatteryFallback", false);
+	putNumber("DrgBatteryPercent", pct);
+	legacy(mah, mv, -ma, plugged, charging && !full_);
 	updateStatus();
-	IOLog("DRG BATTERY: static (Nokia %u mAh profile, fuel gauge not ported), 100%% external\n",
-	    DRG_BATTERY_MAH);
+	if (!fHaveGood || pct != fPercent) {
+		IOLog("DRG BATTERY: %u%% %u mV %d mA %d.%02d C usb %d charger state %u\n", pct, mv, ma,
+		    centic / 100, (centic < 0 ? -centic : centic) % 100, plugged, state);
+	}
+	fHaveGood = true;
+	fPercent = pct;
+}
+
+void
+DrgBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+{
+	DrgBattery *me = OSDynamicCast(DrgBattery, owner);
+	if (!me) {
+		return;
+	}
+	me->sample(me->fTicks++ % 6 == 0);       /* full every 30 s, plug-in bit every 5 s */
+	sender->setTimeoutMS(5000);
 }
 
 bool
@@ -138,7 +324,18 @@ DrgBattery::start(IOService *provider)
 		return false;
 	}
 	/* Publish a complete source BEFORE registerService wakes powerd. */
-	publish();
+	publishStatic();
+	if (spmiSetup()) {
+		sample(true);
+		fWL = IOWorkLoop::workLoop();
+		IOWorkLoop *wl = fWL;
+		fTimer = IOTimerEventSource::timerEventSource(this, &DrgBattery::timerFired);
+		if (wl && fTimer && wl->addEventSource(fTimer) == kIOReturnSuccess) {
+			fTimer->setTimeoutMS(5000);
+		}
+	} else {
+		IOLog("DRG BATTERY: fuel gauge not reachable, static values kept\n");
+	}
 	registerService();
 	return true;
 }
