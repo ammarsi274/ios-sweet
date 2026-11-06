@@ -1,0 +1,12 @@
+drg: USB device mode with CDC-ECM networking on the Nokia (patch 0918)
+
+drg_usb.c (USB device + CDC-ECM ifnet ue0 + live log, proven on the
+other phone, compiled out by 0908) back in the build with this phone's
+addresses (device tree / HMD gcc-sdm660.c): DWC3 0x0a800000, QSCRATCH
+0x0a8f8800, QUSB2 v1 PHY 0x0c012000 (read only: PLL_STATUS 0x38,
+PORT_POWERDOWN 0xb4, TUNE1/2 0x80/0x84), GCC usb30 master 0xf008, sleep
+0xf00c, mock utmi 0xf010, cfg-noc axi 0x5018, aggre2 axi 0xf03c,
+ahb2phy 0x6a004, clkref 0x8800c; GDSC 0xf004 unchanged. Probed from
+drg_emmc_init after touch (as from the UFS init before). Boot-arg
+drgusb: 0 off, 1 report only (default), 2 start the device.
+research/reports/wifi-bt.md section 5.
