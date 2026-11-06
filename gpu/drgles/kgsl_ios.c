@@ -553,8 +553,18 @@ static long gpu_command(struct kdev *d, struct gpu_command *c)
 	}
 	uint64_t in[3] = { c->context_id, c->flags, c->timestamp }, out[1] = { 0 };
 #if defined(__aarch64__)	/* (the host test builds this file for x86) */
-	if (opt_dsb)
-		__asm__ volatile("dsb sy" ::: "memory");
+	/*
+	 * Boot #51 (research/reports/gpu-fault.md): the GPU read the newest lines
+	 * of each IB as zeros. Clean and invalidate every IB's lines to the point
+	 * of coherency (what iOS's sys_dcache_flush does at EL0) and wait for it,
+	 * in case any alias of them is cacheable; the kernel then drains every
+	 * core's write buffer and checks the IB in RAM before it kicks the GPU.
+	 */
+	for (unsigned k = 0; k < n; k++)
+		for (uint64_t a = ibs[k].gpuaddr & ~63ull; a < ibs[k].gpuaddr + ibs[k].bytes; a += 64)
+			__asm__ volatile("dc civac, %0" : : "r"(a) : "memory");
+	__asm__ volatile("dsb sy" ::: "memory");
+	(void)opt_dsb;
 #endif
 	int rc = call(d, DRGPU_UC_SUBMIT, in, 3, n ? ibs : 0, n * sizeof(ibs[0]), out, 1, 0, 0);
 	if (rc == -E_DEADLK && !gpu_faulted) {

@@ -212,6 +212,7 @@ private:
 	void setLevel(int level);
 	void dumpFault(uint32_t status);
 	void faultPage(DrgGPUUserClient *c, struct drg_gpu_obj *o, uint64_t va, unsigned k);
+	unsigned ibVisible(DrgGPUUserClient *c, uint64_t gpuaddr, uint32_t dwords);
 	uint32_t regRead(uint32_t reg);
 
 	static void idleTimer(thread_call_param_t p0, thread_call_param_t p1);
@@ -982,6 +983,8 @@ DrgGPU::dumpFault(uint32_t status)
 	    drgpu_rd(fG.smmu + SMMU_CB0_FAR_LO) | (uint64_t)drgpu_rd(fG.smmu + SMMU_CB0_FAR_HI) << 32,
 	    drgpu_rd(fG.smmu + SMMU_CB0_FSYNR0),
 	    drgpu_rd(fG.smmu + SMMU_CB0_TTBR0_LO) | (uint64_t)drgpu_rd(fG.smmu + SMMU_CB0_TTBR0_HI) << 32);
+	/* FSR is write-1-to-clear (arm-smmu.c): boot #51's mode 2 still showed mode 3's fault */
+	drgpu_wr(fG.smmu + SMMU_CB0_FSR, drgpu_rd(fG.smmu + SMMU_CB0_FSR));
 
 	/* the words around each IB position, as the CPU sees them in the owner's object */
 	DrgGPUUserClient *c = ctx != 0 && ctx < DRGPU_MS_RB ? fCtx[ctx].owner : NULL;
@@ -1007,6 +1010,69 @@ DrgGPU::dumpFault(uint32_t status)
 			break;
 		}
 	}
+}
+
+/* every core: finish its outstanding stores (cross-call handler) */
+static void
+drg_gpu_drain(void *arg __unused)
+{
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+/*
+ * Walk an IB1's packets as the CP will (type 4: count in bits 6:0; type 7:
+ * count in bits 13:0) in RAM through the physical pages of the client's
+ * object. A header that is neither (0 at the stale tail, boot #51) means the
+ * CPU's writes have not landed: re-read for up to 1 ms. Returns the
+ * microseconds waited (0: visible at once, or not checkable); a timeout is
+ * logged and the submit goes ahead as before.
+ */
+unsigned
+DrgGPU::ibVisible(DrgGPUUserClient *c, uint64_t gpuaddr, uint32_t dwords)
+{
+	struct drg_gpu_obj *o = NULL;
+	for (uint32_t i = 0; i < c->fObjCap; i++) {
+		struct drg_gpu_obj *p = &c->fObjs[i];
+		if (p->md != NULL && p->phys != NULL && gpuaddr >= p->gpuaddr && gpuaddr + 4ull * dwords <= p->gpuaddr + p->size) {
+			o = p;
+			break;
+		}
+	}
+	if (o == NULL || dwords == 0) {
+		return 0;
+	}
+	for (unsigned us = 0; us <= 1000; us += 10) {
+		uint64_t off = gpuaddr - o->gpuaddr, end = off + 4ull * dwords;
+		bool bad = false;
+		while (off < end) {
+			IOByteCount seg = 0;
+			uint64_t pa = o->phys->getPhysicalSegment(off & ~0xfffull, &seg, kIOMemoryMapperNone);
+			if (pa == 0) {
+				return 0;
+			}
+			uint32_t h = ml_phys_read_word_64(pa + (off & 0xfff));
+			uint32_t type = h >> 28, cnt;
+			if (type == 7) {
+				cnt = h & 0x3fff;
+			} else if (type == 4) {
+				cnt = h & 0x7f;
+			} else {
+				bad = true;
+				break;
+			}
+			off += 4ull * (1 + cnt);
+		}
+		if (!bad) {
+			return us;
+		}
+		if (us == 1000) {
+			IOLog("DRG GPU: IB 0x%llx: header at +0x%llx still not a packet after 1 ms\n", gpuaddr,
+			    off - (gpuaddr - o->gpuaddr));
+			return 0;
+		}
+		IODelay(10);
+	}
+	return 0;
 }
 
 /*
@@ -1186,6 +1252,22 @@ DrgGPU::submit(DrgGPUUserClient *c, uint32_t ctx, uint32_t flags, uint32_t *ts,
 	}
 	if (c->fOpts & DRGPU_UC_OPT_WFI) {
 		sflags |= DRGPU_SUBMIT_WFI;
+	}
+	/*
+	 * Boot #51 (research/reports/gpu-fault.md): the GPU read the last one to
+	 * three 64-byte lines of a just-written IB1 as zeros (CP_OPCODE_ERROR; a
+	 * zero HI dword gave the "bit 32 lost" write to 0x0399c000), while the
+	 * CPU saw the commands. The newest stores were not in RAM yet when WPTR
+	 * moved: Nokia's driver can write the IB on another core than the one
+	 * that submits, and our dsb before WPTR only drains this core. So every
+	 * core drains its writes first, then each IB1 is checked in RAM.
+	 */
+	cpu_broadcast_xcall_simple(TRUE, drg_gpu_drain, NULL);
+	for (unsigned i = 0; i < n; i++) {
+		unsigned waited = ibVisible(c, kib[i].gpuaddr, kib[i].dwords);
+		if (waited) {
+			IOLog("DRG GPU: IB 0x%llx tail reached RAM after %u us\n", kib[i].gpuaddr, waited);
+		}
 	}
 	if (drgpu_submit_ex(&fG, &c->fSpace, ctx, kib, n, *ts, sflags) == 0) {
 		IOLog("DRG GPU: submit failed: %s\n", drgpu_err(&fG));
