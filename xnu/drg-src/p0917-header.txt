@@ -1,0 +1,9 @@
+drg: screen brightness as AppleARMBacklight (patch 0917)
+
+backboardd's CoreBrightness finds no backlight service (boot logs:
+IOPropertyMatch backlight-control -> none) and only drives a service
+that conforms to AppleARMBacklight. Publish one with backlight-control
+and IODisplayParameters brightness {min 16, max 4095, value}; a
+"brightness" property write sets the PM660L WLED strings 0-2 and syncs
+them (HMD leds-qpnp-wled.c, research/reports/backlight.md), over the
+SPMI arbiter's channel only when the ownership table gives it to EE 0.
