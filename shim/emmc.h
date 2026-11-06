@@ -8,3 +8,6 @@ int drg_emmc_log_open(void);
 int drg_emmc_log_write(const char *buf, unsigned len);
 #include <stdint.h>
 uint64_t drg_emmc_log_lba(void);
+#include "gptslot.h"
+/* boot slots in the GPT (gptslot.c): GPT_SLOTS_NORMAL / GPT_SLOTS_TWRP_ONCE */
+int drg_emmc_slots(int mode, struct gpt_slots_result *r);

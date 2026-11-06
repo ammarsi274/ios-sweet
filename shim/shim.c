@@ -856,11 +856,65 @@ static uint32_t drg_gold_speedup(void)
 	return khz;
 }
 
+/*
+ * Normal-phone buttons (user, 2026-11-05): Power alone = iOS, Volume Up held
+ * at power-on = TWRP once, Volume Down = ABL's own download mode (ABL handles
+ * it before this image runs). Volume Up is PON RT_STS bit 1 (resin), read
+ * as in boots #21/#22 (drg_spmi_read below). Every start makes sure slot A
+ * stays active, successful, 7 tries (gptslot.c); with Volume Up it makes B
+ * a one-try slot and resets: ABL starts TWRP once, then falls back to A.
+ */
+static int drg_spmi_read(unsigned int apid, uint8_t addr, uint8_t *val);
+static unsigned int drg_spmi_apid(uint32_t ppid);
+#define DRG_PON_PPID_SLOTS	0x008		/* SID 0, peripheral 0x08: PON */
+
+static void __attribute__((noreturn)) reset_normal(void)
+{
+	wr32(IMEM_RESTART_REASON, 0);	/* no reason: ABL's normal start, which picks the active slot */
+	__asm__ volatile("dsb sy" ::: "memory");
+	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
+	wr32(PSHOLD, 0);
+	for (;;)
+		__asm__ volatile("wfe");
+}
+
+static int vol_up_held(void)
+{
+	unsigned int apid = drg_spmi_apid(DRG_PON_PPID_SLOTS);
+	uint8_t st = 0;
+	if (apid == 0xffff || drg_spmi_read(apid, 0x10, &st))
+		return 0;
+	return (st >> 1) & 1;
+}
+
+static void cpu_put(const char *label, uint32_t a, uint32_t v, int rc);
+
+static void drg_slots(void)
+{
+	int up = vol_up_held();
+	struct gpt_slots_result r;
+	int rc = drg_emmc_slots(up ? GPT_SLOTS_TWRP_ONCE : GPT_SLOTS_NORMAL, &r);
+	cpu_put("slots vol-up mode", 0, (uint32_t)up, 0);
+	cpu_put("slots rc primary backup", (uint32_t)r.primary << 16 | ((uint32_t)r.backup & 0xffff), (uint32_t)rc,
+		rc < 0);
+	cpu_put("slots was a b", r.was_a, r.was_b, 0);
+	con_hex2("SLOTS", "rc=", (uint32_t)rc, "volup=", (uint32_t)up);
+	if (up && rc >= 0) {
+		int lr = drg_emmc_log_open();
+		if (lr == 0)
+			(void)drg_emmc_log_write(cpu_log, cpu_len);
+		con_str("SLOTS", "TWRP once: resetting");
+		delay_ms(200);
+		reset_normal();
+	}
+}
+
 static void drg_cpu_probe(void)
 {
 	static const uint16_t saw[] = { 0xc04, 0xfd0, 0x00, 0x04, 0x0c, 0x900, 0x904, 0x908, 0x90c,
 					0x40, 0x44, 0x48, 0x4c, 0x50, 0x54, 0xc0c, 0xc10, 0xc14, 0xc18 };
 	cpu_len = 0;
+	drg_slots();
 	cpu_put("PLL L gold (direct)", (uint32_t)(DRG_PLL_GOLD + 4), rd32(DRG_PLL_GOLD + 4), 0);
 	for (unsigned i = 0; i < sizeof(saw) / sizeof(saw[0]); i++)
 		cpu_rd("saw4", DRG_SAW_GOLD + saw[i]);

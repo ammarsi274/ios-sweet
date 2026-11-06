@@ -384,6 +384,44 @@ int drg_emmc_log_open(void)
 	return -6;
 }
 
+/*
+ * Boot slots (gptslot.c): block access for the GPT only. Writes are refused
+ * outside the two GPT copies of this eMMC (LBA 1-33 and the last 33 LBAs of
+ * 122,142,720, measured 2026-11-03), whatever gptslot.c asks for.
+ */
+#define DRG_EMMC_LAST_LBA	122142719ULL
+
+static int gpt_rd(void *ctx, uint64_t lba, uint8_t *buf)
+{
+	uint32_t resp = 0, st = 0;
+	(void)ctx;
+	if (lba > DRG_EMMC_LAST_LBA || read_block((uint32_t)lba, &resp, &st))
+		return -1;
+	for (int i = 0; i < 512; i++)
+		buf[i] = byte_at((unsigned)i);
+	return 0;
+}
+
+static int gpt_wr(void *ctx, uint64_t lba, const uint8_t *buf)
+{
+	uint32_t resp = 0, st = 0;
+	(void)ctx;
+	if (!((lba >= 1 && lba <= 33) || (lba >= DRG_EMMC_LAST_LBA - 32 && lba <= DRG_EMMC_LAST_LBA)))
+		return -1;
+	for (int i = 0; i < 128; i++)
+		sector[i] = buf[4 * i] | buf[4 * i + 1] << 8 | buf[4 * i + 2] << 16 | (uint32_t)buf[4 * i + 3] << 24;
+	return xfer_block((uint32_t)lba, 1, &resp, &st) ? -1 : 0;
+}
+
+int drg_emmc_slots(int mode, struct gpt_slots_result *r)
+{
+	if (*(volatile uint32_t *)(CQ_BASE + CQ_CFG) & CQ_CFG_ENABLE)
+		return -100;
+	hc_wr(SDHCI_INT_ENABLE, hc_rd(SDHCI_INT_ENABLE) | INT_ERRORS | INT_CMD_DONE | INT_XFER_DONE | INT_BUF_READ);
+	struct gpt_io io = { gpt_rd, gpt_wr, 0 };
+	return gpt_slots(&io, DRG_EMMC_LAST_LBA, mode, r);
+}
+
 uint64_t drg_emmc_log_lba(void)
 {
 	return log_lba;
