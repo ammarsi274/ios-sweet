@@ -1,0 +1,13 @@
+drg: power off and restart, backlight off with the display (patch 0919)
+
+Boot #53: iOS shut down for a 0 % battery reading (6 LowBatteryLog
+reports) and every shutdown panicked "Halt/Restart Timed Out" after 30 s:
+nothing set PE_halt_restart. DrgPlatformExpert now restarts as the shim
+does (IMEM restart_reason 0, PSCI SYSTEM_RESET, PS_HOLD) and powers off
+as HMD msm-poweroff.c/qpnp-power-on.c do (PON PS_HOLD reset type 4 on
+PM660 and PM660L, PSCI SYSTEM_OFF, PS_HOLD), writing the PON only when
+the SPMI ownership table gives it to EE 0. Panics keep their screen.
+
+The panel is an LCD: DrgFramebuffer's "display off" painted black but
+left the WLED at level 2047 (boot #53 drew 400-900 mA). Display off/on
+now also switches the WLED module (DrgBacklight.cpp, patch 0917).

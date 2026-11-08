@@ -1,0 +1,237 @@
+drg: power off and restart, backlight off with the display (patch 0919)
+
+Boot #53: iOS shut down for a 0 % battery reading (6 LowBatteryLog
+reports) and every shutdown panicked "Halt/Restart Timed Out" after 30 s:
+nothing set PE_halt_restart. DrgPlatformExpert now restarts as the shim
+does (IMEM restart_reason 0, PSCI SYSTEM_RESET, PS_HOLD) and powers off
+as HMD msm-poweroff.c/qpnp-power-on.c do (PON PS_HOLD reset type 4 on
+PM660 and PM660L, PSCI SYSTEM_OFF, PS_HOLD), writing the PON only when
+the SPMI ownership table gives it to EE 0. Panics keep their screen.
+
+The panel is an LCD: DrgFramebuffer's "display off" painted black but
+left the WLED at level 2047 (boot #53 drew 400-900 mA). Display off/on
+now also switches the WLED module (DrgBacklight.cpp, patch 0917).
+
+diff --git a/iokit/Kernel/arm/DrgFramebuffer.cpp b/iokit/Kernel/arm/DrgFramebuffer.cpp
+index 91c95cb..2bafe1f 100644
+--- a/iokit/Kernel/arm/DrgFramebuffer.cpp
++++ b/iokit/Kernel/arm/DrgFramebuffer.cpp
+@@ -18,8 +18,10 @@
+  *   6  SwapWait, 7 GetID, 8 GetDisplaySize -> [w, h],
+  *   12 RequestPowerChange [state]: 0 = display off (backboardd, power
+  *      button / auto-lock), else on. Off fades the panel out over a few
+- *      vsyncs (halving each pixel) and keeps it black until on again;
+- *      the panel itself stays powered (AMOLED black pixels are off).
++ *      vsyncs (halving each pixel) and keeps it black until on again.
++ *      The panel is an LCD (CTC OTM1911A): black pixels do not switch the
++ *      backlight off, so off/on also switch the PM660L WLED module
++ *      (DrgBacklight.cpp, drg_backlight_display; patch 0919).
+  *   18 IsMainDisplay,
+  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
+  * Everything else is accepted and logged once.
+@@ -38,6 +40,7 @@
+ 
+ extern "C" int drg_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void drg_perf_fb(uint64_t abs);      /* bsd/kern/drg_perf.c */
++extern "C" void drg_backlight_display(int on);  /* DrgBacklight.cpp */
+ 
+ #if defined(DRG)
+ #include <IOKit/IOService.h>
+@@ -642,13 +645,17 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		if (args->scalarInputCount >= 1) {
+ 			bool off = args->scalarInput[0] == 0;
+ 			IOLockLock(fFB->fLock);
+-			if (off != fFB->fPowerOff) {
++			bool changed = off != fFB->fPowerOff;
++			if (changed) {
+ 				fFB->fPowerOff = off;
+ 				fFB->fFadeStep = 0;
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+ 			IOLog("DRG FB: display %s\n", off ? "off" : "on");
++			if (changed) {
++				drg_backlight_display(!off);
++			}
+ 		}
+ 		break;
+ 	case kDrgFBSwapWait:
+diff --git a/iokit/Kernel/arm/DrgPlatformExpert.cpp b/iokit/Kernel/arm/DrgPlatformExpert.cpp
+index a2eb5ca..b267ff7 100644
+--- a/iokit/Kernel/arm/DrgPlatformExpert.cpp
++++ b/iokit/Kernel/arm/DrgPlatformExpert.cpp
+@@ -22,6 +22,165 @@ public:
+ 
+ OSDefineMetaClassAndStructors(DrgPlatformExpert, IODTPlatformExpert);
+ 
++/*
++ * Power off and restart (patch 0919). Without PE_halt_restart, every iOS
++ * shutdown (power-off slider, Restart, the low-battery shutdown) waited 30 s
++ * and panicked "Halt/Restart Timed Out" (boot #53, photo).
++ *   restart: IMEM restart_reason 0x146bf65c = 0 (ABL's normal start), PSCI
++ *     SYSTEM_RESET, PS_HOLD 0x10ac000 = 0 if it returns: the shim's reset,
++ *     measured on this phone (BOOTLOG milestone 2).
++ *   power off: as HMD msm-poweroff.c do_msm_poweroff + qpnp-power-on.c
++ *     qpnp_pon_reset_config: on each PON (PM660 SID 0 primary, PM660L SID 2
++ *     secondary, both GEN2: RESET_EN in PS_HOLD_RST_CTL2 0x5b bit 7) clear
++ *     RESET_EN, >= 500 us, PS_HOLD_RST_CTL 0x5a[3:0] = 4 (shutdown), set
++ *     RESET_EN; then drop PS_HOLD. PSCI SYSTEM_OFF in between (not measured
++ *     here; PS_HOLD follows if it returns). TWRP leaves 0x85a/0x85b = 01/80
++ *     (primary, warm reset) and 04/00 (secondary).
++ * PMIC writes go through the SPMI arbiter's channel only when its ownership
++ * table gives the PON to EE 0 (as DrgBacklight.cpp); otherwise PSCI alone.
++ * Panics keep their screen (no restart on kPEPanicRestartCPU).
++ */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define HR_CORE_PA      0x0800f000u
++#define HR_CNFG_PA      0x0800a000u
++#define HR_CHNLS_PA     0x08400000u
++#define HR_OBS_PA       0x09400000u
++#define HR_STRIDE       0x8000u
++#define HR_PSHOLD_PA    0x010ac000u
++#define HR_IMEM_PA      0x146bf000u     /* restart_reason at +0x65c */
++#define HR_PSCI_OFF     0x84000008ul
++#define HR_PSCI_RESET   0x84000009ul
++
++struct hr_pon {
++	vm_offset_t obs, chan;
++	uint32_t ppid;
++};
++static struct hr_pon hr_pons[2] = { { 0, 0, 0x008 }, { 0, 0, 0x208 } };
++static vm_offset_t hr_pshold, hr_imem;
++
++static uint64_t
++hr_smc(uint64_t fn)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = 0;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++                 "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	return x0;
++}
++
++static bool
++hr_wait(vm_offset_t ch)
++{
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t st = *(volatile uint32_t *)(ch + 0x08u);
++		__asm__ volatile ("dmb oshld" ::: "memory");
++		if (st & 1u) {
++			return !(st & 0x0eu);
++		}
++		IODelay(1);
++	}
++	return false;
++}
++
++static bool
++hr_rd(const struct hr_pon *p, uint8_t reg, uint8_t *v)
++{
++	*(volatile uint32_t *)p->obs = (1u << 27) | ((uint32_t)reg << 4);
++	__asm__ volatile ("dsb osh" ::: "memory");
++	if (!hr_wait(p->obs)) {
++		return false;
++	}
++	*v = (uint8_t)*(volatile uint32_t *)(p->obs + 0x18u);
++	return true;
++}
++
++static bool
++hr_wr(const struct hr_pon *p, uint8_t reg, uint8_t v)
++{
++	*(volatile uint32_t *)(p->chan + 0x10u) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++	*(volatile uint32_t *)p->chan = (uint32_t)reg << 4;
++	__asm__ volatile ("dsb osh" ::: "memory");
++	return hr_wait(p->chan);
++}
++
++static void
++hr_setup(void)
++{
++	vm_offset_t core = ml_io_map(HR_CORE_PA, 0x1000), cnfg = ml_io_map(HR_CNFG_PA, 0x1000);
++	hr_pshold = ml_io_map(HR_PSHOLD_PA, 0x1000);
++	hr_imem = ml_io_map(HR_IMEM_PA, 0x1000);
++	if (!core || !cnfg || *(volatile uint32_t *)core != 0x30000000u) {
++		IOLog("DRG POWER: SPMI arbiter not as expected: PSCI only\n");
++		return;
++	}
++	for (unsigned k = 0; k < 2; k++) {
++		struct hr_pon *p = &hr_pons[k];
++		uint32_t apid = 0xffff;
++		for (uint32_t n = 0; n < 512; n++) {
++			if (((*(volatile uint32_t *)(core + 0x800u + 4u * n) >> 8) & 0xfffu) == p->ppid) {
++				apid = n;
++				break;
++			}
++		}
++		uint32_t owner = apid == 0xffff ? 7 : *(volatile uint32_t *)(cnfg + 0x700u + 4u * apid) & 7u;
++		if (apid != 0xffff && owner == 0) {
++			p->obs = ml_io_map(HR_OBS_PA + HR_STRIDE * apid, 0x1000);
++			p->chan = ml_io_map(HR_CHNLS_PA + HR_STRIDE * apid, 0x1000);
++		}
++		uint8_t ctl = 0xee, ctl2 = 0xee;
++		if (p->obs) {
++			(void)hr_rd(p, 0x5a, &ctl);
++			(void)hr_rd(p, 0x5b, &ctl2);
++		}
++		IOLog("DRG POWER: PON 0x%03x apid %u owner EE %u, PS_HOLD_RST_CTL %02x/%02x%s\n", p->ppid, apid, owner,
++		    ctl, ctl2, p->obs && p->chan ? "" : " (not ours)");
++	}
++}
++
++static void
++hr_pon_type(uint8_t type)
++{
++	for (unsigned k = 0; k < 2; k++) {
++		struct hr_pon *p = &hr_pons[k];
++		uint8_t ctl = 0, ctl2 = 0;
++		if (!p->obs || !p->chan || !hr_rd(p, 0x5a, &ctl) || !hr_rd(p, 0x5b, &ctl2)) {
++			continue;
++		}
++		(void)hr_wr(p, 0x5b, ctl2 & 0x7f);
++		IODelay(500);
++		(void)hr_wr(p, 0x5a, (uint8_t)((ctl & 0xf0) | type));
++		(void)hr_wr(p, 0x5b, ctl2 | 0x80);
++	}
++}
++
++static int
++drg_halt_restart(unsigned int type)
++{
++	if (type == kPEHaltCPU) {
++		hr_pon_type(4);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		(void)hr_smc(HR_PSCI_OFF);
++	} else if (type == kPERestartCPU) {
++		if (hr_imem) {
++			*(volatile uint32_t *)(hr_imem + 0x65cu) = 0;
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		(void)hr_smc(HR_PSCI_RESET);
++	} else {
++		return -1;
++	}
++	if (hr_pshold) {
++		*(volatile uint32_t *)hr_pshold = 0;
++	}
++	for (;;) {
++		__asm__ volatile ("wfe");
++	}
++}
++
+ bool
+ DrgPlatformExpert::start(IOService *provider)
+ {
+@@ -29,6 +188,8 @@ DrgPlatformExpert::start(IOService *provider)
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+ 	}
++	hr_setup();
++	PE_halt_restart = drg_halt_restart;
+ 	registerService();
+ 	IOLog("DRG: platform expert registered\n");
+ 	return true;

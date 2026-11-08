@@ -4,8 +4,8 @@
  * qpnp-fg-gen3.c, fg-reg.h, smb-reg.h, smb-lib.c and this phone's device
  * tree). Plain register reads over the SPMI arbiter's observer channels (as
  * drg_keys.c: v3 arbiter, APID map at core + 0x800 + 4n, observer of EE 0 at
- * 0x9400000 + 0x8000 * apid); nothing is written to the PMIC, no fuel gauge
- * SRAM. PM660 = SPMI SID 0, so a register 0xPPRR is PPID 0x0PP, offset 0xRR.
+ * 0x9400000 + 0x8000 * apid); no fuel gauge SRAM, and the only PMIC write is
+ * the charger watchdog pet below. PM660 = SPMI SID 0, so a register 0xPPRR is PPID 0x0PP, offset 0xRR.
  *
  *   state of charge  0x4009 (monotonic SOC) and its copy 0x400a, used only
  *                    when equal; 255 -> 100, 0 -> 0, else
@@ -22,6 +22,17 @@
  * DrgBatteryFallback set. Never publishes 0 % or a critical level from a
  * single sample. The design capacity is this phone's profile in its device
  * tree: "DRG_alt_3000mah_100k" / "DRG_coslight_3000mah_200k", 3000 mAh, 4.4 V.
+ *
+ * Charger watchdog (patch 0919): boot #53's first start came right after
+ * TWRP and ran 87 min with charger state 7 (disabled) on a PC port, 56 % ->
+ * 3 %; later cold starts showed state 3. Linux (qpnp-smb2.c smb2_init_hw)
+ * leaves WD_CFG 0x1651 = 0x42 (timer on at plug-in, bark interrupt) and
+ * 0x1653 = 0x0b, and pets BARK_BITE_WDOG_PET 0x1643 = 1 on each bark
+ * (smblib_handle_wdog_bark); the PMIC keeps that across a warm restart. So
+ * every 5 s, when 0x1651 bits 1:0 arm the timer, the MISC block (PPID 0x016)
+ * gets the same pet, through the arbiter's channel only if EE 0 owns it.
+ * That is the only PMIC write. The first sample also logs the charger's
+ * enable/status registers, and every charger state change is logged.
  */
 #if defined(ARM64_BOARD_CONFIG_DRG)
 #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
@@ -40,11 +51,13 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);   /* as
 #define SPMI_CORE_PA            0x0800f000u
 #define SPMI_OBS_PA             0x09400000u
 #define SPMI_OBS_STRIDE         0x8000u
+#define SPMI_CNFG_PA            0x0800a000u
+#define SPMI_CHNLS_PA           0x08400000u
 #define SPMI_APIDS              512u
 #define SPMI_NO_APID            0xffffu
 
-enum { P_SOC, P_BATT, P_CHG, P_USB, P_COUNT };
-static const uint16_t drg_bat_ppid[P_COUNT] = { 0x040, 0x041, 0x010, 0x013 };
+enum { P_SOC, P_BATT, P_CHG, P_USB, P_MISC, P_COUNT };
+static const uint16_t drg_bat_ppid[P_COUNT] = { 0x040, 0x041, 0x010, 0x013, 0x016 };
 
 class DrgBattery : public IOPMPowerSource {
 	OSDeclareDefaultStructors(DrgBattery);
@@ -59,10 +72,14 @@ private:
 	bool spmiSetup(void);
 	bool rd(unsigned p, uint8_t reg, unsigned bytes, uint32_t *out);
 	void sample(bool full);
+	void petWatchdog(void);
 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
 
 	vm_offset_t fCore = 0;
 	vm_offset_t fObs[P_COUNT] = {};
+	vm_offset_t fMiscChan = 0;
+	unsigned fChgState = 8;
+	unsigned fPets = 0;
 	IOWorkLoop *fWL = NULL;
 	IOTimerEventSource *fTimer = NULL;
 	unsigned fTicks = 0;
@@ -200,14 +217,52 @@ DrgBattery::spmiSetup(void)
 		}
 		if (apid == SPMI_NO_APID) {
 			IOLog("DRG BATTERY: PPID %#x not in the arbiter's map\n", drg_bat_ppid[p]);
+			if (p == P_MISC) {
+				continue;       /* only the watchdog pet and its log need it */
+			}
 			return false;
 		}
 		fObs[p] = ml_io_map(SPMI_OBS_PA + SPMI_OBS_STRIDE * apid, 0x1000);
 		if (!fObs[p]) {
 			return false;
 		}
+		if (p == P_MISC) {
+			vm_offset_t cnfg = ml_io_map(SPMI_CNFG_PA, 0x1000);
+			uint32_t owner = cnfg ? *(volatile uint32_t *)(cnfg + 0x700u + 4u * apid) & 7u : 7u;
+			if (owner == 0) {
+				fMiscChan = ml_io_map(SPMI_CHNLS_PA + SPMI_OBS_STRIDE * apid, 0x1000);
+			}
+			IOLog("DRG BATTERY: charger MISC apid %u, owner EE %u: %s\n", apid, owner,
+			    fMiscChan ? "watchdog pet on" : "not ours, no pet");
+		}
 	}
 	return true;
+}
+
+void
+DrgBattery::petWatchdog(void)
+{
+	uint32_t cfg = 0;
+	if (!fMiscChan || !rd(P_MISC, 0x51, 1, &cfg) || !(cfg & 3u)) {
+		return;
+	}
+	*(volatile uint32_t *)(fMiscChan + 0x10u) = 1;      /* BARK_BITE_WDOG_PET bit 0 */
+	__asm__ volatile("dsb osh" ::: "memory");
+	*(volatile uint32_t *)fMiscChan = 0x43u << 4;       /* EXT_WRITEL, one byte */
+	__asm__ volatile("dsb osh" ::: "memory");
+	bool ok = false;
+	for (unsigned i = 0; i < 1000; ++i) {
+		uint32_t st = *(volatile uint32_t *)(fMiscChan + 0x08u);
+		__asm__ volatile("dmb oshld" ::: "memory");
+		if (st & 1u) {
+			ok = !(st & 0x0eu);
+			break;
+		}
+		IODelay(1);
+	}
+	if (fPets++ == 0 || !ok) {
+		IOLog("DRG BATTERY: charger watchdog pet (WD_CFG %#x)%s\n", cfg, ok ? "" : " failed");
+	}
 }
 
 /* bytes (1..4) from reg of peripheral p through its observer channel, little endian */
@@ -215,6 +270,9 @@ bool
 DrgBattery::rd(unsigned p, uint8_t reg, unsigned bytes, uint32_t *out)
 {
 	vm_offset_t ch = fObs[p];
+	if (!ch) {
+		return false;
+	}
 	__asm__ volatile("dmb oshst" ::: "memory");
 	*(volatile uint32_t *)ch = (1u << 27) | ((uint32_t)reg << 4) | (bytes - 1);
 	__asm__ volatile("dsb osh" ::: "memory");
@@ -258,6 +316,16 @@ DrgBattery::sample(bool full)
 		(void)rd(P_BATT, 0x10, 1, &d);   /* bit 3: battery missing */
 		IOLog("DRG BATTERY: first sample raw soc %#x v %#x i %#x t %#x tok %#x chg %#x usb %#x; "
 		    "therm %#x sense %#x prof %#x missing %#x\n", soc, vraw, iraw, traw, tok, chg, usb, a, b, c, d);
+		uint32_t st2 = 0, en = 0, cfg2 = 0, wst = 0, wcfg = 0, wbite = 0, mrt = 0;
+		(void)rd(P_CHG, 0x07, 1, &st2);   /* BATTERY_CHARGER_STATUS_2: errors, temperature */
+		(void)rd(P_CHG, 0x42, 1, &en);    /* CHARGING_ENABLE_CMD bit 0 */
+		(void)rd(P_CHG, 0x51, 1, &cfg2);  /* CHGR_CFG2: enable source/polarity */
+		(void)rd(P_MISC, 0x0c, 1, &wst);  /* WDOG_STATUS */
+		(void)rd(P_MISC, 0x51, 1, &wcfg); /* WD_CFG */
+		(void)rd(P_MISC, 0x53, 1, &wbite);/* SNARL_BARK_BITE_WD_CFG: bit 7 bite disables charging */
+		(void)rd(P_MISC, 0x10, 1, &mrt);  /* MISC RT_STS: bit 1 bark */
+		IOLog("DRG BATTERY: charger status2 %#x enable %#x cfg2 %#x; watchdog status %#x cfg %#x bite %#x rt %#x\n",
+		    st2, en, cfg2, wst, wcfg, wbite, mrt);
 		fLogged = true;
 	}
 	if (!ok || (soc & 0xff) != (soc >> 8)) {
@@ -298,10 +366,11 @@ DrgBattery::sample(bool full)
 	putNumber("DrgBatteryPercent", pct);
 	legacy(mah, mv, -ma, plugged, charging && !full_);
 	updateStatus();
-	if (!fHaveGood || pct != fPercent) {
+	if (!fHaveGood || pct != fPercent || state != fChgState) {
 		IOLog("DRG BATTERY: %u%% %u mV %d mA %d.%02d C usb %d charger state %u\n", pct, mv, ma,
 		    centic / 100, (centic < 0 ? -centic : centic) % 100, plugged, state);
 	}
+	fChgState = state;
 	fHaveGood = true;
 	fPercent = pct;
 }
@@ -313,6 +382,7 @@ DrgBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
 	if (!me) {
 		return;
 	}
+	me->petWatchdog();
 	me->sample(me->fTicks++ % 6 == 0);       /* full every 30 s, plug-in bit every 5 s */
 	sender->setTimeoutMS(5000);
 }

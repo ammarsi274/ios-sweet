@@ -22,6 +22,15 @@
  * (0x800a000 + 0x700 + 4 * apid, bits 2:0) gives the channel to EE 0. Not
  * measured on this phone yet: logged at start; if not ours, the service is
  * still published (so CoreBrightness runs) but writes are skipped.
+ * Boot #53: apid 6, owner EE 0, level 2047 as ABL left it.
+ *
+ * Display off/on (patch 0919): the panel is an LCD, so black pixels still
+ * burn the backlight (#53: 400-900 mA drawn, the screen "off" 22 % of the
+ * time). DrgFramebuffer calls drg_backlight_display(): off clears MODULE_EN
+ * (ctrl block 0xd800 = PPID 0x3d8, reg 0x46 bit 7, then >= 5 ms), on writes
+ * the level, sets MODULE_EN and waits >= 10 ms for the soft start
+ * (qpnp_wled_module_en; this phone's node has no lcd-psm-ctrl, so no PSM
+ * step). TWRP with its screen timed out reads 0xd846 = 0x00.
  */
 #if defined(ARM64_BOARD_CONFIG_DRG)
 #include <device/device_types.h>
@@ -38,6 +47,8 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);   /* as
 #define BL_OBS_PA       0x09400000u
 #define BL_STRIDE       0x8000u
 #define BL_SINK_PPID    0x3d9u          /* PM660L SID 3, peripheral 0xd9 */
+#define BL_CTRL_PPID    0x3d8u          /* PM660L SID 3, peripheral 0xd8 */
+#define BL_MODULE_EN    0x46u           /* ctrl block: bit 7 */
 #define BL_MIN          16
 #define BL_MAX          4095
 
@@ -46,18 +57,35 @@ class AppleARMBacklight : public IOService {
 public:
 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+	void display(bool on);
 private:
 	bool spmiSetup(void);
 	bool rd(uint8_t reg, uint8_t *v);
 	bool wr(uint8_t reg, uint8_t v);
+	bool wrCtrl(uint8_t reg, uint8_t v);
 	void publish(SInt32 value);
 	void apply(SInt32 level);
 
-	vm_offset_t fObs = 0, fChan = 0;
-	bool fWritable = false;
+	vm_offset_t fObs = 0, fChan = 0, fCtrlObs = 0, fCtrl = 0;
+	bool fWritable = false, fOff = false;
 	SInt32 fValue = BL_MAX;
+	unsigned fChanges = 0;
+	IOLock *fLock = NULL;
 };
 OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+
+static AppleARMBacklight *gDrgBacklight;
+
+static uint32_t
+bl_apid(vm_offset_t core, uint32_t ppid)
+{
+	for (uint32_t n = 0; n < 512; n++) {
+		if (((*(volatile uint32_t *)(core + 0x800u + 4u * n) >> 8) & 0xfffu) == ppid) {
+			return n;
+		}
+	}
+	return 0xffff;
+}
 
 bool
 AppleARMBacklight::spmiSetup(void)
@@ -66,13 +94,7 @@ AppleARMBacklight::spmiSetup(void)
 	if (!core || !cnfg || *(volatile uint32_t *)core != 0x30000000u) {
 		return false;
 	}
-	uint32_t apid = 0xffff;
-	for (uint32_t n = 0; n < 512; n++) {
-		if (((*(volatile uint32_t *)(core + 0x800u + 4u * n) >> 8) & 0xfffu) == BL_SINK_PPID) {
-			apid = n;
-			break;
-		}
-	}
+	uint32_t apid = bl_apid(core, BL_SINK_PPID);
 	if (apid == 0xffff) {
 		IOLog("DRG BACKLIGHT: WLED sink (PPID 0x3d9) not in the arbiter's map\n");
 		return false;
@@ -83,6 +105,14 @@ AppleARMBacklight::spmiSetup(void)
 	fWritable = fChan != 0;
 	IOLog("DRG BACKLIGHT: WLED sink apid %u, owner EE %u: %s\n", apid, owner,
 	    fWritable ? "brightness control on" : "not ours, read only");
+	uint32_t capid = bl_apid(core, BL_CTRL_PPID);
+	uint32_t cowner = capid == 0xffff ? 7 : *(volatile uint32_t *)(cnfg + 0x700u + 4u * capid) & 7u;
+	if (capid != 0xffff && cowner == 0) {
+		fCtrlObs = ml_io_map(BL_OBS_PA + BL_STRIDE * capid, 0x1000);
+		fCtrl = ml_io_map(BL_CHNLS_PA + BL_STRIDE * capid, 0x1000);
+	}
+	IOLog("DRG BACKLIGHT: WLED ctrl apid %u, owner EE %u: %s\n", capid, cowner,
+	    fCtrl && fCtrlObs ? "backlight off with the display" : "not ours, stays on");
 	return fObs != 0;
 }
 
@@ -120,6 +150,16 @@ AppleARMBacklight::wr(uint8_t reg, uint8_t v)
 	*(volatile uint32_t *)fChan = (uint32_t)reg << 4;      /* EXT_WRITEL (0), one byte */
 	__asm__ volatile("dsb osh" ::: "memory");
 	return bl_wait(fChan);
+}
+
+bool
+AppleARMBacklight::wrCtrl(uint8_t reg, uint8_t v)
+{
+	*(volatile uint32_t *)(fCtrl + 0x10u) = v;
+	__asm__ volatile("dsb osh" ::: "memory");
+	*(volatile uint32_t *)fCtrl = (uint32_t)reg << 4;
+	__asm__ volatile("dsb osh" ::: "memory");
+	return bl_wait(fCtrl);
 }
 
 void
@@ -180,17 +220,67 @@ AppleARMBacklight::setProperties(OSObject *properties)
 		level = BL_MAX;
 	}
 	if (level != fValue) {
+		IOLockLock(fLock);
 		apply(level);
 		fValue = level;
+		IOLockUnlock(fLock);
 		publish(level);
+		if (fChanges++ < 8 || fChanges % 50 == 0) {
+			IOLog("DRG BACKLIGHT: level %d (change %u)\n", (int)level, fChanges);
+		}
 	}
 	return kIOReturnSuccess;
+}
+
+void
+AppleARMBacklight::display(bool on)
+{
+	if (!fCtrl || !fCtrlObs || !fWritable) {
+		return;
+	}
+	IOLockLock(fLock);
+	if (on == !fOff) {
+		IOLockUnlock(fLock);
+		return;
+	}
+	bool ok;
+	if (on) {
+		apply(fValue);
+		ok = wrCtrl(BL_MODULE_EN, 0x80);
+		IOSleep(10);
+	} else {
+		ok = wrCtrl(BL_MODULE_EN, 0x00);
+		IOSleep(5);
+	}
+	fOff = !on;
+	uint8_t en = 0xee;
+	*(volatile uint32_t *)fCtrlObs = (1u << 27) | ((uint32_t)BL_MODULE_EN << 4);
+	__asm__ volatile("dsb osh" ::: "memory");
+	if (bl_wait(fCtrlObs)) {
+		en = (uint8_t)*(volatile uint32_t *)(fCtrlObs + 0x18u);
+	}
+	IOLockUnlock(fLock);
+	IOLog("DRG BACKLIGHT: display %s, MODULE_EN 0x%02x%s\n", on ? "on" : "off", en,
+	    ok ? "" : " (write failed)");
+}
+
+/* DrgFramebuffer (patch 0919): RequestPowerChange from backboardd. */
+extern "C" void
+drg_backlight_display(int on)
+{
+	if (gDrgBacklight) {
+		gDrgBacklight->display(on != 0);
+	}
 }
 
 bool
 AppleARMBacklight::start(IOService *provider)
 {
 	if (!IOService::start(provider)) {
+		return false;
+	}
+	fLock = IOLockAlloc();
+	if (!fLock) {
 		return false;
 	}
 	if (spmiSetup()) {
@@ -207,6 +297,7 @@ AppleARMBacklight::start(IOService *provider)
 	}
 	setProperty("backlight-control", kOSBooleanTrue);
 	publish(fValue);
+	gDrgBacklight = this;
 	registerService();
 	return true;
 }
