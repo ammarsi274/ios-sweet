@@ -15,6 +15,7 @@
 #include "drg_rpm.h"
 #include "drg_ts.h"
 #include "drg_gpu.h"
+#include "fdt.h"
 
 #define RESTART_BOOTLOADER	0x77665500U
 
@@ -878,23 +879,43 @@ static void __attribute__((noreturn)) reset_normal(void)
 		__asm__ volatile("wfe");
 }
 
-static int vol_up_held(void)
+/* PON RT_STS (bit 0 power, bit 1 volume up) in the low byte, or 0x100 | -rc on a failed read */
+static uint32_t pon_rt_raw(void)
 {
 	unsigned int apid = drg_spmi_apid(DRG_PON_PPID_SLOTS);
 	uint8_t st = 0;
-	if (apid == 0xffff || drg_spmi_read(apid, 0x10, &st))
-		return 0;
-	return (st >> 1) & 1;
+	int rc = apid == 0xffff ? 0xff : drg_spmi_read(apid, 0x10, &st);
+	return rc ? 0x100u | ((uint32_t)-rc & 0xff) : st;
 }
 
 static void cpu_put(const char *label, uint32_t a, uint32_t v, int rc);
 
+/*
+ * Boot #53: no TWRP however Volume Up was held, and the one read at this
+ * point said "not held" (the read itself is right: TWRP's Linux reports
+ * Volume Up as PON resin). The key is now sampled when the shim starts on
+ * Silver (vol_up_early) and again for 1 s here, with a hint on screen.
+ */
+static volatile uint32_t vol_up_early = 0x200;	/* not sampled */
+
 static void drg_slots(void)
 {
-	int up = vol_up_held();
+	uint32_t raw_early = vol_up_early;
+	int up = raw_early < 0x100 && ((raw_early >> 1) & 1);
+	uint32_t raw = 0x200, waited = 0;
+	if (!up) {
+		con_str("BUTTONS", "hold Volume Up now for TWRP");
+		for (waited = 0; waited < 10 && !up; waited++) {
+			raw = pon_rt_raw();
+			up = raw < 0x100 && ((raw >> 1) & 1);
+			if (!up)
+				delay_ms(100);
+		}
+	}
 	struct gpt_slots_result r;
 	int rc = drg_emmc_slots(up ? GPT_SLOTS_TWRP_ONCE : GPT_SLOTS_NORMAL, &r);
-	cpu_put("slots vol-up mode", 0, (uint32_t)up, 0);
+	cpu_put("slots pon early late", raw_early, raw, 0);
+	cpu_put("slots vol-up mode", waited, (uint32_t)up, 0);
 	cpu_put("slots rc primary backup", (uint32_t)r.primary << 16 | ((uint32_t)r.backup & 0xffff), (uint32_t)rc,
 		rc < 0);
 	cpu_put("slots was a b", r.was_a, r.was_b, 0);
@@ -1094,6 +1115,132 @@ static void drg_l6_enable(void)
 	con_hex2("L6 WRITE", "status=", st, "en/st=", (uint32_t)en << 8 | ready);
 }
 
+/* One PMIC byte through the arbiter's channel, only if EE 0 owns the peripheral. */
+static int drg_spmi_write(uint32_t ppid, uint8_t addr, uint8_t val)
+{
+	unsigned int apid = drg_spmi_apid(ppid);
+	if (apid == 0xffff || (rd32(DRG_SPMI_CNFG + 0x700 + 4 * apid) & 7) != 0)
+		return -2;
+	uintptr_t ch = DRG_SPMI_CHNLS + 0x8000UL * apid;
+	wr32(ch + 0x10, val);
+	wr32(ch + 0x0, (uint32_t)addr << 4);
+	for (int i = 0; i < 100000; i++) {
+		uint32_t st = rd32(ch + 0x8);
+		if (st & 1)
+			return (st & 0xe) ? -(int)st : 0;
+	}
+	return -1;
+}
+
+/*
+ * Power off as HMD msm-poweroff.c do_msm_poweroff + qpnp-power-on.c
+ * qpnp_pon_reset_config (GEN2 PONs: RESET_EN = PS_HOLD_RST_CTL2 0x5b bit 7):
+ * PM660 (PPID 0x008) and PM660L (0x208) get PS_HOLD reset type 4 (shutdown),
+ * then PSCI SYSTEM_OFF, then PS_HOLD 0x10ac000 = 0. The kernel does the same
+ * (patch 0919, DrgPlatformExpert).
+ */
+static void __attribute__((noreturn)) power_off(void)
+{
+	static const uint32_t pons[2] = { 0x008, 0x208 };
+	for (unsigned int k = 0; k < 2; k++) {
+		unsigned int apid = drg_spmi_apid(pons[k]);
+		uint8_t ctl = 0, ctl2 = 0;
+		if (apid == 0xffff || drg_spmi_read(apid, 0x5a, &ctl) || drg_spmi_read(apid, 0x5b, &ctl2))
+			continue;
+		(void)drg_spmi_write(pons[k], 0x5b, ctl2 & 0x7f);
+		delay_us(500);
+		(void)drg_spmi_write(pons[k], 0x5a, (uint8_t)((ctl & 0xf0) | 4));
+		(void)drg_spmi_write(pons[k], 0x5b, ctl2 | 0x80);
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+	smc(0x84000008UL, 0, 0, 0);	/* PSCI SYSTEM_OFF */
+	wr32(PSHOLD, 0);
+	for (;;)
+		__asm__ volatile("wfe");
+}
+
+static void put_dec(char *buf, unsigned v)
+{
+	char t[8];
+	int n = 0;
+	do {
+		t[n++] = (char)('0' + v % 10);
+		v /= 10;
+	} while (v && n < 7);
+	for (int i = 0; i < n; i++)
+		buf[i] = t[n - 1 - i];
+	buf[n] = 0;
+}
+
+/*
+ * Off-mode charging. A charger plugged into a phone that is off makes ABL
+ * start this image with "androidboot.mode=charger" (ABL: "charger path",
+ * "Set off mode charger"); before, the shim booted iOS anyway. The PMIC
+ * charges by itself (boot #53: cold starts show charger state 3, full-on).
+ * Here: a black screen with the fuel gauge's percentage (0x4009/0x400a, as
+ * DrgBattery.cpp), the backlight off after 20 s (WLED MODULE_EN 0xd846
+ * bit 7, PPID 0x3d8), a short Power press lights it again, Power held 2 s
+ * starts iOS (normal reset: a warm start is not ABL's charger path), and
+ * the charger unplugged for 3 s powers the phone off.
+ */
+static void __attribute__((noreturn)) drg_charger_mode(void)
+{
+	unsigned int soc = drg_spmi_apid(0x040), usb = drg_spmi_apid(0x013), chg = drg_spmi_apid(0x010);
+	unsigned int lit = 200, held = 0, gone = 0, shown = 0x1000;
+	int wled = drg_spmi_write(0x3d8, 0x46, 0x80);
+	for (unsigned int tick = 0;; tick++) {
+		uint8_t s1 = 0, s2 = 1, u = 0x10, c = 0;
+		(void)drg_spmi_read(soc, 0x09, &s1);
+		(void)drg_spmi_read(soc, 0x0a, &s2);
+		(void)drg_spmi_read(usb, 0x10, &u);
+		(void)drg_spmi_read(chg, 0x06, &c);
+		uint32_t pon = pon_rt_raw();
+		int power = pon < 0x100 && (pon & 1);
+
+		unsigned int pct = s1 == s2 ? (s1 == 255 ? 100 : s1 == 0 ? 0 : ((s1 - 1u) * 98 + 126) / 253 + 1) : 0xfff;
+		unsigned int state = (unsigned int)(c & 7);
+		if (pct != shown || tick % 100 == 0) {
+			char line[24] = "", num[8];
+			put_dec(num, pct);
+			int n = 0;
+			for (const char *p = pct == 0xfff ? "--" : num; *p; p++)
+				line[n++] = *p;
+			line[n++] = ' ';
+			line[n++] = '%';
+			line[n] = 0;
+			con_clear(0xff000000U);
+			con_skip(); con_skip(); con_skip(); con_skip(); con_skip(); con_skip();
+			con_str(state <= 4 ? "CHARGING" : state == 7 ? "PAUSED" : "FULL", line);
+			con_skip();
+			con_str("POWER", "hold 2 s to start iOS");
+			con_hex2("PMIC", "chg=", c, "wled=", (uint32_t)wled);
+			shown = pct;
+		}
+
+		if (power) {
+			if (lit == 0)
+				(void)drg_spmi_write(0x3d8, 0x46, 0x80);
+			lit = 200;
+			if (++held >= 20) {
+				con_str("POWER", "starting iOS");
+				delay_ms(300);
+				reset_normal();
+			}
+		} else {
+			held = 0;
+		}
+		if (lit && --lit == 0)
+			(void)drg_spmi_write(0x3d8, 0x46, 0x00);
+		if (!((u >> 4) & 1)) {
+			if (++gone >= 30)
+				power_off();
+		} else {
+			gone = 0;
+		}
+		delay_ms(100);
+	}
+}
+
 static void drg_ldo_probe(void)
 {
 	/*
@@ -1211,6 +1358,11 @@ static void __attribute__((noreturn)) drg_main(uint64_t dtb)
 	stage = "drg wdt";
 	wr32(WDT_BASE + WDT_EN, 0);
 	__asm__ volatile("dsb sy" ::: "memory");
+
+	vol_up_early = pon_rt_raw();	/* as early as possible: see drg_slots */
+	stage = "drg charger";
+	if (fdt_chosen_has(dtb, "bootargs", "androidboot.mode=charger"))
+		drg_charger_mode();
 
 	stage = "drg console";
 	con_clear(0xff102040U);
