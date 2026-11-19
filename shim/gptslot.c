@@ -12,6 +12,15 @@
  *              boot_b = 0x0f (priority 3, active, one try, not successful):
  *              ABL boots TWRP once, then finds B out of tries and falls back
  *              to A ("Slot %s is unbootable, trying alternate slot").
+ *   every other "<name>_a"/"<name>_b" entry: only the active bit, set on
+ *              the chosen slot's side and cleared on the other. Boot #54's
+ *              first start changed boot_a/boot_b alone and ABL stopped in
+ *              download mode with current-slot b, B's try unused (ABL:
+ *              "Boot lun: %x and BootableSlot: %s do not match"): the
+ *              firmware chain (xbl, abl, tz, ...) is chosen by these bits.
+ *              `fastboot --set-active` flips exactly this bit on all 24
+ *              pairs (backup/gpt-2026-11-03, B active -> after set-active=a)
+ *              and its TWRP start on slot B worked (2026-11-03).
  *
  * Both GPT copies, each checked first (signature, header CRC, entry CRC, the
  * shape measured on this phone: 88 entries of 128 bytes at LBA 2, backup
@@ -64,6 +73,18 @@ static int name_is(const uint8_t *e, const char *want)
 			return 1;
 	}
 	return 0;
+}
+
+/* 'a' or 'b' for a name ending in "_a"/"_b", else 0 */
+static int slot_of(const uint8_t *e)
+{
+	unsigned n = 0;
+	while (n < 36 && (e[56 + 2 * n] | e[57 + 2 * n]))
+		n++;
+	if (n < 3 || e[56 + 2 * (n - 2)] != '_' || e[57 + 2 * (n - 2)] || e[57 + 2 * (n - 1)])
+		return 0;
+	uint8_t c = e[56 + 2 * (n - 1)];
+	return c == 'a' || c == 'b' ? c : 0;
 }
 
 static int hdr_crc_ok(void)
@@ -124,11 +145,22 @@ static int apply(const struct gpt_io *io, uint64_t at, uint64_t other, int mode,
 	*was_a = *pa, *was_b = *pb;
 	uint8_t na = mode == GPT_SLOTS_TWRP_ONCE ? 0x7a : 0x7f;
 	uint8_t nb = mode == GPT_SLOTS_TWRP_ONCE ? 0x0f : (uint8_t)(*pb & ~0x04);
-	if (*pa == na && *pb == nb)
-		return 0;
 	for (unsigned i = 0; i < sizeof(ent); i++)
 		orig[i] = ent[i];
 	*pa = na, *pb = nb;
+	int on = mode == GPT_SLOTS_TWRP_ONCE ? 'b' : 'a';
+	for (int i = 0; i < GPT_N; i++) {
+		uint8_t *e = ent + i * GPT_ESZ;
+		int s = slot_of(e);
+		if (!s || i == a || i == b)
+			continue;
+		e[ATTR_OFF] = s == on ? (uint8_t)(e[ATTR_OFF] | 0x04) : (uint8_t)(e[ATTR_OFF] & ~0x04);
+	}
+	int changed = 0;
+	for (unsigned i = 0; i < sizeof(ent) && !changed; i++)
+		changed = ent[i] != orig[i];
+	if (!changed)
+		return 0;
 	p32(hdr + 88, crc32(ent, sizeof(ent)));
 	p32(hdr + 16, 0);
 	p32(hdr + 16, crc32(hdr, g32(hdr + 12)));

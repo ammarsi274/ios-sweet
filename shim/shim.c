@@ -900,18 +900,22 @@ static volatile uint32_t vol_up_early = 0x200;	/* not sampled */
 
 static void drg_slots(void)
 {
+	/*
+	 * #54's first start took the TWRP path with nobody holding the key (its
+	 * log was overwritten; the next start logged 0/0 and no TWRP). So one
+	 * reading no longer decides: Volume Up must read held 3 times in a row,
+	 * 100 ms apart, within 1.5 s. The early sample is only logged.
+	 */
 	uint32_t raw_early = vol_up_early;
-	int up = raw_early < 0x100 && ((raw_early >> 1) & 1);
-	uint32_t raw = 0x200, waited = 0;
-	if (!up) {
-		con_str("BUTTONS", "hold Volume Up now for TWRP");
-		for (waited = 0; waited < 10 && !up; waited++) {
-			raw = pon_rt_raw();
-			up = raw < 0x100 && ((raw >> 1) & 1);
-			if (!up)
-				delay_ms(100);
-		}
+	uint32_t raw = 0x200, waited, run = 0;
+	con_str("BUTTONS", "hold Volume Up now for TWRP");
+	for (waited = 0; waited < 15 && run < 3; waited++) {
+		raw = pon_rt_raw();
+		run = raw < 0x100 && ((raw >> 1) & 1) ? run + 1 : 0;
+		if (run < 3)
+			delay_ms(100);
 	}
+	int up = run >= 3;
 	struct gpt_slots_result r;
 	int rc = drg_emmc_slots(up ? GPT_SLOTS_TWRP_ONCE : GPT_SLOTS_NORMAL, &r);
 	cpu_put("slots pon early late", raw_early, raw, 0);
