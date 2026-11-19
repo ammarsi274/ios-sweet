@@ -12,15 +12,21 @@
  *              boot_b = 0x0f (priority 3, active, one try, not successful):
  *              ABL boots TWRP once, then finds B out of tries and falls back
  *              to A ("Slot %s is unbootable, trying alternate slot").
- *   every other "<name>_a"/"<name>_b" entry: only the active bit, set on
- *              the chosen slot's side and cleared on the other. Boot #54's
- *              first start changed boot_a/boot_b alone and ABL stopped in
- *              download mode with current-slot b, B's try unused (ABL:
- *              "Boot lun: %x and BootableSlot: %s do not match"): the
- *              firmware chain (xbl, abl, tz, ...) is chosen by these bits.
- *              `fastboot --set-active` flips exactly this bit on all 24
- *              pairs (backup/gpt-2026-11-03, B active -> after set-active=a)
- *              and its TWRP start on slot B worked (2026-11-03).
+ *   boot_b's partition type GUID: twrp once gives it the boot type GUID
+ *              20117F86-E985-4357-B9EE-374BC1D8487D, normal puts back the
+ *              "disabled" type 77036CD4-03D5-42BB-8ED1-37E5A88BAA34 that
+ *              every inactive-slot entry carries. ABL (LinuxLoader
+ *              FindBootableSlot, research/reports/abl-slots.md) refuses a
+ *              slot whose boot_X and system_X type GUIDs are equal ("does not
+ *              have valid guids"): #54's first start and the 2026-11-19 test
+ *              (flags only, boot_b and system_b both 77036CD4) stopped in
+ *              download mode with B's try unused, and `fastboot boot` failed.
+ *              `fastboot --set-active` swaps the type GUIDs of all 24 pairs
+ *              (it switches the firmware chain too, which XBL picks by GUID);
+ *              here only boot_b changes, so xbl/tz/abl stay slot A. After
+ *              TWRP, B is out of tries and ABL's own fallback re-activates A.
+ *   normal also sets the active bit on every "<name>_a" entry and clears it
+ *              on "<name>_b", as ABL's SetActiveSlot does for slot A.
  *
  * Both GPT copies, each checked first (signature, header CRC, entry CRC, the
  * shape measured on this phone: 88 entries of 128 bytes at LBA 2, backup
@@ -148,13 +154,22 @@ static int apply(const struct gpt_io *io, uint64_t at, uint64_t other, int mode,
 	for (unsigned i = 0; i < sizeof(ent); i++)
 		orig[i] = ent[i];
 	*pa = na, *pb = nb;
-	int on = mode == GPT_SLOTS_TWRP_ONCE ? 'b' : 'a';
-	for (int i = 0; i < GPT_N; i++) {
+	static const uint8_t guid_boot[16] = { 0x86, 0x7f, 0x11, 0x20, 0x85, 0xe9, 0x57, 0x43,
+					       0xb9, 0xee, 0x37, 0x4b, 0xc1, 0xd8, 0x48, 0x7d };
+	static const uint8_t guid_off[16] = { 0xd4, 0x6c, 0x03, 0x77, 0xd5, 0x03, 0xbb, 0x42,
+					      0x8e, 0xd1, 0x37, 0xe5, 0xa8, 0x8b, 0xaa, 0x34 };
+	uint8_t *ga = ent + a * GPT_ESZ, *gb = ent + b * GPT_ESZ;
+	for (int k = 0; k < 16; k++) {
+		if (ga[k] != guid_boot[k])
+			return -9;	/* boot_a must be the live boot partition */
+		gb[k] = mode == GPT_SLOTS_TWRP_ONCE ? guid_boot[k] : guid_off[k];
+	}
+	for (int i = 0; mode != GPT_SLOTS_TWRP_ONCE && i < GPT_N; i++) {
 		uint8_t *e = ent + i * GPT_ESZ;
 		int s = slot_of(e);
 		if (!s || i == a || i == b)
 			continue;
-		e[ATTR_OFF] = s == on ? (uint8_t)(e[ATTR_OFF] | 0x04) : (uint8_t)(e[ATTR_OFF] & ~0x04);
+		e[ATTR_OFF] = s == 'a' ? (uint8_t)(e[ATTR_OFF] | 0x04) : (uint8_t)(e[ATTR_OFF] & ~0x04);
 	}
 	int changed = 0;
 	for (unsigned i = 0; i < sizeof(ent) && !changed; i++)
