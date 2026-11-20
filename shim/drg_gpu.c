@@ -2264,6 +2264,34 @@ static void g4_core(void)
 						put("MISMATCH obj ");
 						puthex(o->id);
 						put("\n");
+#ifdef DRG_GPU_RT_REPLAY
+						/* word diff against Linux's contents (this record carries them when has) */
+						if (has) {
+							const volatile uint32_t *me = (const volatile uint32_t *)(uintptr_t)o->pa;
+							uint32_t ndiff = 0, shown = 0, nz_me = 0, nz_lx = 0;
+							for (uint64_t w = 0; w < n / 4; w++) {
+								uint32_t lx = cle32(d + 40 + 4 * w), mv = me[w];
+								nz_me += mv != 0;
+								nz_lx += lx != 0;
+								if (lx != mv) {
+									ndiff++;
+									if (shown < 12) {
+										shown++;
+										put(" @");
+										puthex((uint32_t)(4 * w));
+										put(" ours ");
+										puthex(mv);
+										put(" linux ");
+										puthex(lx);
+										put("\n");
+									}
+								}
+							}
+							lv(" words differing", ndiff);
+							lv(" nonzero words ours", nz_me);
+							lv(" nonzero words linux", nz_lx);
+						}
+#endif
 					}
 				}
 			}
@@ -2350,6 +2378,17 @@ static void g4_core(void)
 			row[(RT_W + 63) / 64] = '\n';
 			row[(RT_W + 63) / 64 + 1] = 0;
 			put(row);
+		}
+		/* VSC block 0xbc0-0xc0f as the last draw left it (names [E]: freedreno a5xx.xml) */
+		put("vsc regs 0xbc0..0xc0f:\n");
+		for (uint32_t r = 0xbc0; r < 0xc10; r += 8) {
+			puthex(r);
+			put(":");
+			for (uint32_t k = 0; k < 8; k++) {
+				put(" ");
+				puthex(rd(GPU_REG(r + k)));
+			}
+			put("\n");
 		}
 		lv("rt texels right", good);
 		lv("rt texels untouched", untouched);
