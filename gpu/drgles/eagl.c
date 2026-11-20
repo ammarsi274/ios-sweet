@@ -765,8 +765,24 @@ static int read_small(const char *path, char *buf, size_t n)
  * "mode N" for this bench, library and kernel, no fault mark is set, and the GPU was not tried in
  * this boot before (a restarted backboardd stays on the CPU, and that restart sets the fault mark).
  */
+#ifdef DRG_EAGL_GPU
+static volatile int gpu_build = 1;
+#else
+static volatile int gpu_build = 0;	/* volatile: the GPU path stays in the library (build-eagl.sh checks its imports) */
+#endif
+
 static int decide(void)
 {
+	if (!gpu_build) {
+	/*
+	 * Root r28: off unless built with -DDRG_EAGL_GPU. Boot #58 (r27): backboardd on the GPU crashed in
+	 * CA::Render::iosurface_get_edr_factor (an IOSurface client with no shared state page, read at
+	 * 0x30), eglMakeCurrent failed on CoreAnimation's render thread (EGL 3002) and a 2-plane 'b3a8'
+	 * surface was not supported; every boot's self-test re-enabled it, so backboardd crashed each boot.
+	 */
+		LOG("GPU drawing off in this build (DRG_EAGL_GPU not set): CPU drawing\n");
+		return 0;
+	}
 	char text[256], boot[80], prev[80];
 	int missing = 0, mode = -1;
 	double t0 = now_ms();

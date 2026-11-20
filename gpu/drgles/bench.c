@@ -1552,10 +1552,12 @@ static int selftest_boot(const char *self, const char *cache, int delay_s, char 
 	 * verdict and no GPU use in this boot yet (BOOT_FILE is written only when the GPU is used), so it
 	 * draws with the GPU. A second restart in this boot stays on the CPU and sets the fault mark.
 	 */
+#ifdef DRG_EAGL_GPU	/* only with a libdrgeagl that draws with the GPU (root r28: off) */
 	if (!rc && v >= 0) {
 		int bb = pid_of("backboardd");
 		host_log("selftest-boot: restarting backboardd (pid %d) for GPU drawing: %d\n", bb, bb ? kill(bb, 15) : -1);
 	}
+#endif
 	return rc ? 1 : 0;
 }
 #endif
