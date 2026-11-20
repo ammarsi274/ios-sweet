@@ -105,6 +105,7 @@ struct kobj {
 };
 
 #define NDEV 4
+#define NLAST 16
 static struct kdev {
 	int used;
 	int fd;			/* placeholder descriptor */
@@ -112,6 +113,7 @@ static struct kdev {
 	uint64_t memstore;
 	struct kobj *objs;
 	uint32_t nobjs, cap;
+	struct { uint32_t ctx, ts, used; } last[NLAST];	/* each context's last submitted timestamp */
 } devs[NDEV];
 
 static unsigned long seen_req[64];
@@ -164,13 +166,21 @@ void kgsl_ios_readback(int mode)
  *   KGSL_IOS_FLUSH_ALL    that, plus every live object that is not an import
  *                         (IB2s and state the blob wrote outside IB1: H1)
  *   KGSL_IOS_DELAY        no cache maintenance; spin 2 ms before the kick (H2)
- * All end with dsb sy. Imported IOSurfaces are never touched: their
- * mappings belong to the surface (and can be big render targets).
+ * All end with dsb sy. Imported IOSurfaces are not touched before a submit
+ * (they can be big render targets): they get one clean+invalidate when they
+ * are imported and one after the GPU wrote them (kgsl_ios_cpu_sync).
+ * Default since root r25: FLUSH_ALL (boot #55: the only mode without a GPU
+ * fault, 200 back-to-back frames OK, drg/BOOTLOG.md).
  */
-static int opt_flush = KGSL_IOS_FLUSH_IBS;
+static int opt_flush = KGSL_IOS_FLUSH_ALL;
 void kgsl_ios_flush(int mode)
 {
 	opt_flush = mode;
+}
+
+int kgsl_ios_flush_mode(void)
+{
+	return opt_flush;
 }
 
 #define DELAY_NS 2000000
@@ -194,6 +204,13 @@ static void flush_range(uint64_t va, uint64_t len)
 	(void)len;
 }
 #endif
+
+static void dsb_sy(void)
+{
+#if defined(__aarch64__)
+	__asm__ volatile("dsb sy" ::: "memory");
+#endif
+}
 
 static void spin_ns(int64_t ns)
 {
@@ -349,6 +366,7 @@ int kgsl_open(int flags)
 	d->memstore = 0;
 	d->objs = 0;
 	d->nobjs = d->cap = 0;
+	memset(d->last, 0, sizeof(d->last));	/* a reused slot: no context of the old connection */
 	return fd;
 }
 
@@ -462,6 +480,17 @@ static long gpuobj_import(struct kdev *d, struct gpuobj_import *im)
 	uint64_t flags = (im->flags & ~(KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_MEMALIGN_MASK | KGSL_MEMFLAGS_USERMEM_MASK)) |
 			 KGSL_MEMFLAGS_USERMEM_ION | (uint64_t)align << 16;
 	*o = (struct kobj){ (uint32_t)out[0], 1, 0, out[1], out[2], flags, 1, surface };
+	/*
+	 * Before the GPU first touches it: clean+invalidate its lines (dirty lines
+	 * from whoever wrote it through a cached alias, e.g. the kernel zeroing a
+	 * new surface, would otherwise be written back over what the GPU draws).
+	 * DrgGPU's own flush at SURFACE_MAP is not enough for a big surface: XNU's
+	 * dcache_incoherent_io_flush64 (osfmk/arm/caches.c 153) does a set/way
+	 * flush of the calling core only once the length reaches the L2 size
+	 * (osfmk/arm/cpuid.c 367); dc civac by VA is broadcast to every core.
+	 */
+	flush_range(o->va, o->size);
+	dsb_sy();
 	im->id = o->id;
 	im->flags = flags;
 	host_log("drgles: IOSurface %u imported: object %u at 0x%llx, 0x%llx bytes, flags 0x%llx\n", surface, o->id,
@@ -543,6 +572,164 @@ static long gpuobj_free(struct kdev *d, struct gpuobj_free *f)
 	o->live = 0;
 	o->freed = 1;	/* until the driver's munmap of it */
 	return 0;
+}
+
+/*
+ * GPUOBJ_SYNC (0x49): the driver's own cache maintenance requests. Boot #55
+ * (logs/boot55/drgles-selftest.log): Nokia's driver called it 18 times in the
+ * flushall run (16 in the 200-frame test, 2 around the sampled IOSurface) and
+ * got EINVAL (not in the measured set). HMD kgsl.c kgsl_ioctl_gpuobj_sync:
+ * 1..128 entries, entries copied with min(obj_len, 24) bytes at a stride of
+ * 24, unknown ids skipped, op must have CLEAN and/or INV, without CACHE_RANGE
+ * the whole object; Linux does nothing for its write-combined objects. Here:
+ * dc civac over the range for every op (EL0 has no invalidate-only dc), the
+ * range clipped to the object, so a call never fails on a found object.
+ */
+#define KGSL_GPUMEM_CACHE_CLEAN	0x1u
+#define KGSL_GPUMEM_CACHE_INV	0x2u
+#define KGSL_GPUMEM_CACHE_RANGE	0x80000000u
+struct gpuobj_sync { uint64_t objs; uint32_t obj_len, count; };
+struct gpuobj_sync_obj { uint64_t offset, length; uint32_t id, op; };
+static unsigned sync_ioctls, sync_logged;
+
+static long gpuobj_sync(struct kdev *d, struct gpuobj_sync *s)
+{
+	if (!s->count || s->count > 128 || !s->objs)
+		return -E_INVAL;
+	for (uint32_t i = 0; i < s->count; i++) {
+		struct gpuobj_sync_obj ob;
+		memset(&ob, 0, sizeof(ob));
+		memcpy(&ob, (const uint8_t *)(uintptr_t)s->objs + (uint64_t)i * sizeof(ob),
+		       s->obj_len < sizeof(ob) ? s->obj_len : sizeof(ob));
+		struct kobj *o = obj_find(d, ob.id);
+		if (!o)
+			continue;
+		if (!(ob.op & (KGSL_GPUMEM_CACHE_CLEAN | KGSL_GPUMEM_CACHE_INV)))
+			return -E_INVAL;
+		uint64_t off = 0, len = o->size;
+		if (ob.op & KGSL_GPUMEM_CACHE_RANGE) {
+			off = ob.offset < o->size ? ob.offset : o->size;
+			len = ob.length < o->size - off ? ob.length : o->size - off;
+		}
+		if (sync_logged < 4) {
+			sync_logged++;
+			host_log("drgles: GPUOBJ_SYNC object %u%s op 0x%x offset 0x%llx length 0x%llx (obj_len %u, count %u)\n",
+				 ob.id, o->imports ? " (import)" : "", ob.op, (unsigned long long)off,
+				 (unsigned long long)len, s->obj_len, s->count);
+		}
+		if (len)
+			flush_range(o->va + off, len);
+	}
+	dsb_sy();
+	sync_ioctls++;
+	return 0;
+}
+
+/* each context's last submitted timestamp (for kgsl_ios_cpu_sync) */
+static void last_set(struct kdev *d, uint32_t ctx, uint32_t ts)
+{
+	int free_slot = -1;
+	for (int i = 0; i < NLAST; i++) {
+		if (d->last[i].used && d->last[i].ctx == ctx) {
+			d->last[i].ts = ts;
+			return;
+		}
+		if (!d->last[i].used && free_slot < 0)
+			free_slot = i;
+	}
+	if (free_slot < 0) {	/* more contexts than slots: forget the oldest entry's context (logged) */
+		host_log("drgles: more than %d contexts submitting; context %u not tracked for CPU sync\n", NLAST,
+			 d->last[0].ctx);
+		free_slot = 0;
+	}
+	d->last[free_slot].ctx = ctx;
+	d->last[free_slot].ts = ts;
+	d->last[free_slot].used = 1;
+}
+
+static void last_drop(struct kdev *d, uint32_t ctx)
+{
+	for (int i = 0; i < NLAST; i++)
+		if (d->last[i].used && d->last[i].ctx == ctx)
+			d->last[i].used = 0;
+}
+
+/* surfaces the GPU writes (render targets), by IOSurface id */
+static uint32_t gpu_written[NSURF];
+static unsigned ngpu_written;
+static uint64_t cs_calls, cs_bytes, cs_ns;
+
+void kgsl_ios_surface_gpu_written(uint32_t surface)
+{
+	for (unsigned i = 0; i < ngpu_written; i++)
+		if (gpu_written[i] == surface)
+			return;
+	if (ngpu_written < NSURF)
+		gpu_written[ngpu_written++] = surface;
+	else
+		host_log("drgles: more than %d GPU-written surfaces; %u not synced for the CPU\n", NSURF, surface);
+}
+
+static int marked(uint32_t surface)
+{
+	for (unsigned i = 0; i < ngpu_written; i++)
+		if (gpu_written[i] == surface)
+			return 1;
+	return 0;
+}
+
+static int64_t now_ns(void)
+{
+	struct host_ts t;
+	return host_clock(1, &t) ? 0 : t.sec * 1000000000 + t.nsec;
+}
+
+int kgsl_ios_cpu_sync(void)
+{
+	int err = 0, n = 0;
+	for (int k = 0; k < NDEV; k++) {	/* 1. the GPU is done with everything submitted so far */
+		struct kdev *d = &devs[k];
+		if (!d->used)
+			continue;
+		for (int i = 0; i < NLAST; i++) {
+			if (!d->last[i].used)
+				continue;
+			uint64_t in[3] = { d->last[i].ctx, d->last[i].ts, 2000 };
+			int rc = call(d, DRGPU_UC_WAIT, in, 3, 0, 0, 0, 0, 0, 0);
+			if (rc && !err) {
+				err = rc;
+				host_log("drgles: CPU sync: wait for context %u timestamp %u: %d\n", d->last[i].ctx,
+					 d->last[i].ts, rc);
+			}
+		}
+	}
+	int64_t t0 = now_ns();
+	uint64_t bytes = 0;
+	for (int k = 0; k < NDEV; k++) {	/* 2. no stale line of a GPU-written surface stays in any CPU cache */
+		struct kdev *d = &devs[k];
+		if (!d->used)
+			continue;
+		for (uint32_t i = 0; i < d->nobjs; i++) {
+			struct kobj *o = &d->objs[i];
+			if (o->live && o->imports && marked(o->surface)) {
+				flush_range(o->va, o->size);
+				bytes += o->size;
+				n++;
+			}
+		}
+	}
+	dsb_sy();
+	cs_calls++;
+	cs_bytes += bytes;
+	cs_ns += now_ns() - t0;
+	return err ? err : n;
+}
+
+void kgsl_ios_sync_stats(uint64_t *calls, uint64_t *bytes, uint64_t *ns)
+{
+	*calls = cs_calls;
+	*bytes = cs_bytes;
+	*ns = cs_ns;
 }
 
 static long gpu_command(struct kdev *d, struct gpu_command *c)
@@ -636,6 +823,7 @@ static long gpu_command(struct kdev *d, struct gpu_command *c)
 	if (rc)
 		return rc;
 	c->timestamp = (uint32_t)out[0];
+	last_set(d, c->context_id, c->timestamp);
 	return 0;
 }
 
@@ -669,7 +857,10 @@ static long ioctl_(int fd, unsigned long req, void *arg)
 	}
 	case 0x14: {	/* DRAWCTXT_DESTROY */
 		uint64_t in[1] = { ((struct drawctxt_destroy *)arg)->drawctxt_id };
-		return call(d, DRGPU_UC_CTX_DESTROY, in, 1, 0, 0, 0, 0, 0, 0);
+		int rc = call(d, DRGPU_UC_CTX_DESTROY, in, 1, 0, 0, 0, 0, 0, 0);
+		if (!rc)
+			last_drop(d, (uint32_t)in[0]);	/* DrgGPU waited for its work */
+		return rc;
 	}
 	case 0x40: {	/* SYNCSOURCE_CREATE */
 		uint64_t out[1] = { 0 };
@@ -695,6 +886,8 @@ static long ioctl_(int fd, unsigned long req, void *arg)
 		return gpuobj_info(d, arg);
 	case 0x48:	/* GPUOBJ_IMPORT */
 		return gpuobj_import(d, arg);
+	case 0x49:	/* GPUOBJ_SYNC (root r25) */
+		return gpuobj_sync(d, arg);
 	case 0x4a:	/* GPU_COMMAND */
 		return gpu_command(d, arg);
 	default:
@@ -783,5 +976,7 @@ void kgsl_report(void)
 {
 	for (int i = 0; i < nseen; i++)
 		host_log("kgsl ioctl %08lx x%u\n", seen_req[i], seen_count[i]);
+	host_log("cache: flush mode %d, %u GPUOBJ_SYNC calls; CPU sync %llu calls, %llu MiB invalidated in %.2f ms\n",
+		 opt_flush, sync_ioctls, (unsigned long long)cs_calls, (unsigned long long)(cs_bytes >> 20), cs_ns / 1e6);
 }
 

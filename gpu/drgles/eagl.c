@@ -19,26 +19,36 @@
  * module), imported zero-copy: measured on TWRP (render target and sampling,
  * RGBA and BGRA, 1125x2436, GPU-DRAW-PLAN.md).
  *
- * Safety: the GPU is used only if the boot's self-test (com.drg.gpuselftest,
- * bench -selftest) wrote a passing submission framing to MODE_FILE; once
+ * Safety: the GPU is used only if the self-test (com.drg.gpuselftest,
+ * bench -selftest) found a passing submission framing; once
  * per boot (a restarted backboardd stays on SWContext); a GPU fault seen at
  * a flush aborts backboardd so that launchd restarts it on SWContext.
  * Anything unexpected makes initWithAPI: return nil: CoreAnimation then
  * draws with SWContext, as before.
+ *
+ * Root r25: loaded by an LC_LOAD_WEAK_DYLIB in /usr/libexec/backboardd
+ * (launchd drops DYLD_INSERT_LIBRARIES for com.apple.* jobs, boot #53). The
+ * verdict comes from the cache /private/var/db/drg/gpu-selftest (verdict.h),
+ * read at load without waiting: unless it is "mode N" for this bench,
+ * library and kernel, no GPU fault mark is set and the GPU was not tried
+ * before in this boot, nothing is replaced and backboardd runs exactly as
+ * without this library (CPU drawing). With the GPU, every frame ends with
+ * glFinish and a CPU sync of the render targets (wait + dc civac) before
+ * CoreAnimation hands the surface to the display (boot #55: GPU-written
+ * surfaces read 48 % stale by the CPU without it).
  */
 #include "elf.h"
 #include "host.h"
 #include "rt.h"
 #include "kgsl.h"
 #include "drgwin.h"
+#include "verdict.h"
 #include "bionic/bionic.h"
 #include "../drgpu/drgpu_uc.h"
 
 #define LIBS_DIR	"/usr/local/drgles/adreno"
 #define LOG_FILE	"/private/var/tmp/drgeagl.log"	/* backboardd runs as mobile: /var/log and /var/run are root's */
-#define MODE_FILE	"/private/var/run/drg-gpu-mode"
 #define BOOT_FILE	"/private/var/tmp/drgeagl-boot"
-#define MODE_WAIT_S	150
 
 /* ---- libSystem, libobjc, IOSurface (declarations as the SDK has them) ---- */
 typedef long ssize_t;
@@ -51,7 +61,7 @@ int proc_name(int pid, void *buf, uint32_t size);
 int sysctlbyname(const char *, void *, size_t *, void *, size_t);
 void abort(void) __attribute__((noreturn));
 char *strstr(const char *, const char *);
-long atol(const char *);
+int access(const char *, int);
 uint64_t mach_absolute_time(void);
 struct mach_timebase_info { uint32_t numer, denom; };
 int mach_timebase_info(struct mach_timebase_info *);
@@ -259,8 +269,19 @@ static void make_current(struct ectx *c)
 }
 
 /* ---- frames: flush = finish (the panel copy must see a whole frame), fault check, timing ---- */
-static double flush_ms, last_flush;
-static unsigned frames;
+static double flush_ms, sync_ms, last_flush;
+static unsigned frames, sync_errs;
+
+/* the next boot's self-test reruns, and until then this library stays off (verdict.h) */
+static void mark_fault(const char *why)
+{
+	int fd = open(DRG_FAULT_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd >= 0) {
+		write(fd, why, strlen(why));
+		close(fd);
+	}
+	LOG("fault mark %s: %s (fd %d)\n", DRG_FAULT_FILE, why, fd);
+}
 
 static void frame_end(void)
 {
@@ -270,15 +291,22 @@ static void frame_end(void)
 	if (kgsl_ios_faulted()) {
 		LOG("GPU fault seen at a flush after %u frames: aborting backboardd (launchd restarts it on SWContext)\n",
 		    frames);
+		mark_fault("GPU fault in backboardd\n");
 		abort();
 	}
+	/* the render targets (attachImage surfaces) as the GPU wrote them, before the display reads them */
+	int sr = kgsl_ios_cpu_sync();
+	double t2 = now_ms();
+	if (sr < 0 && sync_errs++ < 8)
+		LOG("CPU sync after frame %u: wait error %d\n", frames, sr);
 	frames++;
 	flush_ms += t1 - t0;
+	sync_ms += t2 - t1;
 	if (frames % 120 == 0) {
-		LOG("%u frames; last 120: %.1f ms between flushes, %.2f ms waiting for the GPU each\n", frames,
-		    (t1 - last_flush) / 120, flush_ms / 120);
-		flush_ms = 0;
-		last_flush = t1;
+		LOG("%u frames; last 120: %.1f ms between flushes, %.2f ms waiting for the GPU and %.2f ms CPU sync each\n",
+		    frames, (t2 - last_flush) / 120, flush_ms / 120, sync_ms / 120);
+		flush_ms = sync_ms = 0;
+		last_flush = t2;
 	}
 }
 
@@ -704,14 +732,21 @@ static EGLImage surface_image(IOSurfaceRef s)
 	return m->img;
 }
 
-/* ---- the GPU, once per boot, if the self-test passed ---- */
+/* ---- the GPU, once per boot, if the cached self-test verdict says so ---- */
 static int gpu_state;	/* 0 not tried, 1 up, -1 off */
+static int gpu_mode = -1;	/* the verdict's mode, set at load by decide() */
 
-static long boot_sec(void)
+/* this boot's identity: kern.bootsessionuuid (random per boot, XNU kern_sysctl.c 2769); the phone has no RTC */
+static void boot_id(char *b, size_t n)
 {
-	struct { long sec; int usec; } tv = { 0, 0 };
-	size_t n = sizeof(tv);
-	return sysctlbyname("kern.boottime", &tv, &n, 0, 0) ? -1 : tv.sec;
+	size_t l = n - 1;
+	if (sysctlbyname("kern.bootsessionuuid", b, &l, 0, 0) || l >= n) {
+		struct { long sec; int usec; } tv = { 0, 0 };
+		size_t tl = sizeof(tv);
+		snprintf(b, n, "boottime %ld", sysctlbyname("kern.boottime", &tv, &tl, 0, 0) ? -1L : tv.sec);
+		return;
+	}
+	b[l] = 0;
 }
 
 static int read_small(const char *path, char *buf, size_t n)
@@ -725,48 +760,51 @@ static int read_small(const char *path, char *buf, size_t n)
 	return r > 0 ? 0 : -1;
 }
 
+/*
+ * At load, no waiting: 1 if the GPU may be used in this process. Off unless the cached verdict is
+ * "mode N" for this bench, library and kernel, no fault mark is set, and the GPU was not tried in
+ * this boot before (a restarted backboardd stays on the CPU, and that restart sets the fault mark).
+ */
+static int decide(void)
+{
+	char text[256], boot[80], prev[80];
+	int missing = 0, mode = -1;
+	double t0 = now_ms();
+	uint64_t key = drg_verdict_key_now(&missing);
+	int have = read_small(DRG_VERDICT_FILE, text, sizeof(text)) == 0;
+	int fault = access(DRG_FAULT_FILE, 0) == 0;
+	enum drg_verdict_use u = drg_verdict_check(have ? text : 0, key, fault, &mode);
+	LOG("verdict: key %016llx (%d of 2 files unreadable, %.1f ms), %s, mode %d\n", (unsigned long long)key, missing,
+	    now_ms() - t0, drg_verdict_why(u), mode);
+	if (u != DRG_VERDICT_USE || mode < 0 || mode > DRG_MODE_MAX) {
+		LOG("staying on CPU drawing: nothing replaced\n");
+		return 0;
+	}
+	boot_id(boot, sizeof(boot));
+	if (read_small(BOOT_FILE, prev, sizeof(prev)) == 0 && !strcmp(prev, boot)) {
+		LOG("GPU already tried in this boot (%s): backboardd restarted, staying on CPU drawing\n", boot);
+		mark_fault("backboardd restarted in a boot that used the GPU\n");
+		return 0;
+	}
+	int fd = open(BOOT_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd >= 0) {
+		write(fd, boot, strlen(boot));
+		close(fd);
+	}
+	gpu_mode = mode;
+	LOG("GPU drawing allowed with self-test mode %d (boot %s)\n", mode, boot);
+	return 1;
+}
+
 static int gpu_up(void)
 {
 	if (gpu_state)
 		return gpu_state > 0;
 	gpu_state = -1;
-	char b[64];
-	long boot = boot_sec();
-	if (read_small(BOOT_FILE, b, sizeof(b)) == 0 && atol(b) == boot) {
-		LOG("already tried in this boot (backboardd restarted): staying on SWContext\n");
+	if (gpu_mode < 0)
 		return 0;
-	}
-	int fd = open(BOOT_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-	if (fd >= 0) {
-		int n = snprintf(b, sizeof(b), "%ld\n", boot);
-		write(fd, b, (size_t)n);
-		close(fd);
-	}
-	/* the self-test's verdict: "mode N" (DRGPU_UC_OPT_* bits that passed) or "none" */
-	int mode = -1;
-	double t0 = now_ms();
-	b[0] = 0;
-	for (int i = 0; i < MODE_WAIT_S * 2 && mode < 0; i++) {
-		if (read_small(MODE_FILE, b, sizeof(b)) == 0) {
-			if (!strncmp(b, "mode ", 5) && b[5] >= '0' && b[5] <= '9')
-				mode = (int)atol(b + 5);
-			else
-				break;
-		} else {
-			host_sleep_ns(500000000);
-		}
-	}
-	if (mode < 0) {
-		LOG("self-test verdict \"%s\" after %.0f ms: staying on SWContext\n", b, now_ms() - t0);
-		return 0;
-	}
-	LOG("self-test passed with mode %d (waited %.0f ms)\n", mode, now_ms() - t0);
-	if (mode > DRG_MODE_MAX) {
-		LOG("self-test mode %d unknown: staying on SWContext\n", mode);
-		return 0;
-	}
 	/* mode: framing bits 0-1, CPU read-back bits 2-3, flushall bit 4, delay bit 5 (bench -selftest) */
-	kgsl_ios_mode(mode);
+	kgsl_ios_mode(gpu_mode);
 	if (load_gl() || build_stubs())
 		return 0;
 	gpu_state = 1;
@@ -870,6 +908,8 @@ static int m_attachImage(id self, SEL cmd, uint64_t target, IOSurfaceRef s, _Boo
 {
 	(void)cmd;
 	struct ectx *c = ectx_of(self);
+	if (c && s)	/* the display's surfaces: the GPU draws them, the display reads them (kgsl_ios_cpu_sync) */
+		kgsl_ios_surface_gpu_written(IOSurfaceGetID(s));
 	return c ? bind_surface(c, (GLenum)target, s, inverted, "attachImage") : 0;
 }
 
@@ -918,7 +958,7 @@ __attribute__((constructor)) static void drgeagl_init(void)
 	char name[64] = "";
 	proc_name(getpid(), name, sizeof(name));
 	if (strcmp(name, "backboardd"))
-		return;	/* DYLD_INSERT_LIBRARIES is inherited by anything backboardd starts */
+		return;	/* only backboardd (its executable's weak load command; an inherited DYLD_INSERT_LIBRARIES) */
 	int fd = open(LOG_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
 	if (fd >= 0)
 		host_log_to(fd);
@@ -931,6 +971,8 @@ __attribute__((constructor)) static void drgeagl_init(void)
 		close(con);
 	}
 	LOG("loaded into backboardd (pid %d)\n", getpid());
+	if (!decide())
+		return;	/* CPU drawing: EAGLContext untouched, backboardd as without this library */
 	Class k = (Class)(void *)&eagl_class;
 	Class super = k ? class_getSuperclass(k) : 0;
 	s_release = sel_registerName("release");

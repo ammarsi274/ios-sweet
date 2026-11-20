@@ -345,6 +345,7 @@ static void *bench_hook(const char *name)
  * forwarded to TWRP but reported as FALLBACK with its call count */
 #include "bionic/bionic.h"
 #include "kgsl.h"
+#include "verdict.h"
 static int stage = 2;
 static unsigned fallback_from = MAXFWD;
 
@@ -1211,8 +1212,14 @@ static int stress_test(EGLDisplay d)
 
 	u32 fbo = 0;
 	fails += frames_test(&fbo);
-	/* 2. a 1125x2436 BGRA IOSurface as render target (backboardd's display size), SF frames, CPU check */
+	/*
+	 * 2. a 1125x2436 BGRA IOSurface as render target (backboardd's display size), SF frames, CPU check.
+	 * Root r25: marked GPU-written, and kgsl_ios_cpu_sync() after glFinish (wait + dc civac) before
+	 * the CPU reads it, as libdrgeagl does before the display gets a frame (boot #55: 48 % stale without).
+	 */
 	IOSurfaceRef ds = make_surface(SW, SH, SBPR);
+	if (ds)
+		kgsl_ios_surface_gpu_written(IOSurfaceGetID(ds));
 	u32 dtex = ds ? surface_texture(d, ds, SW, SH) : 0;
 	u32 dfbo = 0, st = 0;
 	if (dtex) {
@@ -1234,6 +1241,13 @@ static int stress_test(EGLDisplay d)
 			glFlush();
 		}
 		glFinish();
+		uint64_t c0, b0, n0, c1, b1, n1;
+		kgsl_ios_sync_stats(&c0, &b0, &n0);
+		int sr = kgsl_ios_cpu_sync();
+		kgsl_ios_sync_stats(&c1, &b1, &n1);
+		host_log("selftest: CPU sync after the render target frames: %d surface(s), %llu KiB in %.2f ms\n", sr,
+			 (unsigned long long)((b1 - b0) >> 10), (n1 - n0) / 1e6);
+		fails += check("selftest: CPU sync of the render target", sr == 1);
 	}
 	long good = 0;
 	if (dtex && !IOSurfaceLock(ds, 1 /* read-only */, 0)) {
@@ -1297,7 +1311,8 @@ static const char *mode_name(int m)
 	switch (m) {
 	case 4: return "mode 4 (read-back of the submit's objects, IB1 flush)";
 	case 8: return "mode 8 (read-back of every object, IB1 flush)";
-	case DRG_MODE_FLUSHALL: return "flushall (mode 16: dc civac of every live non-import object, no read-back)";
+	case DRG_MODE_FLUSHALL: return "flushall (mode 16: dc civac of every live non-import object, no read-back; "
+				       "render targets invalidated after the GPU)";
 	case DRG_MODE_DELAY: return "delay (mode 32: 2 ms spin before each submit, no flush, no read-back)";
 	default: return "mode ?";
 	}
@@ -1312,14 +1327,21 @@ static const char *mode_name(int m)
  * flushall passes, delay fails) from H2 (GPU-side stale line: delay passes, flushall fails). Mode 8
  * (r23's fallback) runs only if all three fail. The verdict is the first that passed, in that order;
  * "none" keeps backboardd on CPU drawing (SWContext).
+ * Root r25 (boot #55: flushall the only mode without a fault): flushall first, and the others only
+ * if it fails (to tell H1/H2 apart again); the verdict is the first pass in that order. Returns it
+ * (-1 = none).
  */
 static int selftest(const char *self, const char *out, char **envp)
 {
 	enum { NRUN = 4 };
-	static const int order[NRUN] = { 4, DRG_MODE_FLUSHALL, DRG_MODE_DELAY, 8 };
+	static const int order[NRUN] = { DRG_MODE_FLUSHALL, 4, DRG_MODE_DELAY, 8 };
 	int pass[DRG_MODE_MAX + 1] = { 0 }, ran[DRG_MODE_MAX + 1] = { 0 };
 	for (int i = 0; i < NRUN; i++) {
 		int m = order[i];
+		if (m != DRG_MODE_FLUSHALL && pass[DRG_MODE_FLUSHALL]) {
+			host_log("selftest: %s not run (flushall passed)\n", mode_name(m));
+			continue;
+		}
 		if (m == 8 && (pass[4] || pass[DRG_MODE_FLUSHALL] || pass[DRG_MODE_DELAY])) {
 			host_log("selftest: mode 8 not run (a cheaper mode passed)\n");
 			continue;
@@ -1339,8 +1361,10 @@ static int selftest(const char *self, const char *out, char **envp)
 		host_log("selftest: VERDICT %s: %s (status 0x%x)\n", mode_name(m), pass[m] ? "PASS" : "FAIL", st);
 	}
 	char verdict[16] = "none\n";
+	int vmode = -1;
 	for (int i = 0; i < NRUN; i++)
 		if (pass[order[i]]) {
+			vmode = order[i];
 			snprintf(verdict, sizeof(verdict), "mode %d\n", order[i]);
 			break;
 		}
@@ -1359,7 +1383,100 @@ static int selftest(const char *self, const char *out, char **envp)
 	host_log("selftest: SUMMARY mode 4 %s, flushall %s, delay %s, mode 8 %s; points to %s; verdict %s",
 		 res[ran[4] + pass[4]], res[ran[f] + pass[f]], res[ran[dl] + pass[dl]], res[ran[8] + pass[8]], h,
 		 verdict);
+	return vmode;
+}
+
+/*
+ * -selftest-boot CACHE SECONDS (boot job com.drg.gpuselftest since root r25; user: lag after boot
+ * while r24 ran four modes as SpringBoard started). Once per root image: if CACHE holds a verdict
+ * whose key matches this bench, libdrgeagl and kernel (verdict.h) and no GPU fault was recorded
+ * since, it is kept and nothing runs. Otherwise, at nice 10 (children inherit it; the job's plist
+ * also has Nice 10 and LowPriorityIO), wait for SpringBoard (at most 600 s), then SECONDS more, run
+ * the self-test, write CACHE (tmp + rename, 0644) and remove the fault mark. libdrgeagl never
+ * waits for this: without a usable verdict at backboardd's start it draws on the CPU.
+ */
+int setpriority(int, uint32_t, int);
+int proc_listallpids(void *, int);
+int proc_name(int, void *, uint32_t);
+int rename(const char *, const char *);
+int mkdir(const char *, uint16_t);
+int unlink(const char *);
+int chmod(const char *, uint16_t);
+
+static int springboard_running(void)
+{
+	static int pids[4096];
+	int n = proc_listallpids(pids, (int)sizeof(pids));
+	for (int i = 0; i < n && i < 4096; i++) {
+		char nm[64] = "";
+		if (pids[i] > 0 && proc_name(pids[i], nm, sizeof(nm)) > 0 && !strcmp(nm, "SpringBoard"))
+			return 1;
+	}
 	return 0;
+}
+
+static double mono_s(void)
+{
+	struct host_ts t = { 0, 0 };
+	host_clock(1, &t);
+	return (double)t.sec + t.nsec / 1e9;
+}
+
+static int write_file(const char *path, const char *text)
+{
+	int fd = open(path, 0x0601 /* O_WRONLY | O_CREAT | O_TRUNC */, 0644);
+	if (fd < 0)
+		return -1;
+	long w = write(fd, text, strlen(text));
+	close(fd);
+	return w == (long)strlen(text) ? 0 : -1;
+}
+
+static int selftest_boot(const char *self, const char *cache, int delay_s, char **envp)
+{
+	int missing = 0, mode = -1;
+	uint64_t key = drg_verdict_key_now(&missing);
+	char text[256] = "";
+	size_t n = 0;
+	char *t = host_read_file(cache, &n);
+	if (t) {
+		memcpy(text, t, n < sizeof(text) - 1 ? n : sizeof(text) - 1);
+		host_free(t);
+	}
+	int fault = host_access(DRG_FAULT_FILE, 0) == 0;
+	enum drg_verdict_use u = drg_verdict_check(t ? text : 0, key, fault, &mode);
+	host_log("selftest-boot: key %016llx (%d of 2 files unreadable), fault mark %s: %s\n", (unsigned long long)key,
+		 missing, fault ? "present" : "absent", drg_verdict_why(u));
+	if (u == DRG_VERDICT_USE) {
+		if (mode >= 0)
+			host_log("selftest-boot: verdict mode %d kept, self-test not run\n", mode);
+		else
+			host_log("selftest-boot: verdict none kept, self-test not run\n");
+		return 0;
+	}
+	int pr = setpriority(0 /* PRIO_PROCESS */, 0, 10);
+	double t0 = mono_s();
+	while (!springboard_running() && mono_s() - t0 < 600)
+		host_sleep_ns(2000000000);
+	double t1 = mono_s();
+	host_log("selftest-boot: nice 10 (%d); SpringBoard %s after %.0f s; waiting %d s more\n", pr,
+		 springboard_running() ? "running" : "not seen", t1 - t0, delay_s);
+	host_sleep_ns((int64_t)delay_s * 1000000000);
+	int v = selftest(self, "/private/var/run/drg-gpu-mode", envp);
+	char out[128], tmp[256];
+	if (drg_verdict_format(out, sizeof(out), key, v) < 0)
+		return 1;
+	snprintf(tmp, sizeof(tmp), "%s.tmp", cache);
+	mkdir(DRG_VERDICT_DIR, 0755);
+	chmod(DRG_VERDICT_DIR, 0755);
+	int rc = write_file(tmp, out);
+	if (!rc)
+		rc = chmod(tmp, 0644) | rename(tmp, cache);
+	if (fault && !rc)
+		unlink(DRG_FAULT_FILE);
+	host_log("selftest-boot: verdict %d (-1 = none) written to %s: %s (self-test took %.0f s)\n", v, cache,
+		 rc ? "FAILED" : "ok", mono_s() - t1 - delay_s);
+	return rc ? 1 : 0;
 }
 #endif
 
@@ -1510,8 +1627,16 @@ static int main_(int argc, char **argv, char **envp)
 			continue;
 		}
 #ifdef __APPLE__
-		if (!strcmp(argv[i], "-selftest") && i + 1 < argc)	/* the boot job: children do the work */
-			return selftest(argv[0], argv[i + 1], envp);
+		if (!strcmp(argv[i], "-selftest") && i + 1 < argc) {	/* children do the work */
+			selftest(argv[0], argv[i + 1], envp);
+			return 0;
+		}
+		if (!strcmp(argv[i], "-selftest-boot") && i + 2 < argc) {	/* the boot job since root r25 */
+			int s = 0;
+			for (const char *p = argv[i + 2]; *p >= '0' && *p <= '9'; p++)
+				s = s * 10 + (*p - '0');
+			return selftest_boot(argv[0], argv[i + 1], s, envp);
+		}
 		if (!strcmp(argv[i], "-selftest-child") && i + 1 < argc) {
 			selftest_child = 0;
 			for (const char *p = argv[++i]; *p >= '0' && *p <= '9'; p++)

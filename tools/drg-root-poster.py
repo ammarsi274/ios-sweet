@@ -2,7 +2,11 @@
 """Load libdrgposter.dylib into PosterBoard (research/reports/wallpaper.md; root r24).
 
   drg-root-poster.py MOUNTED_ROOT LIBDRGPOSTER
-  drg-root-poster.py --check FILE      verify a PosterBoard executable's load command and signature
+  drg-root-poster.py --check FILE [LIB]  verify an executable's weak load command of LIB (default
+                                        libdrgposter's path) and its signature's page hashes
+  drg-root-poster.py --weak FILE LIB      add an LC_LOAD_WEAK_DYLIB of LIB (an install path on the phone)
+                                        to any ad hoc signed executable FILE, as below (root r25:
+                                        libdrgeagl into /usr/libexec/backboardd, drg-root-gpudraw.py)
 
 LIBDRGPOSTER  tools/ios/build-drgposter.sh's libdrgposter.dylib
 
@@ -132,14 +136,14 @@ def page_hashes_bad(d, cd):
     return bad
 
 
-def patch_exe(path):
+def patch_exe(path, lib=LIB):
     with open(path, 'rb') as f:
         d = bytearray(f.read())
     cmds = commands(d)
     names = [dylib_name(d, off) for c, off, _ in cmds if c in DYLIB_CMDS]
-    if LIB in names:
-        print(f'{path}: already loads {LIB}')
-        return check(path)
+    if lib in names:
+        print(f'{path}: already loads {lib}')
+        return check(path, lib)
     dataoff, datasize, blobs = signature(d, cmds)
     cds = code_directories(d, blobs)
     for cd in cds:
@@ -149,7 +153,7 @@ def patch_exe(path):
             raise SystemExit('error: unexpected code limit')
     before = {t: bytes(d[o:o + bl]) for t, o, bm, bl in blobs if bm != 0xfade0c02}
 
-    path_b = LIB.encode() + b'\0'
+    path_b = lib.encode() + b'\0'
     size = (24 + len(path_b) + 7) & ~7
     # timestamp 2 as ld writes it; current/compatibility version 0, as the library's own LC_ID_DYLIB
     # (0.0.0), so no version check can refuse it
@@ -180,18 +184,18 @@ def patch_exe(path):
     with open(path, 'r+b') as f:	# in place: same inode, owner and mode
         f.write(d)
     os.utime(path, None)
-    print(f'{path}: LC_LOAD_WEAK_DYLIB {LIB} added after load command {last_dylib} '
+    print(f'{path}: LC_LOAD_WEAK_DYLIB {lib} added after load command {last_dylib} '
           f'(ncmds {ncmds} -> {ncmds + 1}, sizeofcmds {sizeofcmds} -> {sizeofcmds + size}, first section at {low}); '
           f'mode {oct(st.st_mode & 0o7777)}')
-    return check(path)
+    return check(path, lib)
 
 
-def check(path):
+def check(path, lib=LIB):
     with open(path, 'rb') as f:
         d = f.read()
     cmds = commands(d)
     names = [(c, dylib_name(d, off)) for c, off, _ in cmds if c in DYLIB_CMDS]
-    weak = [n for c, n in names if c == LC_LOAD_WEAK_DYLIB and n == LIB]
+    weak = [n for c, n in names if c == LC_LOAD_WEAK_DYLIB and n == lib]
     dataoff, datasize, blobs = signature(d, cmds)
     cds = code_directories(d, blobs)
     ok = len(weak) == 1 and cmds[-1][0] == LC_CODE_SIGNATURE
@@ -202,7 +206,7 @@ def check(path):
         print(f'  CodeDirectory v{cd["ver"]:#x} flags {cd["flags"]:#x}: {cd["ncode"]} pages, bad page hashes {bad}, '
               f'cdhash {cdhash}')
     ents = [bm for _, _, bm, _ in blobs]
-    print(f'  {len(names)} dylib commands, ours #{[n for _, n in names].index(LIB) + 1 if weak else "-"} (weak); '
+    print(f'  {len(names)} dylib commands, ours #{[n for _, n in names].index(lib) + 1 if weak else "-"} (weak); '
           f'blobs {[hex(b) for b in ents]}; last command {cmds[-1][0]:#x}')
     if not ok:
         raise SystemExit(f'error: {path} does not verify')
@@ -211,8 +215,11 @@ def check(path):
 
 
 def main():
-    if len(sys.argv) == 3 and sys.argv[1] == '--check':
-        check(sys.argv[2])
+    if len(sys.argv) in (3, 4) and sys.argv[1] == '--check':
+        check(*sys.argv[2:])
+        return
+    if len(sys.argv) == 4 and sys.argv[1] == '--weak':
+        patch_exe(sys.argv[2], sys.argv[3])
         return
     if len(sys.argv) != 3:
         sys.exit(__doc__)

@@ -130,6 +130,10 @@ static struct cobj *cobj_id(uint32_t id)
 static uint64_t pend_va, pend_size;
 static uint32_t pend_id;
 static int submits_seen;
+static struct { uint64_t ctx, ts; unsigned nfl_at; } waits[16];
+static unsigned nwaits;
+static int wait_rc;
+static unsigned nfl_now(void) { return nfl; }
 #define IMPORT_VA 0x500000000ull
 #define IMPORT_SIZE 0xac4000ull
 void *IOServiceMatching(const char *name) { CHECK(!strcmp(name, "DrgGPU")); return (void *)1; }
@@ -150,8 +154,16 @@ int IOConnectCallMethod(mach_port_t c, uint32_t sel, const uint64_t *in, uint32_
 		return 0;
 	case DRGPU_UC_OBJ_FREE: return 0;
 	case DRGPU_UC_SUBMIT: submits_seen++; out[0] = in[2]; return 0;
-	case DRGPU_UC_WAIT: return 0;
-	case DRGPU_UC_SURFACE_MAP: out[0] = 9999; out[1] = IMPORT_VA; out[2] = IMPORT_SIZE; return 0;
+	case DRGPU_UC_WAIT:	/* recorded, with how many flush ranges existed at the time (order check) */
+		if (nwaits < 16) {
+			waits[nwaits].ctx = in[0], waits[nwaits].ts = in[1], waits[nwaits].nfl_at = nfl_now();
+			nwaits++;
+		}
+		return wait_rc;
+	case DRGPU_UC_SURFACE_MAP:	/* surface 2 -> object 9999 at IMPORT_VA, 3 -> 10000 16 MiB above, ... */
+		out[0] = 9997 + in[0]; out[1] = IMPORT_VA + (in[0] - 2) * 0x1000000ull; out[2] = IMPORT_SIZE;
+		return 0;
+	case DRGPU_UC_CTX_DESTROY: return 0;
 	default: printf("FAIL: unexpected selector %u\n", sel); fails++; return E(0x2c7);
 	}
 }
@@ -313,10 +325,12 @@ static struct stats replay(int selfmode, int mode, int *nsub_out, unsigned *dela
 				o->dlen = h.len;
 			}
 		} else if (r.type == CAP_SUBMIT) {
-			if (!imported) {	/* an IOSurface import live during every submit: must never be flushed */
+			if (!imported) {	/* an IOSurface import live during every submit: never flushed by a submit */
 				int sfd = kgsl_ios_surface_fd(2);
 				struct gpuobj_import im = { (uintptr_t)&sfd, 4, 0x10001200, 3, 0 };
+				nfl = 0;
 				CHECK(kgsl_ioctl(fd, 0xc0200948, &im) == 0 && im.id == 9999);
+				CHECK(range_flushed(IMPORT_VA, IMPORT_SIZE));	/* r25: once, whole, at import */
 				CHECK(ncobj < NOBJ);
 				cobjs[ncobj++] = (struct cobj){ 9999, 1, 1, IMPORT_VA, IMPORT_SIZE, 0, 0 };
 				imported = 1;
@@ -381,12 +395,106 @@ static struct stats replay(int selfmode, int mode, int *nsub_out, unsigned *dela
 	return tot;
 }
 
+/*
+ * Root r25: GPUOBJ_SYNC (Nokia's driver called it 18 times in boot #55 and got EINVAL) and
+ * kgsl_ios_cpu_sync (wait for every context's last timestamp, then dc civac of the GPU-written
+ * imports only), against the same mock.
+ */
+struct sync_obj { uint64_t offset, length; uint32_t id, op; };
+struct sync_arg { uint64_t objs; uint32_t obj_len, count; };
+static void sync_tests(void)
+{
+	printf("GPUOBJ_SYNC and CPU sync:\n");
+	kgsl_ios_mode(DRG_MODE_FLUSHALL);
+	int fd = kgsl_open(0x80002);
+	CHECK(fd >= 0);
+	struct gpuobj_alloc a = { 0x10000, 0, 0, 0, 0, 0, 0 }, b = { 0x4000, 0, 0, 0, 0, 0, 0 };
+	pend_id = 101, pend_va = 0x700000000ull, pend_size = 0x10000;
+	CHECK(kgsl_ioctl(fd, 0xc0300945, &a) == 0 && a.id == 101);
+	pend_id = 102, pend_va = 0x700100000ull, pend_size = 0x4000;
+	CHECK(kgsl_ioctl(fd, 0xc0300945, &b) == 0 && b.id == 102);
+
+	/* whole object (no CACHE_RANGE), a range, an unknown id (skipped, as Linux) */
+	struct sync_obj so[3] = { { 0, 0, 101, 0x1 }, { 0x1000, 0x800, 102, 0x80000002u }, { 0, 0, 555, 0x3 } };
+	struct sync_arg sy = { (uintptr_t)so, sizeof(so[0]), 3 };
+	nfl = 0;
+	CHECK(kgsl_ioctl(fd, 0x40100949, &sy) == 0);
+	CHECK(range_flushed(0x700000000ull, 0x10000));
+	CHECK(range_flushed(0x700101000ull, 0x800));
+	CHECK(!range_touched(0x700100000ull, 0x1000) && !range_touched(0x700101800ull, 0x2800));
+	struct sync_obj clip = { 0x3000, 0x10000, 102, 0x80000001u };	/* past the end: clipped to the object */
+	struct sync_arg sc = { (uintptr_t)&clip, sizeof(clip), 1 };
+	nfl = 0;
+	CHECK(kgsl_ioctl(fd, 0x40100949, &sc) == 0);
+	CHECK(range_flushed(0x700103000ull, 0x1000) && !range_touched(0x700104000ull, 0x10000));
+	sy.count = 0;
+	CHECK(kgsl_ioctl(fd, 0x40100949, &sy) == -22);
+	sy.count = 129;
+	CHECK(kgsl_ioctl(fd, 0x40100949, &sy) == -22);
+	struct sync_obj bad = { 0, 0, 101, 0 };	/* no CLEAN/INV on a found object */
+	struct sync_arg sb = { (uintptr_t)&bad, sizeof(bad), 1 };
+	CHECK(kgsl_ioctl(fd, 0x40100949, &sb) == -22);
+
+	/* two imports; only surface 2 is a render target */
+	int s2 = kgsl_ios_surface_fd(2), s3 = kgsl_ios_surface_fd(3);
+	struct gpuobj_import i2 = { (uintptr_t)&s2, 4, 0x10001200, 3, 0 }, i3 = { (uintptr_t)&s3, 4, 0x10001200, 3, 0 };
+	nfl = 0;
+	CHECK(kgsl_ioctl(fd, 0xc0200948, &i2) == 0 && i2.id == 9999);
+	CHECK(kgsl_ioctl(fd, 0xc0200948, &i3) == 0 && i3.id == 10000);
+	CHECK(range_flushed(IMPORT_VA, IMPORT_SIZE) && range_flushed(IMPORT_VA + 0x1000000, IMPORT_SIZE));
+	kgsl_ios_surface_gpu_written(2);
+	kgsl_ios_surface_gpu_written(2);	/* twice: one mark */
+
+	/* submits: context 5 ts 40, context 6 ts 7, context 5 ts 41 */
+	struct command_object co = { 0, 0x700000000ull, 0x100, 1, 101 };
+	struct gpu_command c;
+	static const uint32_t cts[3][2] = { { 5, 40 }, { 6, 7 }, { 5, 41 } };
+	for (int i = 0; i < 3; i++) {
+		memset(&c, 0, sizeof(c));
+		c.cmdlist = (uintptr_t)&co, c.cmdsize = sizeof(co), c.numcmds = 1;
+		c.context_id = cts[i][0], c.timestamp = cts[i][1];
+		nfl = 0;
+		CHECK(kgsl_ioctl(fd, 0xc040094a, &c) == 0);
+		CHECK(!range_touched(IMPORT_VA, IMPORT_SIZE) && !range_touched(IMPORT_VA + 0x1000000, IMPORT_SIZE));
+		CHECK(range_flushed(0x700000000ull, 0x10000) && range_flushed(0x700100000ull, 0x4000));	/* flushall */
+	}
+	nfl = 0, nwaits = 0;
+	int r = kgsl_ios_cpu_sync();
+	CHECK(r == 1);
+	CHECK(nwaits == 2);
+	int w5 = 0, w6 = 0;
+	for (unsigned i = 0; i < nwaits; i++) {
+		w5 += waits[i].ctx == 5 && waits[i].ts == 41;
+		w6 += waits[i].ctx == 6 && waits[i].ts == 7;
+		CHECK(waits[i].nfl_at == 0);	/* every wait before any invalidate */
+	}
+	CHECK(w5 == 1 && w6 == 1);
+	CHECK(range_flushed(IMPORT_VA, IMPORT_SIZE));			/* the render target, whole */
+	CHECK(!range_touched(IMPORT_VA + 0x1000000, IMPORT_SIZE));	/* a sampled surface: not touched */
+	CHECK(!range_touched(0x700000000ull, 0x200000));		/* the driver's own objects: not touched */
+	wait_rc = E(0x2d6);	/* a wait times out: reported, the surface invalidated anyway */
+	nfl = 0;
+	r = kgsl_ios_cpu_sync();
+	CHECK(r == -110 && range_flushed(IMPORT_VA, IMPORT_SIZE));
+	wait_rc = 0;
+	uint32_t dd = 6;	/* DRAWCTXT_DESTROY: no wait for context 6 any more */
+	CHECK(kgsl_ioctl(fd, 0x40040914, &dd) == 0);
+	nwaits = 0;
+	CHECK(kgsl_ios_cpu_sync() == 1 && nwaits == 1 && waits[0].ctx == 5 && waits[0].ts == 41);
+	uint64_t calls, bytes, ns;
+	kgsl_ios_sync_stats(&calls, &bytes, &ns);
+	CHECK(calls == 3 && bytes == 3 * IMPORT_SIZE);
+	printf("  %llu CPU syncs, %llu bytes\n", (unsigned long long)calls, (unsigned long long)bytes);
+	CHECK(kgsl_close(fd) == 1);
+}
+
 int main(int argc, char **argv)
 {
 	if (argc != 2) {
 		fprintf(stderr, "usage: %s CAPTURE.bin\n", argv[0]);
 		return 2;
 	}
+	CHECK(kgsl_ios_flush_mode() == KGSL_IOS_FLUSH_ALL);	/* r25 default, before anything sets a mode */
 	FILE *f = fopen(argv[1], "rb");
 	if (!f) {
 		perror(argv[1]);
@@ -422,6 +530,7 @@ int main(int argc, char **argv)
 	CHECK(st[0].refs_out == 0 && st[0].ib2_out == 0);	/* flushall covers everything */
 	CHECK(st[1].refs_out > 0);			/* r23's IB1-only flush misses refs: the check has teeth */
 	CHECK(dbad[2] == 0);				/* delay: >= 2 ms before every submit */
+	sync_tests();
 
 	printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);
 	return fails != 0;

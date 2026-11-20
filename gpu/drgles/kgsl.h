@@ -32,12 +32,27 @@ int kgsl_ios_faulted(void);			/* a submit was refused: GPU fault */
 void kgsl_ios_readback(int mode);	/* CPU read-back before submits: 1 its objects, 2 all */
 /* kgsl_ios.c only: cache maintenance before each submit (research/reports/gpu-fault-2.md §4A) */
 #define KGSL_IOS_FLUSH_IBS	0	/* dc civac over the IB1 ranges, dsb sy (r23) */
-#define KGSL_IOS_FLUSH_ALL	1	/* also every live object that is not an import */
+#define KGSL_IOS_FLUSH_ALL	1	/* also every live object that is not an import (default since r25) */
 #define KGSL_IOS_DELAY		2	/* no dc civac; dsb sy, then a 2 ms spin */
 void kgsl_ios_flush(int mode);
+int kgsl_ios_flush_mode(void);
 /*
- * Self-test modes (bench -selftest, read back by libdrgeagl from /private/var/run/drg-gpu-mode as
- * "mode N"): bits 0-1 DrgGPU framing, bits 2-3 CPU read-back, bit 4 flushall, bit 5 delay.
+ * kgsl_ios.c only, root r25 (boot #55: an IOSurface render target read by the CPU was 48 % stale):
+ * the GPU writes the IOSurface `surface` (a render target the CPU or the display reads later) ...
+ */
+void kgsl_ios_surface_gpu_written(uint32_t surface);
+/*
+ * ... and before the CPU reads one: wait until every context of this process retired its last
+ * submitted timestamp, then dc civac over every live import of a marked surface (its GPU mapping;
+ * the maintenance acts on the physical lines, so every other mapping of them sees RAM). Returns the
+ * number of surfaces invalidated, or a negative errno if a wait failed (they are invalidated anyway).
+ */
+int kgsl_ios_cpu_sync(void);
+/* totals since start: cpu_sync calls, bytes invalidated by them, ns spent in their dc civac loops */
+void kgsl_ios_sync_stats(uint64_t *calls, uint64_t *bytes, uint64_t *ns);
+/*
+ * Self-test modes (bench -selftest; since r25 the verdict is cached in /private/var/db/drg/gpu-selftest,
+ * verdict.h): bits 0-1 DrgGPU framing, bits 2-3 CPU read-back, bit 4 flushall, bit 5 delay.
  */
 #define DRG_MODE_FLUSHALL	16
 #define DRG_MODE_DELAY		32
