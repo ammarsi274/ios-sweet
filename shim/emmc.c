@@ -478,10 +478,11 @@ int drg_emmc_log_write(const char *buf, unsigned len)
 
 static uint32_t mb_acmd_err;
 
-/* count sectors between the card and buf; 0, or a negative step code; *resp = R1 */
-static int xfer_multi(uint32_t lba, uint32_t count, int write, uintptr_t buf, uint32_t *resp, uint32_t *st)
+/* count sectors between the card and buf (descriptor table at desc); 0, or a negative step code; *resp = R1 */
+static int xfer_multi(uint32_t lba, uint32_t count, int write, uintptr_t buf, uint32_t *resp, uint32_t *st,
+		      uintptr_t desc)
 {
-	volatile uint32_t *d = (volatile uint32_t *)MB_DESC;
+	volatile uint32_t *d = (volatile uint32_t *)desc;
 	uint32_t bytes = count * 512, n = (bytes + MB_DESC_BYTES - 1) / MB_DESC_BYTES;
 	uint64_t end = now() + ticks_ms(5000);
 	while (hc_rd(SDHCI_PRESENT) & (PRESENT_CMD_INHIBIT | PRESENT_DAT_INHIBIT))
@@ -496,8 +497,8 @@ static int xfer_multi(uint32_t lba, uint32_t count, int write, uintptr_t buf, ui
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
 	hc_wr(SDHCI_INT_STATUS, 0xffffffffU);
-	hc_wr(SDHCI_ADMA_ADDR_LO, (uint32_t)MB_DESC);
-	hc_wr(SDHCI_ADMA_ADDR_HI, (uint32_t)((uint64_t)MB_DESC >> 32));
+	hc_wr(SDHCI_ADMA_ADDR_LO, (uint32_t)desc);
+	hc_wr(SDHCI_ADMA_ADDR_HI, (uint32_t)((uint64_t)desc >> 32));
 	hc_wr(SDHCI_ARGUMENT2, count);		/* Auto-CMD23 argument: block count */
 	hc_wr(SDHCI_BLOCK, (count << 16) | 512);
 	hc_wr(SDHCI_ARGUMENT, lba);
@@ -618,7 +619,7 @@ void drg_emmc_mb_test(void)
 	for (uint32_t i = 0; i < words; i++)
 		work[i] = mb_pattern(0, i);
 	t0 = now();
-	rc = xfer_multi((uint32_t)lba, MB_SECTORS, 1, MB_WORK, &resp, &st);
+	rc = xfer_multi((uint32_t)lba, MB_SECTORS, 1, MB_WORK, &resp, &st, MB_DESC);
 	mb_put("MB write 2 MiB ms", ms_since(t0));
 	mb_put("MB write rc", (uint32_t)-rc);
 	mb_put("MB write r1", resp);
@@ -632,7 +633,7 @@ void drg_emmc_mb_test(void)
 	for (uint32_t i = 0; i < words; i++)
 		work[i] = FILL;
 	t0 = now();
-	rc = xfer_multi((uint32_t)lba, MB_SECTORS, 0, MB_WORK, &resp, &st);
+	rc = xfer_multi((uint32_t)lba, MB_SECTORS, 0, MB_WORK, &resp, &st, MB_DESC);
 	mb_put("MB read 2 MiB ms", ms_since(t0));
 	mb_put("MB read rc", (uint32_t)-rc);
 	mb_put("MB read r1", resp);
@@ -657,11 +658,11 @@ void drg_emmc_mb_test(void)
 	/* 5. an odd size: 100 sectors (one 32 KiB descriptor + 18 KiB) at sector 200, read 300 from 100 */
 	for (uint32_t i = 0; i < 100 * 128; i++)
 		work[i] = mb_pattern(0x55aa55aaU, i);
-	rc = xfer_multi((uint32_t)lba + 200, 100, 1, MB_WORK, &resp, &st);
+	rc = xfer_multi((uint32_t)lba + 200, 100, 1, MB_WORK, &resp, &st, MB_DESC);
 	mb_put("MB odd write rc", (uint32_t)-rc);
 	for (uint32_t i = 0; i < 300 * 128; i++)
 		work[i] = FILL;
-	rc2 = xfer_multi((uint32_t)lba + 100, 300, 0, MB_WORK, &resp, &st);
+	rc2 = xfer_multi((uint32_t)lba + 100, 300, 0, MB_WORK, &resp, &st, MB_DESC);
 	mb_put("MB odd read rc", (uint32_t)-rc2);
 	bad = 0;
 	for (uint32_t i = 0; i < 300 * 128; i++) {
@@ -674,11 +675,11 @@ void drg_emmc_mb_test(void)
 
 restore:
 	/* 6. the original contents back, checked by a multi-block read and single-block spots */
-	rc = xfer_multi((uint32_t)lba, MB_SECTORS, 1, MB_ORIG, &resp, &st);
+	rc = xfer_multi((uint32_t)lba, MB_SECTORS, 1, MB_ORIG, &resp, &st, MB_DESC);
 	mb_put("MB restore rc", (uint32_t)-rc);
 	for (uint32_t i = 0; i < words; i++)
 		work[i] = FILL;
-	rc2 = xfer_multi((uint32_t)lba, MB_SECTORS, 0, MB_WORK, &resp, &st);
+	rc2 = xfer_multi((uint32_t)lba, MB_SECTORS, 0, MB_WORK, &resp, &st, MB_DESC);
 	bad = 0;
 	for (uint32_t i = 0; i < words; i++)
 		bad += work[i] != orig[i];
@@ -697,4 +698,28 @@ restore:
 out:
 	mb_put("MB end", 0xe0d);
 	drg_emmc_log_write(mb_log, mb_len);
+}
+
+/*
+ * Read-only multi-block read for the shim's hardware tests (drg_w1.c: the
+ * modem firmware from modem_a). CMD18 + Auto-CMD23 through xfer_multi with
+ * its write flag fixed at 0, as measured in the multi-block test (2 MiB in
+ * 13 ms, 0 bad words; drg/BOOTLOG.md 2026-10-31). The descriptor table is in
+ * the shim image, so the low-bank RAM the multi-block test uses (MB_DESC,
+ * inside the ramdisk window) is not touched. Up to 4096 sectors (2 MiB, 64
+ * descriptors) per call; buf 8-byte aligned and below 4 GiB.
+ */
+static volatile uint32_t rd_desc[3 * (MB_SECTORS * 512 / MB_DESC_BYTES)] __attribute__((aligned(64)));
+
+int drg_emmc_read(uint64_t lba, uint32_t count, void *buf)
+{
+	uint32_t resp = 0, st = 0;
+	uintptr_t b = (uintptr_t)buf;
+	if (count == 0 || count > MB_SECTORS || lba > DRG_EMMC_LAST_LBA || count - 1 > DRG_EMMC_LAST_LBA - lba ||
+	    (b & 7) || b + (uint64_t)count * 512 > 0x100000000ULL)
+		return -10;
+	if (*(volatile uint32_t *)(CQ_BASE + CQ_CFG) & CQ_CFG_ENABLE)
+		return -11;
+	hc_wr(SDHCI_INT_ENABLE, hc_rd(SDHCI_INT_ENABLE) | INT_ERRORS | INT_CMD_DONE | INT_XFER_DONE | INT_BUF_READ);
+	return xfer_multi((uint32_t)lba, count, 0, b, &resp, &st, (uintptr_t)rd_desc);
 }

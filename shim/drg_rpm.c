@@ -281,3 +281,9 @@ void drg_rpm_last_ack(uint32_t w[4])
 	for (int i = 0; i < 4; i++)
 		w[i] = st_data_words[i];
 }
+
+/* any KVP list (key, nbytes, value words padded to 4), up to 16 words */
+int drg_rpm_request_kvp(uint32_t type, uint32_t id, const uint32_t *kvp, uint32_t kvp_words)
+{
+	return rpm_send(type, id, kvp, kvp_words);
+}

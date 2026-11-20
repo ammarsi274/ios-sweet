@@ -11,3 +11,5 @@ uint64_t drg_emmc_log_lba(void);
 #include "gptslot.h"
 /* boot slots in the GPT (gptslot.c): GPT_SLOTS_NORMAL / GPT_SLOTS_TWRP_ONCE */
 int drg_emmc_slots(int mode, struct gpt_slots_result *r);
+/* read-only: count (1..4096) sectors from lba into buf (8-byte aligned, below 4 GiB); 0 or <0 */
+int drg_emmc_read(uint64_t lba, uint32_t count, void *buf);

@@ -15,6 +15,8 @@
 #include "drg_rpm.h"
 #include "drg_ts.h"
 #include "drg_gpu.h"
+#include "drg_w1.h"
+#include "drg_bt.h"
 #include "fdt.h"
 
 #define RESTART_BOOTLOADER	0x77665500U
@@ -648,7 +650,7 @@ static void drg_osm_probe(void)
 static int drg_spmi_read(unsigned int apid, uint8_t addr, uint8_t *val);
 static unsigned int drg_spmi_apid(uint32_t ppid);
 
-static char cpu_log[16384];
+static char cpu_log[32768];	/* drg_emmc_log_write's limit: 64 blocks */
 static unsigned cpu_len;
 
 static void cpu_put(const char *label, uint32_t a, uint32_t v, int rc)
@@ -1302,6 +1304,13 @@ static void drg_ldo_probe(void)
 		con_hex2("TS2", "rc=", (uint32_t)drg_ts_probe(), "", 0);
 }
 
+#ifdef DRG_HW_TESTS
+static void cpu_flush(void)
+{
+	(void)drg_emmc_log_write(cpu_log, cpu_len);
+}
+#endif
+
 static void __attribute__((noreturn)) drg_gold_main(void)
 {
 	stage = "gold";
@@ -1319,6 +1328,14 @@ static void __attribute__((noreturn)) drg_gold_main(void)
 	drg_touch_probe();
 	stage = "gold ldo";
 	drg_ldo_probe();
+#ifdef DRG_HW_TESTS	/* wifi-bt-plan W1 (modem) + B1 (Bluetooth); each logs, cleans up and returns */
+	stage = "gold w1";
+	(void)drg_w1_test(cpu_put, cpu_flush);
+	cpu_flush();
+	stage = "gold b1";
+	(void)drg_bt_test(cpu_put, cpu_flush);
+	cpu_flush();
+#endif
 
 	/* A NOKIAXNU payload in the ramdisk: boot XNU from here (returns only on error). */
 	stage = "gold loader";

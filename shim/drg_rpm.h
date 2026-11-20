@@ -18,5 +18,7 @@ int drg_rpm_ldo_enable(uint32_t type, uint32_t id, uint32_t uv);
 int drg_rpm_request2(uint32_t type, uint32_t id, uint32_t k1, uint32_t v1, uint32_t k2, uint32_t v2);
 int drg_rpm_request64(uint32_t type, uint32_t id, uint32_t key, uint64_t v);
 void drg_rpm_last_ack(uint32_t w[4]);
+/* any KVP list (key, nbytes, value...), <= 16 words; 0 when the RPM answered */
+int drg_rpm_request_kvp(uint32_t type, uint32_t id, const uint32_t *kvp, uint32_t kvp_words);
 
 #endif
