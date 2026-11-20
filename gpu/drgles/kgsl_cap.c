@@ -188,8 +188,62 @@ void kgsl_cap_before(int fd, unsigned long req, void *arg)
 		cap_submit(arg);
 }
 
+/* kgsl_submit_log(): what each GPU_COMMAND carried (render-target bug, boot #55/#56) */
+static int sublog_on;
+static uint64_t sub_n, sub_entries, sub_noib, sub_multi, sub_maxcmds, sub_maxbytes, sub_failed;
+static uint32_t sub_noib_flags;
+
+void kgsl_submit_log(int on)
+{
+	sublog_on = on;
+}
+
+void kgsl_submit_report(void)
+{
+	host_log("submits: %llu GPU_COMMANDs (%llu failed), %llu cmdlist entries, %llu with more than one, most %llu "
+		 "entries, largest entry %llu bytes; %llu entries without the IB flag (last flags 0x%x)\n",
+		 (unsigned long long)sub_n, (unsigned long long)sub_failed, (unsigned long long)sub_entries,
+		 (unsigned long long)sub_multi, (unsigned long long)sub_maxcmds, (unsigned long long)sub_maxbytes,
+		 (unsigned long long)sub_noib, sub_noib_flags);
+}
+
+struct cmdobj { uint64_t offset, gpuaddr, size; uint32_t flags, id; };	/* kgsl_command_object */
+
+static void submit_note(const struct gpu_command *c, long rc)
+{
+	char line[400];
+	int n = snprintf(line, sizeof(line), "submit: rc %ld ctx %u ts %u flags 0x%llx cmds %u (size %u):", rc,
+			 c->context_id, c->timestamp, (unsigned long long)c->flags, c->numcmds, c->cmdsize);
+	sub_n++;
+	sub_failed += rc != 0;
+	sub_multi += c->numcmds > 1;
+	if (c->numcmds > sub_maxcmds)
+		sub_maxcmds = c->numcmds;
+	for (uint32_t i = 0; i < c->numcmds && c->cmdlist; i++) {
+		struct cmdobj o = { 0 };
+		memcpy(&o, (const uint8_t *)(uintptr_t)c->cmdlist + (uint64_t)i * c->cmdsize,
+		       c->cmdsize < sizeof(o) ? c->cmdsize : sizeof(o));
+		sub_entries++;
+		if (!(o.flags & 1))
+			sub_noib++, sub_noib_flags = o.flags;
+		if (o.size > sub_maxbytes)
+			sub_maxbytes = o.size;
+		if (n < (int)sizeof(line) - 48)
+			n += snprintf(line + n, sizeof(line) - n, " [f%x 0x%llx+0x%llx %llu B id %u]", o.flags,
+				      (unsigned long long)o.gpuaddr, (unsigned long long)o.offset,
+				      (unsigned long long)o.size, o.id);
+	}
+	if (sublog_on) {
+		if (n < (int)sizeof(line) - 40)
+			snprintf(line + n, sizeof(line) - n, " objs %u syncs %u", c->numobjs, c->numsyncs);
+		host_log("%s\n", line);
+	}
+}
+
 void kgsl_cap_after(int fd, unsigned long req, void *arg, long rc)
 {
+	if (((req >> 8) & 0xff) == 0x09 && NR(req) == 0x4a)
+		submit_note(arg, rc);
 	if (trace_on && ((req >> 8) & 0xff) == 0x09 && NR(req) == 0x4a && rc == 0) {
 		struct gpu_command *c = arg;
 		trace_fd = fd;

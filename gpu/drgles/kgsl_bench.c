@@ -135,4 +135,5 @@ void kgsl_report(void)
 				name = known[k].name;
 		host_log("kgsl ioctl %08lx %-20s x%u\n", r, name, seen_count[i]);
 	}
+	kgsl_submit_report();
 }

@@ -50,6 +50,15 @@ void kgsl_ios_surface_gpu_written(uint32_t surface);
 int kgsl_ios_cpu_sync(void);
 /* totals since start: cpu_sync calls, bytes invalidated by them, ns spent in their dc civac loops */
 void kgsl_ios_sync_stats(uint64_t *calls, uint64_t *bytes, uint64_t *ns);
+/* kgsl_ios.c only: the task address of a live import of `surface` (the GPU's address too), or 0 */
+const void *kgsl_ios_surface_va(uint32_t surface, uint64_t *size);
+/*
+ * kgsl_cap.c (both platforms): while on, one log line per GPU_COMMAND: result, flags, each cmdlist
+ * entry's flags and size, objects, syncpoints. Entries without KGSL_CMDLIST_IB (Linux would refuse
+ * the whole command) are counted always and reported by kgsl_report().
+ */
+void kgsl_submit_log(int on);
+void kgsl_submit_report(void);
 /*
  * Self-test modes (bench -selftest; since r25 the verdict is cached in /private/var/db/drg/gpu-selftest,
  * verdict.h): bits 0-1 DrgGPU framing, bits 2-3 CPU read-back, bit 4 flushall, bit 5 delay.

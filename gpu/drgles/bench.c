@@ -16,6 +16,7 @@
 #include "drgwin.h"
 #include "host.h"
 #include "rt.h"
+#include "rt_map.h"
 
 /* bionic, used only by the bench itself */
 extern void __libc_init(void *raw_args, void (*onexit)(void),
@@ -563,6 +564,46 @@ static int layout_w, layout_h;
 static int gbuf_w __attribute__((unused)), gbuf_h __attribute__((unused));	/* TWRP only */
 static struct drg_dso *egl_dso;
 
+/*
+ * The render-target frames test, shared by the iOS self-test (an IOSurface,
+ * stress_test) and TWRP (-owngbuf ... -gbufframes N: a gralloc buffer, the
+ * same handle as on iOS), so both platforms draw and judge the same thing.
+ * Boot #55/#56: exactly 1,324,512 of 2,740,500 texels right on iOS, every
+ * time. rt_report() says WHICH texels and what the wrong ones hold.
+ *
+ * Pattern of frame k (BGRA memory): byte 0 = (y + k) & 0xff, 1 = x >> 8,
+ * 2 = x & 0xff, 3 = y >> 8 (RGBA memory: bytes 0 and 2 swapped). y = GL row
+ * = memory row (measured on TWRP 2026-11-02).
+ */
+static u32 rt_program(void)
+{
+	return program("attribute vec4 p;\nvoid main() { gl_Position = p; }\n",
+		       "precision highp float;\nuniform int k;\nvoid main() {\n  vec2 c = floor(gl_FragCoord.xy);\n"
+		       "  gl_FragColor = vec4(mod(c.x, 256.0), floor(c.x / 256.0), mod(c.y + float(k), 256.0),"
+		       " floor(c.y / 256.0)) / 255.0;\n}\n");
+}
+
+/* frames clear + full-screen pattern draws into the bound framebuffer, glFlush after each, then glFinish */
+static void rt_draw(u32 prog, int w, int h, int frames)
+{
+	static const float quad[] = { -1, -1, 0, 1, 1, -1, 0, 1, -1, 1, 0, 1, 1, 1, 0, 1 };
+	glUseProgram(prog);
+	glVertexAttribPointer(0, 4, GL_FLOAT, 0, 0, quad);
+	glEnableVertexAttribArray(0);
+	glDisableVertexAttribArray(1);
+	glViewport(0, 0, w, h);
+	int kl = glGetUniformLocation(prog, "k");
+	for (int f = 0; f < frames; f++) {
+		glClearColor(0.2f, 0.2f, 0.2f, 0.2f);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glUniform1i(kl, f);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		glFlush();
+	}
+	glFinish();
+}
+
+
 #ifndef __APPLE__
 /*
  * -gbuf W H (TWRP, with -nokiagralloc): a W x H RGBA_8888 buffer from
@@ -617,6 +658,7 @@ static void anwb_ref(void *p)
  * display surfaces are 'BGRA').
  */
 static int gbuf_own, gbuf_fmt = 1, gbuf_keepmeta;	/* -gbufmeta: keep Nokia's metadata fd */
+static int gbuf_frames;	/* -gbufframes N: the iOS self-test's render-target frames into the buffer */
 static int gbuf_craft;	/* -gbufcraft: the handle built by drgwin_handle as on iOS (rows = h), not a copy */
 static uint64_t gbuf_usage = 1ULL << 8;	/* -gbufusage N: what our GetConsumerUsage answers */
 
@@ -864,6 +906,7 @@ static int gbuf_test(EGLDisplay d)
 		r = 0;
 	}
 	long linear = 0, first_bad_x = -1, first_bad_y = -1, cleared = 0;
+	int rt_fails = 0;	/* -gbufframes */
 	if (!r && cpu) {
 		const uint32_t *last = (const uint32_t *)cpu + (size_t)(h - 1) * st;	/* left out of the draw */
 		for (int x = 0; x < w; x++)
@@ -884,6 +927,29 @@ static int gbuf_test(EGLDisplay d)
 		const unsigned char *t0 = cpu;
 		host_log("gbuf: lock %p, first texel %02x%02x%02x%02x, linear texels %ld of %d (first other (%ld,%ld))\n",
 			 cpu, t0[0], t0[1], t0[2], t0[3], linear, w * (h - 1), first_bad_x, first_bad_y);
+		if (gbuf_frames > 0) {
+			/*
+			 * -gbufframes N: the iOS self-test's render-target frames (stress_test) into this
+			 * buffer: N x (clear + pattern of frame k), glFlush each, glFinish, then the same
+			 * report. With -owngbuf W H 5 -gbufcraft this is the iOS buffer: BGRA, our handle
+			 * (rows = h, stride from gralloc), our gralloc module, no metadata, CPU address 0.
+			 */
+			u32 pf = rt_program();
+			if (pf) {
+				host_log("gbuf: frames: %d into the %dx%d buffer (stride %u px, format %d)\n", gbuf_frames, w, h,
+					 st, gbuf_fmt);
+				kgsl_submit_log(1);
+				rt_draw(pf, w, h, gbuf_frames);
+				kgsl_submit_log(0);
+				uint64_t sync = 1;
+				host_log("gbuf: frames: GL error %x, dma-buf sync start rc %ld\n", glGetError(),
+					 host_ioctl(nh[3], 0x40086200UL, &sync));
+				long right = rt_report("gbuf: frames map", cpu, (size_t)st * 4, w, h, gbuf_frames - 1, gbuf_fmt == 5);
+				rt_fails += check("gbuf: render-target frames as on iOS", right == (long)w * h);
+			} else {
+				rt_fails += check("gbuf: frames program", 0);
+			}
+		}
 		int32_t fence = -1;
 		if (lock_ok)
 			unlock(dev, hnd, &fence);
@@ -960,7 +1026,8 @@ static int gbuf_test(EGLDisplay d)
 	 * columns w..align16(w)-1 (1125..1135) of every row, never a row >= h.
 	 * What the iOS display surface (h rows of st pixels) needs is the latter.
 	 */
-	return ok + check("gbuf: GPU wrote no row past h - 1 (inside an h-row surface)", pad && row_kept == (long)(ah - h) * st);
+	return ok + rt_fails +
+	       check("gbuf: GPU wrote no row past h - 1 (inside an h-row surface)", pad && row_kept == (long)(ah - h) * st);
 }
 #endif
 
@@ -1203,10 +1270,7 @@ static int stress_test(EGLDisplay d)
 			   "void main() { gl_Position = p; uv = t; }\n",
 			   "varying highp vec2 uv;\nuniform lowp sampler2D tex;\n"
 			   "void main() { gl_FragColor = texture2D(tex, uv); }\n");
-	u32 ppat = program("attribute vec4 p;\nvoid main() { gl_Position = p; }\n",
-			   "precision highp float;\nuniform int k;\nvoid main() {\n  vec2 c = floor(gl_FragCoord.xy);\n"
-			   "  gl_FragColor = vec4(mod(c.x, 256.0), floor(c.x / 256.0), mod(c.y + float(k), 256.0),"
-			   " floor(c.y / 256.0)) / 255.0;\n}\n");
+	u32 ppat = rt_program();
 	if (!ptex || !ppat)
 		return 1;
 
@@ -1227,20 +1291,9 @@ static int stress_test(EGLDisplay d)
 		glBindFramebuffer(GL_FRAMEBUFFER, dfbo);
 		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dtex, 0);
 		st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-		glUseProgram(ppat);
-		glVertexAttribPointer(0, 4, GL_FLOAT, 0, 0, quad);
-		glEnableVertexAttribArray(0);
-		glDisableVertexAttribArray(1);
-		glViewport(0, 0, SW, SH);
-		int kl = glGetUniformLocation(ppat, "k");
-		for (int f = 0; f < SF; f++) {
-			glClearColor(0.2f, 0.2f, 0.2f, 0.2f);
-			glClear(GL_COLOR_BUFFER_BIT);
-			glUniform1i(kl, f);
-			glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-			glFlush();
-		}
-		glFinish();
+		kgsl_submit_log(1);	/* one line per GPU_COMMAND of these frames: entries, flags, sizes */
+		rt_draw(ppat, SW, SH, SF);
+		kgsl_submit_log(0);
 		uint64_t c0, b0, n0, c1, b1, n1;
 		kgsl_ios_sync_stats(&c0, &b0, &n0);
 		int sr = kgsl_ios_cpu_sync();
@@ -1252,11 +1305,21 @@ static int stress_test(EGLDisplay d)
 	long good = 0;
 	if (dtex && !IOSurfaceLock(ds, 1 /* read-only */, 0)) {
 		const uint8_t *m = IOSurfaceGetBaseAddress(ds);
-		for (int y = 0; y < SH; y++)
-			for (int x = 0; x < SW; x++) {
-				const uint8_t *t = m + (size_t)y * SBPR + (size_t)x * 4;
-				good += t[0] == ((y + SF - 1) & 0xff) && t[1] == (x >> 8) && t[2] == (x & 0xff) && t[3] == (y >> 8);
-			}
+		good = rt_report("selftest: render target map", m, SBPR, SW, SH, SF - 1, 1);
+		/* the same pages through the GPU import's own (write-combined) task mapping */
+		uint64_t gsize = 0;
+		const uint8_t *g = kgsl_ios_surface_va(IOSurfaceGetID(ds), &gsize);
+		long differ = 0, gright = 0;
+		if (g && gsize >= (uint64_t)SBPR * SH)
+			for (int y = 0; y < SH; y++)
+				for (int x = 0; x < SW; x++) {
+					size_t o = (size_t)y * SBPR + (size_t)x * 4;
+					int dk, dx, dy;
+					differ += memcmp(m + o, g + o, 4) != 0;
+					gright += !rt_class(g + o, x, y, SF - 1, 1, &dk, &dx, &dy);
+				}
+		host_log("selftest: render target through the import's mapping %p (0x%llx bytes): %ld texels right, "
+			 "%ld differ from the IOSurface mapping\n", (const void *)g, (unsigned long long)gsize, gright, differ);
 		IOSurfaceUnlock(ds, 1, 0);
 	}
 	host_log("selftest: IOSurface render target: fbo %x, %ld of %d texels as frame %d drew them\n", st, good,
@@ -1677,6 +1740,12 @@ static int main_(int argc, char **argv, char **envp)
 		}
 		if (!strcmp(argv[i], "-gbufmeta")) {
 			gbuf_keepmeta = 1;
+			continue;
+		}
+		if (!strcmp(argv[i], "-gbufframes") && i + 1 < argc) {
+			gbuf_frames = 0;
+			for (const char *p = argv[++i]; *p >= '0' && *p <= '9'; p++)
+				gbuf_frames = gbuf_frames * 10 + (*p - '0');
 			continue;
 		}
 		if (!strcmp(argv[i], "-gbufcraft")) {

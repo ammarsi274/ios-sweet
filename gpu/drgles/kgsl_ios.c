@@ -725,6 +725,24 @@ int kgsl_ios_cpu_sync(void)
 	return err ? err : n;
 }
 
+const void *kgsl_ios_surface_va(uint32_t surface, uint64_t *size)
+{
+	for (int k = 0; k < NDEV; k++) {
+		struct kdev *d = &devs[k];
+		if (!d->used)
+			continue;
+		for (uint32_t i = 0; i < d->nobjs; i++) {
+			struct kobj *o = &d->objs[i];
+			if (o->live && o->imports && o->surface == surface) {
+				*size = o->size;
+				return (const void *)(uintptr_t)o->va;
+			}
+		}
+	}
+	*size = 0;
+	return 0;
+}
+
 void kgsl_ios_sync_stats(uint64_t *calls, uint64_t *bytes, uint64_t *ns)
 {
 	*calls = cs_calls;
@@ -978,5 +996,6 @@ void kgsl_report(void)
 		host_log("kgsl ioctl %08lx x%u\n", seen_req[i], seen_count[i]);
 	host_log("cache: flush mode %d, %u GPUOBJ_SYNC calls; CPU sync %llu calls, %llu MiB invalidated in %.2f ms\n",
 		 opt_flush, sync_ioctls, (unsigned long long)cs_calls, (unsigned long long)(cs_bytes >> 20), cs_ns / 1e6);
+	kgsl_submit_report();
 }
 
