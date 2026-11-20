@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 STOCK=${1:?usage: build-drg.sh path/to/stock-boot.img [ramdisk]}
 CC=aarch64-linux-gnu-gcc
 OBJCOPY=aarch64-linux-gnu-objcopy
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -DBOARD_DRG ${SHIM_CFLAGS--DDRG_HW_TESTS}"	# default: W1/B1 hardware tests (drg_w1.c, drg_bt.c); SHIM_CFLAGS= turns them off; SHIM_CFLAGS=-DDRG_EMMC_MB_TEST: eMMC multi-block test run
+CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -DBOARD_DRG ${SHIM_CFLAGS--DDRG_HW_TESTS}"	# default: B2/W2/A1 hardware tests (drg_bt.c, drg_w1.c, drg_a1.c); SHIM_CFLAGS= turns them off; SHIM_CFLAGS=-DDRG_EMMC_MB_TEST: eMMC multi-block test run
 OUT=out-drg
 mkdir -p $OUT
 # Nokia's CP microcode and zap shader (vendor_b, kept out of git), checked
@@ -22,16 +22,16 @@ CAP=${DRG_GPU_CAP:-../../research/vendor-adreno/capture}
 	grep -E ' \./capture/cap1\.bin$' SHA256SUMS | sed 's# \./capture/# #' | sha256sum -c --quiet -) ||
 	{ echo "error: GPU capture missing or changed in $CAP" >&2; exit 1; }
 $CC $CFLAGS -I "$FW" -I "$CAP" -c drg_gpu_fw.S -o $OUT/drg_gpu_fw.o
-for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c emmc.c gptslot.c drg_rpm.c drg_ts.c drg_gpu.c drg_fat.c drg_w1.c drg_bt.c; do
+for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c emmc.c gptslot.c drg_rpm.c drg_ts.c drg_gpu.c drg_fat.c drg_part.c drg_smem.c drg_w1.c drg_bt.c drg_a1.c; do
 	$CC $CFLAGS -I ../gpu/drgpu -c $f -o $OUT/${f%.*}.o
 done
 for f in drgpu drgpu_pt drgpu_rpm; do	# portable GPU core, shared with XNU
 	$CC $CFLAGS -c ../gpu/drgpu/$f.c -o $OUT/$f.o
 done
-abs=$(aarch64-linux-gnu-readelf -r $OUT/shim.o $OUT/console.o $OUT/mmu.o $OUT/fdt.o $OUT/loader.o $OUT/ufs.o $OUT/emmc.o $OUT/gptslot.o $OUT/drg_rpm.o $OUT/drg_ts.o $OUT/drg_gpu.o $OUT/drg_fat.o $OUT/drg_w1.o $OUT/drg_bt.o $OUT/drgpu.o $OUT/drgpu_pt.o $OUT/drgpu_rpm.o | grep -c ABS64 || true)
+abs=$(aarch64-linux-gnu-readelf -r $OUT/shim.o $OUT/console.o $OUT/mmu.o $OUT/fdt.o $OUT/loader.o $OUT/ufs.o $OUT/emmc.o $OUT/gptslot.o $OUT/drg_rpm.o $OUT/drg_ts.o $OUT/drg_gpu.o $OUT/drg_fat.o $OUT/drg_part.o $OUT/drg_smem.o $OUT/drg_w1.o $OUT/drg_bt.o $OUT/drg_a1.o $OUT/drgpu.o $OUT/drgpu_pt.o $OUT/drgpu_rpm.o | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
 $CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
-	$OUT/start.o $OUT/shim.o $OUT/console.o $OUT/mmu.o $OUT/fdt.o $OUT/loader.o $OUT/ufs.o $OUT/emmc.o $OUT/gptslot.o $OUT/drg_rpm.o $OUT/drg_ts.o $OUT/drg_gpu.o $OUT/drg_fat.o $OUT/drg_w1.o $OUT/drg_bt.o $OUT/drgpu.o $OUT/drgpu_pt.o $OUT/drgpu_rpm.o $OUT/drg_gpu_fw.o -o $OUT/shim.elf
+	$OUT/start.o $OUT/shim.o $OUT/console.o $OUT/mmu.o $OUT/fdt.o $OUT/loader.o $OUT/ufs.o $OUT/emmc.o $OUT/gptslot.o $OUT/drg_rpm.o $OUT/drg_ts.o $OUT/drg_gpu.o $OUT/drg_fat.o $OUT/drg_part.o $OUT/drg_smem.o $OUT/drg_w1.o $OUT/drg_bt.o $OUT/drg_a1.o $OUT/drgpu.o $OUT/drgpu_pt.o $OUT/drgpu_rpm.o $OUT/drg_gpu_fw.o -o $OUT/shim.elf
 $OBJCOPY -O binary $OUT/shim.elf $OUT/Image
 size=$(aarch64-linux-gnu-nm $OUT/shim.elf | awk '$3=="_end"{print strtonum("0x"$1)}')
 truncate -s "$size" $OUT/Image

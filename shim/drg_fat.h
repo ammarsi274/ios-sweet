@@ -8,24 +8,27 @@
 #define DRG_FAT_H
 #include <stdint.h>
 
-#define FAT_SECTOR		512u
-#define FAT_MAX_READ		4096u	/* sectors per read call (2 MiB, the proven eMMC DMA size) */
+#define FAT_SECTOR		512u	/* device (eMMC) sector */
+#define FAT_MAX_BPS		4096u	/* largest file-system sector accepted (bluetooth_a uses 4096) */
+#define FAT_MAX_READ		4096u	/* device sectors per read call (2 MiB, the proven eMMC DMA size) */
 
-/* count sectors from lba (relative to the partition) into buf; 0 on success */
+/* count device (512-byte) sectors from lba (relative to the partition) into buf; 0 on success */
 typedef int (*fat_read_fn)(void *ctx, uint32_t lba, uint32_t count, void *buf);
 
 struct fat16 {
 	fat_read_fn read;
 	void *ctx;
-	uint32_t part_sectors;		/* partition size, from the GPT */
-	uint32_t spc;			/* sectors per cluster */
+	uint32_t part_sectors;		/* partition size in device sectors, from the GPT */
+	uint32_t bps, shift;		/* file-system sector bytes; = 512 << shift */
+	uint32_t oversize;		/* the boot sector claims more sectors than the partition has (reads stay bounded) */
+	uint32_t spc;			/* file-system sectors per cluster; all LBAs below are in file-system sectors */
 	uint32_t fat_lba, fat_sectors;	/* first FAT */
 	uint32_t root_lba, root_sectors, root_entries;
 	uint32_t data_lba, clusters;	/* cluster 2 starts at data_lba */
 	uint32_t total_sectors;
 	uint32_t fat_cached;		/* sector number held in fatsec, or ~0 */
-	uint8_t sec[FAT_SECTOR] __attribute__((aligned(64)));	/* directory / tail scratch */
-	uint8_t fatsec[FAT_SECTOR] __attribute__((aligned(64)));
+	uint8_t sec[FAT_MAX_BPS] __attribute__((aligned(64)));	/* directory / tail scratch */
+	uint8_t fatsec[FAT_MAX_BPS] __attribute__((aligned(64)));
 };
 
 struct fat16_ent {

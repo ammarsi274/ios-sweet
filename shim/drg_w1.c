@@ -49,11 +49,26 @@
  * Deviations, all logged: the QDSS proxy vote is not sent (its RPM value
  * is a clock rate the source does not pin down); CX/MX/XO votes are left
  * in place afterwards (never lower CX/MX under a running CPU; XNU's GPU
- * driver re-votes CX/MX); after authentication the modem is watched for
- * 5 s and then stopped as pil_mss_shutdown does (unless built with
+ * driver re-votes CX/MX); after authentication the modem is watched and
+ * then stopped as pil_mss_shutdown does (unless built with
  * -DDRG_W1_KEEP_RUNNING), because nothing under XNU would serve it and a
  * Q6 watchdog bite or error fatal must not take the boot down [E]. Memory
  * the modem owns at that point stays its (XNU never maps the low bank).
+ *
+ * W2 (boot #56 proved W1 up to status 4): the watch is 30 s instead of 5 s
+ * and reads SMEM read-only (drg_smem.c, HMD msm_smem.c) once per second:
+ * the modem's outbound SMP2P item (SMEM_SMP2P_MODEM_BASE + apps pid 0 =
+ * 435, apps<->modem partition; entry "slave-kernel" per the DT smp2pgpio
+ * ssr-smp2p-1-in node; the mss node's qcom,gpio-* bits are not in this DT
+ * excerpt [E: 0 err-fatal, 1 err-ready, 2 proxy-unvote, 3 stop-ack as the
+ * lpass node]), the failure reason SMEM_SSR_REASON_MSS0 (421,
+ * SMEM_ANY_HOST_FLAG, as pil-q6v5-mss.c log_modem_sfr, never cleared
+ * here), the GLINK SMEM transport items 478/479/480 in the apps<->modem
+ * partition (glink_smem_native_xprt.c: the descriptor and FIFO 0 are
+ * allocated by apps, which nothing does here, so the modem's GLINK edge
+ * cannot come up), RMB status/debug and the wdog SPI pending bit; a change
+ * is logged, then the full state once more before the shutdown. Log lines
+ * are packed (boot #56's W1 used 259 lines of the 32 KiB log).
  *
  * Safety: assignments only inside modem_fw_region, pil_mba_region and the
  * FIH NV region, all below 4 GiB; a Q6 found running (step 9: headswitch
@@ -67,6 +82,8 @@
 #include <stdint.h>
 #include "drg_w1.h"
 #include "drg_fat.h"
+#include "drg_part.h"
+#include "drg_smem.h"
 #include "drg_rpm.h"
 #include "drg_gpu.h"
 #include "emmc.h"
@@ -131,7 +148,8 @@
 
 #define PBL_MBA_TIMEOUT_MS	5000	/* MBA_ENCRYPTION_TIMEOUT (qcom,minidump-id present) */
 #define AUTH_TIMEOUT_MS		10000	/* modem_auth_timeout_ms */
-#define WATCH_MS		5000
+#define WATCH_MS		30000	/* W2 */
+#define WATCH_STEP_MS		1000
 
 #define MAX_PHDR		64
 
@@ -209,19 +227,21 @@ static int on_spare(void (*fn)(void), uintptr_t addr, uint32_t *val, uint64_t *e
 	return -2;
 }
 
-/* one register read on a spare core; 0 ok */
-static int safe_rd(const char *label, uintptr_t a, uint32_t *v)
+/* one register read on a spare core; 0 ok. quiet: a zero value is not logged (W2 log budget) */
+static int safe_rd_q(const char *label, uintptr_t a, uint32_t *v, int quiet)
 {
 	uint64_t esr = 0;
 	int rc = on_spare(0, a, v, &esr, 100000);
 	if (rc) {
 		LX(label, (uint32_t)a, (uint32_t)rc);
 		LX("w1 probe esr", (uint32_t)a, (uint32_t)esr);
-	} else {
+	} else if (!quiet || *v) {
 		L(label, (uint32_t)a, *v);
 	}
 	return rc;
 }
+
+static int safe_rd(const char *label, uintptr_t a, uint32_t *v) { return safe_rd_q(label, a, v, 0); }
 
 /* RAM targets: one write + read back on a spare core */
 static volatile uintptr_t touch_addr;
@@ -311,10 +331,7 @@ static int assign(const char *label, uint64_t a, uint64_t s, uint32_t src0, uint
 {
 	uint32_t nsrc = src1 ? 2 : 1, ndst = d1 ? 2 : 1;
 	logp(label, (uint32_t)a, (uint32_t)s, 0);
-	L("w1 asg src0/src1", src0, src1);
-	L("w1 asg dst0/perm0", d0, p0);
-	if (d1)
-		L("w1 asg dst1/perm1", d1, p1);
+	L(" src01/dst0p0d1p1", src0 << 8 | src1, d0 << 24 | p0 << 16 | d1 << 8 | p1);	/* packed (W2) */
 	if (!allowed(a, s)) {
 		LX("w1 asg REFUSED range", (uint32_t)a, (uint32_t)s);
 		return -1;
@@ -363,9 +380,11 @@ static int assign(const char *label, uint64_t a, uint64_t s, uint32_t src0, uint
 			return -1;
 		}
 		int64_t x0 = (int64_t)smc_x[0];
-		logp("w1 smc x0/x1", (uint32_t)x0, (uint32_t)smc_x[1], x0 < 0 ? -1 : 0);
-		L("w1 smc x2/x3", (uint32_t)smc_x[2], (uint32_t)smc_x[3]);
-		L("w1 smc rounds/us", smc_rounds, us);
+		logp(" smc x0/us", (uint32_t)x0, us, x0 < 0 ? -1 : 0);
+		if (x0 || smc_x[1] || smc_x[2] || smc_x[3] || smc_rounds != 1) {	/* anything but a plain success */
+			L(" smc x1/x2", (uint32_t)smc_x[1], (uint32_t)smc_x[2]);
+			L(" smc x3/rounds", (uint32_t)smc_x[3], smc_rounds);
+		}
 		if (x0 == SCM_V2_EBUSY && tries < 67) {	/* scm.c: 30 ms, up to 67 retries */
 			udelay(30000);
 			continue;
@@ -510,58 +529,11 @@ static void deinit_err(void)
 
 /* ---- firmware partition ---- */
 
-static uint8_t sec[512] __attribute__((aligned(64)));
 static uint8_t mdt[16384] __attribute__((aligned(64)));
 static struct fat16 fs;
 static uint64_t part_first;
 
-static int part_read(void *ctx, uint32_t lba, uint32_t count, void *buf)
-{
-	(void)ctx;
-	return drg_emmc_read(part_first + lba, count, buf);
-}
-
 static uint32_t g32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
-static uint64_t g64(const uint8_t *p) { return g32(p) | (uint64_t)g32(p + 4) << 32; }
-
-/* GPT entry by name (UTF-16LE at +56), read-only */
-static int gpt_find(const char *name, uint64_t *first, uint64_t *last)
-{
-	int rc = drg_emmc_read(1, 1, sec);
-	if (rc || g32(sec) != 0x20494645 || g32(sec + 4) != 0x54524150) {	/* "EFI PART" */
-		LX("w1 gpt header rc", (uint32_t)rc, g32(sec));
-		return -1;
-	}
-	uint64_t ent = g64(sec + 72);
-	uint32_t n = g32(sec + 80), esz = g32(sec + 84);
-	if (esz != 128 || n == 0 || n > 128) {
-		LX("w1 gpt entries n/size", n, esz);
-		return -1;
-	}
-	for (uint32_t i = 0; i < n; i++) {
-		if (i % 4 == 0 && (rc = drg_emmc_read(ent + i / 4, 1, sec))) {
-			LX("w1 gpt entry read rc", i, (uint32_t)rc);
-			return -1;
-		}
-		const uint8_t *e = sec + (i % 4) * 128;
-		int k = 0;
-		for (; k < 36; k++) {
-			uint16_t c = (uint16_t)(e[56 + 2 * k] | e[57 + 2 * k] << 8);
-			if (c != (uint8_t)name[k])
-				break;
-			if (c == 0)
-				break;
-		}
-		if (k < 36 && name[k] == 0 && e[56 + 2 * k] == 0 && e[57 + 2 * k] == 0) {
-			*first = g64(e + 32);
-			*last = g64(e + 40);
-			L("w1 gpt part index", i + 1, n);
-			return 0;
-		}
-	}
-	LX("w1 gpt not found", n, 0);
-	return -1;
-}
 
 static void segname(char *p, uint32_t num)	/* "image/modem.bNN" */
 {
@@ -605,25 +577,81 @@ static void zero(uintptr_t a, uint32_t n)
 		*(volatile uint8_t *)a++ = 0;
 }
 
+/*
+ * W2: 30 s with the modem running. Each second: RMB PBL/status/debug, the
+ * wdog SPI pending bit, SMP2P "slave-kernel", the first byte of the failure
+ * reason, which GLINK items exist; lines when any of it changed (at most
+ * 48), then everything in full.
+ */
+static void glink_state(uint32_t *mask, uint32_t *desc0, uint32_t *desc1)
+{
+	static const uint16_t ids[3] = { SMEM_GLINK_DESC, SMEM_GLINK_FIFO_0, SMEM_GLINK_FIFO_1 };
+	*mask = 0, *desc0 = *desc1 = 0;
+	for (int i = 0; i < 3; i++) {
+		uint32_t sz = 0;
+		uintptr_t p = drg_smem_item(ids[i], SMEM_HOST_MODEM, &sz);
+		if (p)
+			*mask |= 1u << i;
+		if (p && i == 0 && sz >= 16) {	/* struct channel_desc tx {read, write}, rx {read, write} */
+			*desc0 = rd32(p) << 16 | (rd32(p + 4) & 0xffff);
+			*desc1 = rd32(p + 8) << 16 | (rd32(p + 12) & 0xffff);
+		}
+	}
+}
+
 static void watch(void)
 {
-	uint32_t last_pbl = ~0u, last_st = ~0u, last_dbg = ~0u, last_pend = ~0u, lines = 0;
+	uint32_t last[6] = { ~0u, ~0u, ~0u, ~0u, ~0u, ~0u }, lines = 0;
 	uintptr_t pend_reg = GICD + 0x200 + 4 * (MSS_WDOG_INTID / 32);
+	int smem = drg_smem_init(logp, "w2");
+	(void)drg_smem_string(SMEM_SSR_REASON_MSS0, SMEM_HOST_ANY, logp, "w2 sfr start id/len");
+	flush();
 	uint64_t t0 = now();
-	while (ms_since(t0) < WATCH_MS) {
-		uint32_t pbl = rd32(RMB + RMB_PBL_STATUS), st = rd32(RMB + RMB_MBA_STATUS);
-		uint32_t dbg = rd32(RMB + RMB_MBA_DEBUG_INFO);
-		uint32_t pend = (rd32(pend_reg) >> (MSS_WDOG_INTID % 32)) & 1;
-		if ((pbl != last_pbl || st != last_st || dbg != last_dbg || pend != last_pend) && lines < 24) {
-			L("w1 watch ms/pbl", ms_since(t0), pbl);
-			L("w1 watch status/debug", st, dbg);
-			L("w1 watch wdog pending", MSS_WDOG_INTID, pend);
-			lines += 3;
-			last_pbl = pbl, last_st = st, last_dbg = dbg, last_pend = pend;
+	for (;;) {
+		uint32_t ms = ms_since(t0);
+		int found = 0;
+		uint32_t cur[6];
+		cur[0] = rd32(RMB + RMB_PBL_STATUS) << 16 | (rd32(RMB + RMB_MBA_STATUS) & 0xffff);
+		cur[1] = rd32(RMB + RMB_MBA_DEBUG_INFO);
+		cur[2] = (rd32(pend_reg) >> (MSS_WDOG_INTID % 32)) & 1;
+		cur[3] = smem ? 0xdeadu : drg_smp2p_entry(SMEM_SMP2P_MODEM_BASE + 0, SMEM_HOST_MODEM, "slave-kernel", &found, 0, 0);
+		if (!smem && !found)
+			cur[3] = 0xffffffffu;	/* item or entry not there (yet) */
+		cur[4] = smem ? 0 : drg_smem_string(SMEM_SSR_REASON_MSS0, SMEM_HOST_ANY, 0, 0);
+		uint32_t gm = 0, d0 = 0, d1 = 0;
+		if (!smem)
+			glink_state(&gm, &d0, &d1);
+		cur[5] = gm << 28 | (d1 & 0xffff) << 12 | (d0 & 0xfff);
+		int changed = 0;
+		for (int i = 0; i < 6; i++)
+			changed |= cur[i] != last[i];
+		if (changed && lines < 48) {
+			logp("w2 t ms/pbl.mba", ms, cur[0], cur[2] ? -1 : 0);
+			L(" dbg/smp2p", cur[1], cur[3]);
+			logp(" wdog/sfr0", cur[2], cur[4], cur[4] ? -1 : 0);
+			if (cur[5] != last[5])
+				L(" glink items.idx", gm, cur[5]);
+			lines += 3 + (cur[5] != last[5]);
+			for (int i = 0; i < 6; i++)
+				last[i] = cur[i];
+			flush();
 		}
-		udelay(100000);
+		if (ms >= WATCH_MS)
+			break;
+		udelay(WATCH_STEP_MS * 1000);
 	}
+	L("w2 watch end ms/lines", ms_since(t0), lines);
 	rmb_dump();
+	if (!smem) {
+		int found = 0;
+		(void)drg_smp2p_entry(SMEM_SMP2P_MODEM_BASE + 0, SMEM_HOST_MODEM, "slave-kernel", &found, logp, "w2");
+		(void)drg_smem_string(SMEM_SSR_REASON_MSS0, SMEM_HOST_ANY, logp, "w2 sfr end id/len");
+		uint32_t gm, d0, d1;
+		glink_state(&gm, &d0, &d1);
+		L("w2 glink items", gm, 0);
+		L("w2 glink tx r.w/rx r.w", d0, d1);
+	}
+	flush();
 }
 
 static int stop(int step, const char *why)
@@ -640,7 +668,6 @@ static int rpm_ok(const char *label, int rc)
 	uint32_t w[4];
 	drg_rpm_last_ack(w);
 	logp(label, (uint32_t)rc, w[1], rc ? -1 : 0);
-	L("w1 rpm ack w0/w2", w[0], w[2]);
 	/* rpm-smd.c msm_rpm_get_error_from_ack: v0 ack {req, req_len, rsc_id, msg_len, id_ack}; req_len 12 = no error kvp */
 	if (!rc && w[1] != 12)
 		LX("w1 rpm NACK? len/w3", w[1], w[3]);
@@ -673,7 +700,10 @@ int drg_w1_test(drg_log_fn log, drg_flush_fn fl)
 
 	/* 2. modem_a from the GPT */
 	uint64_t first = 0, last = 0;
-	if (gpt_find("modem_a", &first, &last))
+	uint32_t pidx = 0;
+	int rc_gpt = drg_gpt_find("modem_a", &first, &last, &pidx);
+	logp("w1 gpt rc/index", (uint32_t)rc_gpt, pidx, rc_gpt ? -1 : 0);
+	if (rc_gpt)
 		return stop(2, "gpt");
 	L("w1 modem_a first lba", (uint32_t)(first >> 32), (uint32_t)first);
 	L("w1 modem_a last lba", (uint32_t)(last >> 32), (uint32_t)last);
@@ -682,8 +712,8 @@ int drg_w1_test(drg_log_fn log, drg_flush_fn fl)
 	part_first = first;
 
 	/* 3. FAT16 */
-	fs.read = part_read;
-	fs.ctx = 0;
+	fs.read = drg_part_read;
+	fs.ctx = &part_first;
 	int rc = fat16_mount(&fs, (uint32_t)(last - first + 1));
 	logp("w1 fat mount rc/clusters", (uint32_t)rc, fs.clusters, rc ? -1 : 0);
 	L("w1 fat spc/root_lba", fs.spc, fs.root_lba);
@@ -751,18 +781,20 @@ int drg_w1_test(drg_log_fn log, drg_flush_fn fl)
 	/* 5. every .bNN present with its filesz (pil_load_seg checks this later; here before any side effect) */
 	for (uint32_t i = 0; i < nsegs; i++) {
 		struct seg *s = &segs[i];
-		L("w1 seg num/pa", s->num, s->pa);
-		L("w1 seg filesz/memsz", s->filesz, s->memsz);
 		if (!s->filesz)
 			continue;
 		char name[20];
 		segname(name, s->num);
 		rc = fat16_lookup(&fs, name, &s->ent);
 		if (rc || s->ent.size != s->filesz) {
+			LX("w1 seg num/pa", s->num, s->pa);
+			LX("w1 seg filesz/memsz", s->filesz, s->memsz);
 			LX("w1 seg file rc/size", (uint32_t)rc, s->ent.size);
 			return stop(5, "segment file");
 		}
 	}
+
+	L("w1 segs/first", nsegs, segs[0].num);
 
 	/* 6. RAM targets writable from here (spare core catches a protection fault), then mba.mbn */
 	if (touch(MBA_BUF) || touch(META_BUF) || touch(MODEM_FW_BASE) || touch(MODEM_FW_BASE + rsize - 4))
@@ -819,13 +851,14 @@ int drg_w1_test(drg_log_fn log, drg_flush_fn fl)
 		for (int i = 0; i < 6 && !bad; i++)
 			bad = safe_rd("w1 q6ss", QDSP6 + q6r[i], &q6v[i]);
 		for (uint32_t o = 0; o <= RMB_MBA_DEBUG_INFO && !bad; o += 4)
-			bad = safe_rd("w1 rmb (dry)", RMB + o, &rmbv[o / 4]);
+			bad = safe_rd_q("w1 rmb (dry) !=0", RMB + o, &rmbv[o / 4], 1);
 		uintptr_t hb[3] = { HALT_Q6, HALT_MODEM, HALT_NC };
 		for (int i = 0; i < 3 && !bad; i++)
 			for (uint32_t o = 0; o <= 8 && !bad; o += 4)
-				bad = safe_rd("w1 halt (dry)", hb[i] + o, &v);
+				bad = safe_rd_q("w1 halt (dry) !=0", hb[i] + o, &v, 1);
 		/* the CX ipeak vote-clear register is only written on shutdown: skip it there if unreadable */
 		cxip_ok = !bad && !safe_rd("w1 cxip (dry)", CXIP_LM_VOTE_CLEAR, &v);
+		L("w1 dry reads bad", (uint32_t)bad, 0);
 		if (bad) {
 			wr32(MSS_RESTART, 1);
 			dsb();
@@ -1051,7 +1084,7 @@ int drg_w1_test(drg_log_fn log, drg_flush_fn fl)
 			uint32_t want = s->num < 30 ? seg_crc[s->num] : 0;
 			int crc_ok = !s->filesz || c == want;
 			bad_crc += !crc_ok;
-			logp("w1 load num/crc", s->num, c, crc_ok ? 0 : -2);
+			uint32_t st0 = rd32(RMB + RMB_MBA_STATUS);
 			/* pil_msa_mba_verify_blob(paddr, memsz) */
 			uint32_t len = rd32(RMB + RMB_PMI_CODE_LENGTH);
 			if (len == 0) {
@@ -1062,8 +1095,11 @@ int drg_w1_test(drg_log_fn log, drg_flush_fn fl)
 			wr32(RMB + RMB_PMI_CODE_LENGTH, len);
 			dsb();
 			int32_t st = (int32_t)rd32(RMB + RMB_MBA_STATUS);
-			logp("w1 load length/status", len, (uint32_t)st, st < 0 ? -1 : 0);
+			/* one line per segment (W2): number, status before/after verify_blob, CRC */
+			logp("w1 ld num.st0.st/crc", s->num << 24 | (st0 & 0xfff) << 12 | ((uint32_t)st & 0xfff), c,
+			     st < 0 ? -1 : crc_ok ? 0 : -2);
 			if (st < 0) {
+				LX("w1 load length/status", len, (uint32_t)st);
 				rmb_dump();
 				deinit_err();
 				assign("w1 asg region->hlos", region, rsize, VMID_HLOS, VMID_MSS_MSA, VMID_HLOS,
@@ -1072,6 +1108,7 @@ int drg_w1_test(drg_log_fn log, drg_flush_fn fl)
 			}
 		}
 		L("w1 load done ms/bad crcs", ms_since(t0), bad_crc);
+		L("w1 code length", rd32(RMB + RMB_PMI_CODE_LENGTH), 0);
 	}
 	flush();
 
@@ -1108,7 +1145,7 @@ int drg_w1_test(drg_log_fn log, drg_flush_fn fl)
 	con_str("W1", "PASS: modem authenticated (status 4)");
 	flush();
 
-	/* 18. watch, then stop it again (see the header comment) */
+	/* 18. W2 watch (30 s, SMEM), then stop it again (see the header comment) */
 	watch();
 #ifdef DRG_W1_KEEP_RUNNING
 	L("w1 left running (KEEP)", 0, 0);

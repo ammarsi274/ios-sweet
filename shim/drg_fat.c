@@ -6,23 +6,32 @@
  * 0xE5 = deleted, 0x00 = end, attr 0x0F = long-name entry, 0x08 = label,
  * 0x10 = directory. Long names are ignored: lookups use the 8.3 names
  * (modem_a's files all have one; checked on the saved image).
+ * File-system sectors of 512..4096 bytes: bluetooth_a (backup 2026-11-06)
+ * is FAT16 with 4096-byte sectors on the 512-byte eMMC, and its boot sector
+ * claims 16384 such sectors (64 MiB) on a 1 MiB partition; that is accepted
+ * (fs->oversize = 1) because every read is checked against the partition.
  */
 #include "drg_fat.h"
 
 static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t le32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 
+/* lba, count in file-system sectors */
 static int rd(struct fat16 *fs, uint32_t lba, uint32_t count, void *buf)
 {
-	if (lba >= fs->part_sectors || count > fs->part_sectors - lba || count == 0 || count > FAT_MAX_READ)
+	uint64_t dl = (uint64_t)lba << fs->shift, dc = (uint64_t)count << fs->shift;
+	if (dl >= fs->part_sectors || dc > fs->part_sectors - dl || count == 0 || dc > FAT_MAX_READ)
 		return FAT_E_IO;
-	return fs->read(fs->ctx, lba, count, buf) ? FAT_E_IO : 0;
+	return fs->read(fs->ctx, (uint32_t)dl, (uint32_t)dc, buf) ? FAT_E_IO : 0;
 }
 
 int fat16_mount(struct fat16 *fs, uint32_t part_sectors)
 {
 	fs->part_sectors = part_sectors;
 	fs->fat_cached = ~0u;
+	fs->bps = FAT_SECTOR;
+	fs->shift = 0;
+	fs->oversize = 0;
 	if (part_sectors < 64)
 		return FAT_E_BOOT;
 	int rc = rd(fs, 0, 1, fs->sec);
@@ -31,23 +40,31 @@ int fat16_mount(struct fat16 *fs, uint32_t part_sectors)
 	const uint8_t *b = fs->sec;
 	uint32_t bps = le16(b + 11), spc = b[13], resv = le16(b + 14), nfats = b[16];
 	uint32_t rootent = le16(b + 17), tot16 = le16(b + 19), fatsz = le16(b + 22), tot32 = le32(b + 32);
-	uint32_t tot = tot16 ? tot16 : tot32;
-	if (b[510] != 0x55 || b[511] != 0xaa || bps != FAT_SECTOR || spc == 0 || (spc & (spc - 1)) || spc > 128 ||
-	    resv == 0 || nfats == 0 || nfats > 2 || rootent == 0 || rootent % 16 || fatsz == 0 || tot > part_sectors)
+	uint32_t tot = tot16 ? tot16 : tot32, shift = 0;
+	while (shift < 4 && (FAT_SECTOR << shift) != bps)
+		shift++;
+	if (b[510] != 0x55 || b[511] != 0xaa || shift > 3 || spc == 0 || (spc & (spc - 1)) || spc > 128 ||
+	    resv == 0 || nfats == 0 || nfats > 2 || rootent == 0 || (rootent * 32) % bps || fatsz == 0 ||
+	    (uint64_t)fatsz * bps > 0x40000)
 		return FAT_E_BOOT;
+	fs->oversize = ((uint64_t)tot << shift) > part_sectors;
+	if (fs->oversize && shift == 0)	/* a 512-byte FS larger than its partition stays refused (modem_a) */
+		return FAT_E_BOOT;
+	fs->bps = bps;
+	fs->shift = shift;
 	fs->spc = spc;
 	fs->fat_lba = resv;
 	fs->fat_sectors = fatsz;
 	fs->root_lba = resv + nfats * fatsz;
 	fs->root_entries = rootent;
-	fs->root_sectors = rootent * 32 / FAT_SECTOR;
+	fs->root_sectors = rootent * 32 / bps;
 	fs->data_lba = fs->root_lba + fs->root_sectors;
 	fs->total_sectors = tot;
 	if (fs->data_lba >= tot)
 		return FAT_E_BOOT;
 	fs->clusters = (tot - fs->data_lba) / spc;
 	/* FAT16 by cluster count; the FAT must hold an entry for every cluster */
-	if (fs->clusters < 4085 || fs->clusters > 65524 || (fs->clusters + 2) * 2 > fatsz * FAT_SECTOR)
+	if (fs->clusters < 4085 || fs->clusters > 65524 || (fs->clusters + 2) * 2 > fatsz * bps)
 		return FAT_E_BOOT;
 	return 0;
 }
@@ -55,7 +72,7 @@ int fat16_mount(struct fat16 *fs, uint32_t part_sectors)
 /* next cluster of cl, or a negative error */
 static int32_t fat_next(struct fat16 *fs, uint32_t cl)
 {
-	uint32_t off = cl * 2, s = fs->fat_lba + off / FAT_SECTOR;
+	uint32_t off = cl * 2, s = fs->fat_lba + off / fs->bps;
 	if (fs->fat_cached != s) {
 		int rc = rd(fs, s, 1, fs->fatsec);
 		if (rc) {
@@ -64,7 +81,7 @@ static int32_t fat_next(struct fat16 *fs, uint32_t cl)
 		}
 		fs->fat_cached = s;
 	}
-	return le16(fs->fatsec + off % FAT_SECTOR);
+	return le16(fs->fatsec + off % fs->bps);
 }
 
 static int cl_ok(const struct fat16 *fs, uint32_t cl)
@@ -126,7 +143,7 @@ static int dir_find(struct fat16 *fs, uint32_t dir, const uint8_t name[11], stru
 			int rc = rd(fs, lba + s, 1, fs->sec);
 			if (rc)
 				return rc;
-			for (uint32_t k = 0; k < FAT_SECTOR / 32; k++) {
+			for (uint32_t k = 0; k < fs->bps / 32; k++) {
 				const uint8_t *d = fs->sec + 32 * k;
 				if (d[0] == 0)
 					return FAT_E_NOENT;
@@ -186,7 +203,7 @@ int fat16_lookup(struct fat16 *fs, const char *path, struct fat16_ent *e)
 int32_t fat16_read(struct fat16 *fs, const struct fat16_ent *e, uint8_t *dst, uint32_t max, uint32_t *runs)
 {
 	uint32_t size = e->size, done = 0, nruns = 0;
-	uint32_t cbytes = fs->spc * FAT_SECTOR;
+	uint32_t cbytes = fs->spc * fs->bps, maxs = FAT_MAX_READ >> fs->shift;
 	int direct = ((uintptr_t)dst & 7) == 0;
 	volatile uint8_t *vd = dst;	/* byte copies stay byte stores: no memcpy in the shim */
 	if (runs)
@@ -227,22 +244,22 @@ int32_t fat16_read(struct fat16 *fs, const struct fat16_ent *e, uint8_t *dst, ui
 		uint32_t bytes = n * cbytes;
 		if (bytes > size - done)
 			bytes = size - done;
-		uint32_t full = bytes / FAT_SECTOR, tail = bytes % FAT_SECTOR;
+		uint32_t full = bytes / fs->bps, tail = bytes % fs->bps;
 		for (uint32_t s = 0; s < full;) {
 			uint32_t c = full - s;
 			if (!direct)
 				c = 1;
-			else if (c > FAT_MAX_READ)
-				c = FAT_MAX_READ;
+			else if (c > maxs)
+				c = maxs;
 			uint8_t *to = direct ? dst + done : fs->sec;
 			int rc = rd(fs, lba + s, c, to);
 			nruns++;
 			if (rc)
 				return rc;
 			if (!direct)
-				for (uint32_t i = 0; i < FAT_SECTOR; i++)
+				for (uint32_t i = 0; i < fs->bps; i++)
 					vd[done + i] = fs->sec[i];
-			done += c * FAT_SECTOR;
+			done += c * fs->bps;
 			s += c;
 		}
 		if (tail) {

@@ -17,6 +17,7 @@
 #include "drg_gpu.h"
 #include "drg_w1.h"
 #include "drg_bt.h"
+#include "drg_a1.h"
 #include "fdt.h"
 
 #define RESTART_BOOTLOADER	0x77665500U
@@ -1351,12 +1352,16 @@ static void __attribute__((noreturn)) drg_gold_main(void)
 	drg_touch_probe();
 	stage = "gold ldo";
 	drg_ldo_probe();
-#ifdef DRG_HW_TESTS	/* wifi-bt-plan W1 (modem) + B1 (Bluetooth); each logs, cleans up and returns */
-	stage = "gold w1";
+#ifdef DRG_HW_TESTS	/* B2 (Bluetooth + firmware), W2 (modem, 30 s), A1 (amp + ADSP); each logs, cleans up and returns */
+	stage = "gold b2";
+	(void)drg_bt_test(cpu_put, cpu_flush);
+	cpu_flush();
+	stage = "gold w2";
 	(void)drg_w1_test(cpu_put, cpu_flush);
 	cpu_flush();
-	stage = "gold b1";
-	(void)drg_bt_test(cpu_put, cpu_flush);
+	stage = "gold a1";
+	(void)drg_a1_test(cpu_put, cpu_flush);
+	cpu_put("hw tests log bytes", cpu_len, sizeof(cpu_log), cpu_len < sizeof(cpu_log) - 64 ? 0 : -1);
 	cpu_flush();
 #endif
 

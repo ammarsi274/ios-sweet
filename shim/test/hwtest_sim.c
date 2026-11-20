@@ -1,5 +1,6 @@
 /*
- * Host simulation of the W1 (drg_w1.c) and B1 (drg_bt.c) hardware tests.
+ * Host simulation of the B2 (drg_bt.c), W2 (drg_w1.c) and A1 (drg_a1.c)
+ * hardware tests, in the shim's order.
  * The real code runs unchanged except for the DRG_HOST_SIM seams (timer,
  * the SMC instruction, UART register access). Everything the code touches by
  * physical address is mapped at that address (MAP_FIXED_NOREPLACE, x86-64
@@ -26,9 +27,25 @@
  * an earlier boot: restart cycle, then a normal boot), btdead, btprobe.
  * B1 must end with rc 0 and the decoded SoC version unless btdead/btprobe:
  * the drg_bt.c of commit 430e9f8 fails here the way boot #55 did.
+ * B2 model: segments of 0xFC00/0x1E collected and compared with the files
+ * of the saved bluetooth_a (the NVM with the expected edit: tag 17 byte 2
+ * 0x11 -> 0); patch segments acked only at the end (download_mode 3, env
+ * SIM_BTACK=1: every segment), NVM segments each; after the HCI reset the
+ * chip says "sleep" (0xFE) and ignores commands until it is woken (0xFD ->
+ * 0xFC). Failure injection: btnack (a NVM segment answered with result 1).
+ * SMEM model (W2/A1): target info, TOC with apps<->modem, apps<->adsp and a
+ * common partition; after the modem's status 4: SMP2P item 435
+ * "slave-kernel" 0, then err-ready (2) at +1 s, then (env SIM_MSSCRASH=1)
+ * err-fatal + a failure reason in item 421 at +4 s. ADSP: TZ PAS 1 model
+ * (init with the real adsp.mdt, mem_setup of the DT region, auth checks
+ * every segment and zero tail), SMP2P item 443 err-ready 300 ms after
+ * auth. TAS2557: QUP v2 model answering at 0x4c only with GPIO73 high
+ * (failure injection: tasabsent).
  *   gcc -O2 -Wall -Wextra -DDRG_HOST_SIM -DBOARD_DRG -static -no-pie -pthread -I.. \
- *       -o hwtest_sim hwtest_sim.c ../drg_w1.c ../drg_bt.c ../drg_fat.c
- *   ./hwtest_sim modem_a.img extracted-files-dir
+ *       -o hwtest_sim hwtest_sim.c ../drg_w1.c ../drg_bt.c ../drg_a1.c ../drg_fat.c ../drg_part.c ../drg_smem.c
+ *   ./hwtest_sim modem_a.img extracted-files-dir bluetooth_a.img
+ *   (files-dir: mba.mbn, modem.mdt, modem.bNN, adsp.mdt, adsp.bNN from modem_a;
+ *    crbtfw21.tlv, crnv21.bin from bluetooth_a)
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -43,6 +60,7 @@
 #include <unistd.h>
 #include "drg_w1.h"
 #include "drg_bt.h"
+#include "drg_a1.h"
 
 static const char *fail;
 static int fail_is(const char *s) { return fail && !strcmp(fail, s); }
@@ -133,6 +151,7 @@ int drg_probe_call(int idx, void (*fn)(void), uint64_t *esr, unsigned timeout_us
 }
 
 static uint32_t rpm_n;
+static int rwlc_swen = -1;
 static void fourcc(uint32_t v, char *s)
 {
 	for (int i = 0; i < 4; i++) {
@@ -153,6 +172,10 @@ int drg_rpm_request_kvp(uint32_t type, uint32_t id, const uint32_t *kvp, uint32_
 	}
 	printf("\n");
 	CHECK(words % 3 == 0 && words <= 16, "kvp words %u", words);
+	if (type == 0x636c7772u)	/* "rwlc": last swen */
+		for (uint32_t i = 0; i + 3 <= words; i += 3)
+			if (kvp[i] == 0x6e657773u)
+				rwlc_swen = (int)kvp[i + 2];
 	rpm_n++;
 	return 0;
 }
@@ -164,9 +187,11 @@ void drg_rpm_last_ack(uint32_t w[4])
 	w[3] = 0;
 }
 
-static FILE *img;
+static FILE *img, *btimg;
 #define PART_FIRST 1000000u
 #define PART_SECTORS 225280u
+#define BT_FIRST 2000000u
+#define BT_SECTORS 2048u
 static uint32_t emmc_reads, emmc_sectors;
 int drg_emmc_read(uint64_t lba, uint32_t count, void *buf)
 {
@@ -192,7 +217,8 @@ int drg_emmc_read(uint64_t lba, uint32_t count, void *buf)
 		for (int i = 0; i < 4; i++) {
 			int idx = (int)(lba - 2) * 4 + i;
 			uint8_t *e = p + 128 * i;
-			uint64_t f = idx == 5 ? PART_FIRST : 10000u * (unsigned)(idx + 1), l = f + PART_SECTORS - 1;
+			uint64_t f = idx == 5 ? PART_FIRST : idx == 6 ? BT_FIRST : 10000u * (unsigned)(idx + 1);
+			uint64_t l = f + (idx == 6 ? BT_SECTORS : PART_SECTORS) - 1;
 			memcpy(e + 32, &f, 8);
 			memcpy(e + 40, &l, 8);
 			for (int k = 0; names[idx][k]; k++)
@@ -205,7 +231,12 @@ int drg_emmc_read(uint64_t lba, uint32_t count, void *buf)
 			return -5;
 		return 0;
 	}
-	CHECK(0, "eMMC read outside the GPT and modem_a: lba %llu", (unsigned long long)lba);
+	if (lba >= BT_FIRST && lba + count <= BT_FIRST + BT_SECTORS) {
+		if (fseeko(btimg, (off_t)(lba - BT_FIRST) * 512, SEEK_SET) || fread(p, 512, count, btimg) != count)
+			return -5;
+		return 0;
+	}
+	CHECK(0, "eMMC read outside the GPT, modem_a and bluetooth_a: lba %llu", (unsigned long long)lba);
 	return -6;
 }
 
@@ -251,8 +282,13 @@ static struct own *own_of(uint64_t a, uint64_t s)
 }
 static uint32_t owners(uint64_t a, uint64_t s) { return own_of(a, s)->vms; }
 
+static void sim_pas(volatile uint64_t *x);
 void sim_smc(volatile uint64_t *x)
 {
+	if ((x[0] & ~0xfull) == 0x42000200) {
+		sim_pas(x);
+		return;
+	}
 	smc_calls++;
 	char fs[8];
 	snprintf(fs, sizeof(fs), "smc%u", smc_calls);
@@ -302,6 +338,216 @@ void sim_smc(volatile uint64_t *x)
 	x[1] = x[2] = x[3] = 0;
 }
 static int mss_only(uint64_t a, uint64_t s) { return owners(a, s) == (1u << 15); }
+
+/* ---- SMEM (W2/A1): target info, TOC, partitions apps<->modem, apps<->adsp, common ---- */
+#define SMEM_BASE 0x86000000UL
+#define SMEM_SIZE 0x200000u
+static uintptr_t part_hdr[3];
+
+static void smem_setup(void)
+{
+	map(0x01fd4000, 0x1000, 0);
+	*R(0x01fd4000) = 0x01fd4100, *R(0x01fd4004) = 0;
+	volatile uint32_t *ti = R(0x01fd4100);
+	ti[0] = 0x49494953, ti[1] = SMEM_SIZE, ti[2] = (uint32_t)SMEM_BASE, ti[3] = 0, ti[4] = 512;
+	map(SMEM_BASE, SMEM_SIZE, 0);
+	uintptr_t toc = SMEM_BASE + SMEM_SIZE - 4096;
+	*R(toc) = 0x434f5424, *R(toc + 4) = 1, *R(toc + 8) = 4;
+	static const uint16_t h[4][2] = { { 0, 1 }, { 2, 0 }, { 0xfffe, 0xfffe }, { 1, 2 } };
+	for (int i = 0; i < 4; i++) {
+		uintptr_t e = toc + 32 + 48 * i, off = 0x100000 + 0x20000 * (unsigned)i, hdr = SMEM_BASE + off;
+		*R(e) = (uint32_t)off, *R(e + 4) = 0x20000, *R(e + 8) = 0, *R(e + 16) = 64;
+		*(volatile uint16_t *)(e + 12) = h[i][0], *(volatile uint16_t *)(e + 14) = h[i][1];
+		if (i == 3) {	/* modem<->adsp: not apps', garbage header; reading it would be a bug */
+			memset((void *)hdr, 0x5a, 64);
+			continue;
+		}
+		*R(hdr) = 0x54525024, *(volatile uint16_t *)(hdr + 4) = h[i][0], *(volatile uint16_t *)(hdr + 6) = h[i][1];
+		*R(hdr + 8) = 0x20000, *R(hdr + 12) = 32, *R(hdr + 16) = 0x20000;
+		part_hdr[i] = hdr;
+	}
+}
+
+/* a new uncached item; visible once smem_commit runs (as the remote does: content, then the free offset) */
+static uint32_t pend_free[3];
+static uintptr_t smem_add(int part, uint16_t id, uint32_t size)
+{
+	uintptr_t hdr = part_hdr[part], a = hdr + *R(hdr + 12);
+	uint32_t sz8 = (size + 7) & ~7u;
+	*(volatile uint16_t *)a = 0xa5a5, *(volatile uint16_t *)(a + 2) = id;
+	*R(a + 4) = sz8, *(volatile uint16_t *)(a + 8) = (uint16_t)(sz8 - size), *(volatile uint16_t *)(a + 10) = 0;
+	*R(a + 12) = 0;
+	memset((void *)(a + 16), 0, sz8);
+	pend_free[part] = *R(hdr + 12) + 16 + sz8;
+	return a + 16;
+}
+static void smem_commit(int part)
+{
+	__sync_synchronize();
+	*R(part_hdr[part] + 12) = pend_free[part];
+}
+/* SMP2P outbound item of pid local towards apps with one entry "slave-kernel"; returns the value's address */
+static volatile uint32_t *smp2p_add(int part, uint16_t id, uint32_t local, uint32_t value)
+{
+	uintptr_t p = smem_add(part, id, 20 + 20 * 16);
+	*R(p) = 0x504d5324, *R(p + 4) = 1, *R(p + 8) = local, *R(p + 12) = 16 | 1u << 16, *R(p + 16) = 0;
+	memcpy((void *)(p + 20), "slave-kernel", 12);
+	*R(p + 36) = value;
+	smem_commit(part);
+	return R(p + 36);
+}
+
+static uint64_t mss_auth_t, adsp_auth_t;
+static volatile uint32_t *mss_smp2p, *adsp_smp2p;
+static int mss_stage, adsp_stage;
+static void smem_events(void)
+{
+	uint64_t t = sim_now();
+	if (mss_auth_t && mss_stage == 0 && t - mss_auth_t > 500000000ull)
+		mss_smp2p = smp2p_add(0, 435, 1, 0), mss_stage = 1;
+	if (mss_stage == 1 && t - mss_auth_t > 1000000000ull)
+		*mss_smp2p = 2, mss_stage = 2;	/* err-ready */
+	if (mss_stage == 2 && getenv("SIM_MSSCRASH") && t - mss_auth_t > 4000000000ull) {
+		const char *why = "sim: mcfg_nv.c:123:EFS not available (rmtfs)";
+		uintptr_t p = smem_add(2, 421, 130);
+		memcpy((void *)p, why, strlen(why) + 1);
+		smem_commit(2);
+		*mss_smp2p = 3, mss_stage = 3;	/* err-fatal */
+	}
+	if (adsp_auth_t && adsp_stage == 0 && t - adsp_auth_t > 300000000ull)
+		adsp_smp2p = smp2p_add(1, 443, 2, 2), adsp_stage = 1;
+}
+
+/* ---- TZ PAS (A1: ADSP, pas id 1) ---- */
+static uint8_t *amdt_f;
+static size_t amdt_n;
+static int pas_state;	/* 0 none, 1 init, 2 mem_setup, 3 running, 4 shut down */
+static unsigned pas_calls;
+static int adsp_seg_ok(void)
+{
+	uint32_t phoff, phnum = (uint32_t)(amdt_f[44] | amdt_f[45] << 8);
+	memcpy(&phoff, amdt_f + 28, 4);
+	for (uint32_t i = 0; i < phnum; i++) {
+		uint32_t ph[8];
+		memcpy(ph, amdt_f + phoff + 32 * i, 32);
+		if (!(ph[0] == 1 && ((ph[6] >> 24) & 7) != 2 && ph[5]))
+			continue;
+		uint8_t *m = (uint8_t *)(uintptr_t)ph[3];
+		if (ph[4]) {
+			char nm[16];
+			size_t fn;
+			snprintf(nm, sizeof(nm), "adsp.b%02u", i);
+			uint8_t *f = load(nm, &fn);
+			int bad = !f || fn != ph[4] || memcmp(m, f, fn);
+			free(f);
+			if (bad) {
+				printf("SIM adsp segment %u content mismatch\n", i);
+				return 0;
+			}
+		}
+		for (uint32_t k = ph[4]; k < ph[5]; k++)
+			if (m[k]) {
+				printf("SIM adsp segment %u tail not zero\n", i);
+				return 0;
+			}
+	}
+	return 1;
+}
+static void sim_pas(volatile uint64_t *x)
+{
+	uint32_t cmd = (uint32_t)(x[0] & 0xf);
+	uint64_t res = 0;
+	pas_calls++;
+	printf("[tz] PAS cmd %u args %llx %llx %llx %llx\n", cmd, (unsigned long long)x[1], (unsigned long long)x[2],
+	       (unsigned long long)x[3], (unsigned long long)x[4]);
+	CHECK(x[2] == 1, "PAS id %llu", (unsigned long long)x[2]);
+	switch (cmd) {
+	case 1:
+		CHECK(x[1] == 0x82 && (pas_state == 0 || pas_state == 4), "init arginfo/state");
+		CHECK(amdt_f && !memcmp((void *)(uintptr_t)x[3], amdt_f, amdt_n), "init: metadata is not adsp.mdt");
+		pas_state = 1;
+		break;
+	case 2:
+		CHECK(x[1] == 3 && pas_state == 1, "mem_setup arginfo/state");
+		CHECK(x[3] == 0x92a00000 && x[4] == 0x1e00000, "mem_setup region %llx+%llx", (unsigned long long)x[3],
+		      (unsigned long long)x[4]);
+		pas_state = 2;
+		break;
+	case 5:
+		CHECK(x[1] == 1 && pas_state == 2, "auth arginfo/state");
+		if (adsp_seg_ok() && !fail_is("adspauth")) {
+			pas_state = 3;
+			adsp_auth_t = sim_now();
+		} else {
+			res = (uint64_t)-1;	/* TZ: image not authenticated */
+		}
+		break;
+	case 6:
+		CHECK(x[1] == 1, "shutdown arginfo");
+		pas_state = 4;
+		break;
+	default:
+		CHECK(0, "PAS cmd %u", cmd);
+	}
+	x[0] = 0, x[1] = res, x[2] = x[3] = 0;
+}
+
+/* ---- BLSP2 QUP3 I2C + TAS2557 ---- */
+#define TLMM_N 0x03900000UL
+static uint32_t qr[0x500 / 4], qin;
+static uint8_t qout[16];
+static unsigned qoutn, tas_reads;
+static void qup_run(void)
+{
+	int clk = (*R(GCC + 0x2a008) & 1) && (*R(GCC + 0x52004) & (1u << 15));
+	int pins = *R(TLMM_N + 0x1000 * 26) == 0xc && *R(TLMM_N + 0x1000 * 27) == 0xc;
+	int rst = (*R(TLMM_N + 0x1000 * 73) & 0x200) && (*R(TLMM_N + 0x1000 * 73 + 4) & 2);
+	CHECK(clk && pins, "I2C transfer without clocks/pins (clk %d pins %d)", clk, pins);
+	CHECK(qr[0x150 / 4] == 9 && qoutn >= 9 && qr[0x208 / 4] == 3, "I2C counts w %u r %u", qr[0x150 / 4], qr[0x208 / 4]);
+	int fmt = qout[0] == 0x81 && qout[2] == 0x82 && qout[3] == 1 && qout[5] == 0x81 && qout[6] == (qout[1] | 1) &&
+		  qout[7] == 0x87 && qout[8] == 1;
+	CHECK(fmt, "I2C tags");
+	if (fmt && qout[1] == 0x98 && rst && !fail_is("tasabsent")) {
+		static const uint8_t val[128] = { [0x03] = 0x21, [0x25] = 0x00 };	/* [sim] invented REV_PGID */
+		qin = (uint32_t)val[qout[4] & 0x7f] << 16 | 0x0187;
+		qr[0x18 / 4] |= 1u << 11;
+		tas_reads++;
+	} else {
+		qr[0x1c / 4] = 1u << 3;	/* NACK */
+	}
+	printf("[i2c] addr %02x reg %02x reset %d -> %s\n", qout[1] >> 1, qout[4], rst, qr[0x1c / 4] ? "NACK" : "ok");
+}
+uint32_t sim_qrd(uint32_t o)
+{
+	if (o == 0x004)
+		return (qr[1] & 3) | 4;
+	if (o == 0x218)
+		return qin;
+	return o < 0x500 ? qr[o / 4] : 0;
+}
+void sim_qwr(uint32_t o, uint32_t v)
+{
+	if (o == 0x00c) {
+		memset(qr, 0, sizeof(qr));
+		qoutn = 0;
+		return;
+	}
+	if (o == 0x004) {
+		uint32_t old = qr[1] & 3;
+		qr[1] = v & 3;
+		if (old == 3 && (v & 3) == 1)
+			qup_run();
+		return;
+	}
+	if (o == 0x110) {
+		for (int k = 0; k < 4; k++)
+			if (qoutn < sizeof(qout))
+				qout[qoutn++] = (uint8_t)(v >> (8 * k));
+		return;
+	}
+	if (o < 0x500)
+		qr[o / 4] = v;
+}
 
 /* ---- hardware models ---- */
 static volatile int stop_models;
@@ -355,7 +601,7 @@ static void *model(void *arg)
 	int pbl_done = 0, meta_done = 0, load_started = 0, auth_done = 0, unlocked = 0;
 	while (!stop_models) {
 		/* GCC branches: CLK_OFF (bit 31) follows the enable / vote bit */
-		static const uint32_t br[] = { 0x8a000, 0x4401c, 0x8a03c, 0x8a004, 0x27004 };
+		static const uint32_t br[] = { 0x8a000, 0x4401c, 0x8a03c, 0x8a004, 0x27004, 0x2a008 };
 		for (unsigned i = 0; i < sizeof(br) / 4; i++) {
 			uint32_t v = *R(GCC + br[i]);
 			setbit31(GCC + br[i], !(v & 1));	/* atomic: the code's enable-bit writes are never lost */
@@ -365,6 +611,8 @@ static void *model(void *arg)
 		*R(GCC + 0x25004) = (vote & (1u << 15)) ? 0 : 0x80000000u;	/* blsp2 ahb */
 		if (*R(GCC + 0x2700c) & 1)
 			__atomic_fetch_and((uint32_t *)(GCC + 0x2700c), ~1u, __ATOMIC_SEQ_CST);	/* RCG update done */
+		if (*R(GCC + 0x2a020) & 1)
+			__atomic_fetch_and((uint32_t *)(GCC + 0x2a020), ~1u, __ATOMIC_SEQ_CST);
 		/* QDSP6SS */
 		uint32_t cb = *R(QDSP6 + 0x38);
 		setbit31(QDSP6 + 0x38, !(cb & 1));
@@ -399,11 +647,14 @@ static void *model(void *arg)
 			int ok = seg_ok() && !fail_is("auth");
 			*R(RMB + 0xc) = ok ? 4 : (uint32_t)-5;
 			auth_done = 1;
+			if (ok)
+				mss_auth_t = sim_now();
 		}
 		if (cmd == 0xffffdead && !unlocked) {
 			*R(RMB + 0xc) = 6;
 			unlocked = 1;
 		}
+		smem_events();
 		__asm__ volatile("pause");	/* spin: branch status must follow within the code's 200 us polls */
 	}
 	return NULL;
@@ -437,8 +688,14 @@ static uint32_t xfer, snap_latch, stale_pend, stale_en, brk_latch, overrun, rfr_
 static uint64_t last_rx_t;
 static unsigned ncf, txn, chip_on, chip_slack;
 static uint64_t chip_boot_t;
-static uint8_t txb[64];
+static uint8_t txb[512];
 static unsigned bt_cmds, bt_ignored;
+/* B2: downloads (0 patch, 1 NVM), in-band sleep after the patched reset */
+static uint8_t dl[2][131072];
+static uint32_t dln[2], dltot[2], dlsegs[2], dlacks[2];
+static int dlphase, patched;
+static uint64_t sleep_t;	/* chip asleep from this time (0: awake) */
+static unsigned ibs_wakes;
 struct cq { uint64_t t; int16_t b; };		/* b = -1: break */
 static struct cq cq[512];
 static unsigned cqh, cqt;
@@ -531,27 +788,74 @@ static void chip_frame(void)
 		CHECK(csr == 0x33, "power-off pulse not at 2400");
 		chip_on = 0;
 		cqh = cqt;
+	} else if (txn == 1 && txb[0] == 0xfd && chip_on) {	/* host WAKE_IND */
+		if (sleep_t && t >= sleep_t) {
+			const uint8_t ack[1] = { 0xfc };
+			chip_queue(ack, 1, t + 200000);
+			ibs_wakes++;
+		}
+		sleep_t = 0;
+	} else if (txn == 1 && txb[0] == 0xfc && chip_on) {	/* host WAKE_ACK: nothing */
 	} else if (txn == 1 && txb[0] == 0xfc) {
 		CHECK(csr == 0xcc, "power-on pulse not at 115200");
+		dlphase = patched = 0, sleep_t = 0;
+		dln[0] = dln[1] = dlsegs[0] = dlsegs[1] = dlacks[0] = dlacks[1] = 0;
 		chip_on = !fail_is("btdead");
 		chip_boot_t = t;
 		if (chip_on) {
 			chip_queue(NULL, 1, t);
 			chip_queue(NULL, 1, t + 5000000);
 		}
+	} else if (ready && csr == 0xcc && txn >= 4 && txb[0] == 1 && sleep_t && t >= sleep_t) {
+		bt_ignored++;
+		printf("  (ignored: chip asleep, no wake indication)");
 	} else if (ready && csr == 0xcc && txn >= 4 && txb[0] == 1) {
 		bt_cmds++;
 		uint16_t op = (uint16_t)(txb[1] | txb[2] << 8);
 		uint64_t at = t + 1000000;
+		CHECK(txn == 4u + txb[3], "HCI length %u, plen %u", txn, txb[3]);
 		if (op == 0x0c03) {
 			const uint8_t ev[] = { 4, 0x0e, 4, 1, 0x03, 0x0c, 0 };
 			chip_queue(ev, sizeof(ev), at);
+			if (dlphase == 2 && !patched) {
+				const uint8_t sl[1] = { 0xfe };
+				patched = 1;
+				chip_queue(sl, 1, t + 30000000);	/* HCI_IBS_SLEEP_IND 30 ms later [model] */
+				sleep_t = t + 30000000;
+			}
 		} else if (op == 0x1001) {
-			const uint8_t ev[] = { 4, 0x0e, 0x0c, 1, 0x01, 0x10, 0, 0x08, 0x00, 0x00, 0x08, 0x1d, 0x00, 0x01, 0x02 };
+			uint8_t ev[] = { 4, 0x0e, 0x0c, 1, 0x01, 0x10, 0, 0x08, 0x00, 0x00, 0x08, 0x1d, 0x00, 0xbe, 0x02 };
+			if (patched)
+				ev[13] = 0x02, ev[14] = 0x03;	/* [model] patched LMP subversion */
 			chip_queue(ev, sizeof(ev), at);
-		} else if (op == 0xfc00) {
-			const uint8_t ev[] = { 4, 0xff, 0x0e, 0x00, 0x02, 0x0a, 0x00, 0x00, 0x00, 0x2d, 0x00, 0x01, 0x02,
-					       0x14, 0x02, 0x01, 0x40 };
+		} else if (op == 0x1009) {
+			uint8_t ev[13] = { 4, 0x0e, 0x0a, 1, 0x09, 0x10, 0 };
+			memcpy(ev + 7, patched ? dl[1] + 20 : (const uint8_t *)"\0\0\0\0\0\0", 6);	/* NVM tag 2 */
+			chip_queue(ev, sizeof(ev), at);
+		} else if (op == 0xfc00 && txb[4] == 0x1e && dlphase < 2) {	/* EDL_PATCH_TLV_REQ segment */
+			uint32_t n = txb[5], ph = (uint32_t)dlphase;
+			CHECK(txb[3] == n + 2 && n <= 243, "segment header");
+			if (dln[ph] + n <= sizeof(dl[0]))
+				memcpy(dl[ph] + dln[ph], txb + 6, n);
+			if (!dln[ph])
+				dltot[ph] = (uint32_t)(txb[7] | txb[8] << 8 | txb[9] << 16) + 4;	/* TLV length, bytes 1-3 */
+			dln[ph] += n;
+			dlsegs[ph]++;
+			int last = dln[ph] >= dltot[ph];
+			int ack = ph == 1 || last || getenv("SIM_BTACK");
+			uint8_t res = ph == 1 && dlsegs[1] == 4 && fail_is("btnack") ? 1 : 0;
+			if (ack) {
+				const uint8_t ev[6] = { 4, 0xff, 3, 0, 4, res };
+				chip_queue(ev, 6, at);
+				dlacks[ph]++;
+			}
+			if (last)
+				dlphase++;
+		} else if (op == 0xfc00) {	/* EDL version: values measured on boot #56; patch version 2 after the download */
+			uint8_t ev[] = { 4, 0xff, 0x0e, 0x00, 0x02, 0x0a, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x02,
+					 0x40, 0x01, 0x02, 0x40 };
+			if (patched)
+				ev[9] = 0x02;
 			chip_queue(ev, sizeof(ev), at);
 		}
 	} else if (chip_on) {
@@ -614,7 +918,7 @@ void sim_uwr(uint32_t o, uint32_t v)
 	}
 	if (o == 0x100) {
 		for (int k = 0; k < 4 && ncf; k++, ncf--)
-			txb[txn++ & 63] = (uint8_t)(v >> (8 * k));
+			txb[txn++ & 511] = (uint8_t)(v >> (8 * k));
 		if (!ncf)
 			chip_frame();
 		return;
@@ -625,16 +929,20 @@ void sim_uwr(uint32_t o, uint32_t v)
 
 int main(int argc, char **argv)
 {
-	if (argc < 3) {
-		fprintf(stderr, "usage: %s modem_a.img files-dir\n", argv[0]);
+	if (argc < 4) {
+		fprintf(stderr, "usage: %s modem_a.img files-dir bluetooth_a.img\n", argv[0]);
 		return 2;
 	}
 	fail = getenv("SIM_FAIL");
 	img = fopen(argv[1], "rb");
+	btimg = fopen(argv[3], "rb");
 	fdir = argv[2];
 	mba_f = load("mba.mbn", &mba_n);
 	mdt_f = load("modem.mdt", &mdt_n);
-	if (!img || !mba_f || !mdt_f)
+	amdt_f = load("adsp.mdt", &amdt_n);
+	size_t tlv_n = 0, nvm_n = 0;
+	uint8_t *tlv_f = load("crbtfw21.tlv", &tlv_n), *nvm_f = load("crnv21.bin", &nvm_n);
+	if (!img || !btimg || !mba_f || !mdt_f || !amdt_f || !tlv_f || !nvm_f)
 		return 2;
 	{	/* total memsz of the loadable segments, for the MBA model */
 		uint32_t phoff, phnum = (uint32_t)(mdt_f[44] | mdt_f[45] << 8);
@@ -653,6 +961,10 @@ int main(int argc, char **argv)
 	map(QDSP6, 0x1000, 0);
 	map(RMB, 0x1000, 0);
 	map(0x0c1af000, 0x1000, 0);
+	map(0x0c1b7000, 0x1000, 0);
+	map(0x03900000, 0x50000, 0);
+	map(0x92a00000, 0x1e00000, 0xee);	/* adsp_fw_mem: garbage, tails must be zeroed */
+	smem_setup();
 	map(0x17a00000, 0x10000, 0);
 	map(MODEM, 0x7e00000, 0xee);	/* garbage: the tails must be zeroed */
 	map(MBA, 0x200000, 0xee);
@@ -667,6 +979,8 @@ int main(int argc, char **argv)
 	*R(0x01f63004) = 1, *R(0x01f64004) = 1, *R(0x01f65004) = 1;	/* halt acks */
 	*R(0x03510000) = 0x203, *R(0x03511000) = 0x3, *R(0x03512000) = 0x3, *R(0x03513000) = 0x3;	/* "sleep" pins */
 	*R(GCC + 0x27010) = 0x0000;		/* RCG CFG: XO */
+	*R(0x03900000 + 0x1000 * 73) = 0x0;	/* GPIO73 input, low: amp in reset as ABL leaves it [model] */
+	*R(0x03900000 + 0x1000 * 26) = 0x1, *R(0x03900000 + 0x1000 * 27) = 0x1;	/* pulled down [model] */
 	if (fail_is("probe"))
 		probe_fail_addr = QDSP6 + 0x14;
 	if (fail_is("btprobe"))
@@ -676,11 +990,20 @@ int main(int argc, char **argv)
 	pthread_create(&th, NULL, model, NULL);
 
 	uint32_t vote0 = *R(GCC + 0x52004), pins0 = *R(0x03510000);
+	uint32_t a_pins0[3] = { *R(0x03900000 + 0x1000 * 26), *R(0x03900000 + 0x1000 * 27), *R(0x03900000 + 0x1000 * 73) };
+	unsigned l0 = loglen;
+	int bt = drg_bt_test(cpu_put, flush);
+	unsigned l1 = loglen;
+	printf("== drg_bt_test -> %d (HCI commands answered %u, segments %u/%u acked %u/%u, wakes %u)\n", bt, bt_cmds,
+	       dlsegs[0], dlsegs[1], dlacks[0], dlacks[1], ibs_wakes);
 	int w1 = drg_w1_test(cpu_put, flush);
+	unsigned l2 = loglen;
 	printf("== drg_w1_test -> %d (flushes %u, eMMC reads %u, sectors %u, SMCs %u)\n", w1, flushes, emmc_reads,
 	       emmc_sectors, smc_calls);
-	int bt = drg_bt_test(cpu_put, flush);
-	printf("== drg_bt_test -> %d (HCI commands answered %u)\n", bt, bt_cmds);
+	int a1 = drg_a1_test(cpu_put, flush);
+	unsigned l3 = loglen;
+	printf("== drg_a1_test -> %d (PAS calls %u, state %d, TAS reads %u)\n", a1, pas_calls, pas_state, tas_reads);
+	printf("== log bytes: B2 %u, W2 %u, A1 %u\n", l1 - l0, l2 - l1, l3 - l2);
 	stop_models = 1;
 	pthread_join(th, NULL);
 
@@ -697,10 +1020,10 @@ int main(int argc, char **argv)
 		CHECK(*R(GCC + 0x79000) & 1, "MSS not back in reset");
 	if (fail_is("mssstale"))
 		CHECK(w1 == 0, "stale RMB state: W1 rc %d", w1);
-	if (!fail_is("btdead") && !fail_is("btprobe")) {
-		CHECK(bt == 0, "B1 rc %d", bt);
+	if (!fail_is("btdead") && !fail_is("btprobe") && !fail_is("btnack")) {
+		CHECK(bt == 0, "B1/B2 rc %d", bt);
 		logbuf[loglen < sizeof(logbuf) ? loglen : sizeof(logbuf) - 1] = 0;
-		CHECK(strstr(logbuf, "bt rome version 02140201") != NULL, "SoC version not decoded");
+		CHECK(strstr(logbuf, "bt rome version 01400201") != NULL, "SoC version not decoded");
 		CHECK(strstr(logbuf, "bt fw crbtfw/crnv NN [E] 00000021 00000001 ok") != NULL, "firmware number");
 	}
 	CHECK(*R(GCC + 0x52004) == vote0, "GCC vote register %x, was %x", *R(GCC + 0x52004), vote0);
@@ -708,6 +1031,37 @@ int main(int argc, char **argv)
 		      !(*R(GCC + 0x8a004) & 1) && !(*R(GCC + 0x5200c) & 4),
 	      "MSS clocks left on");
 	CHECK(*R(0x03510000) == pins0, "BT pins not restored");
+	/* B2 */
+	if (!fail_is("btdead") && !fail_is("btprobe") && !fail_is("btnack")) {
+		CHECK(dlphase == 2 && patched, "B2: download not complete (phase %d)", dlphase);
+		CHECK(dln[0] == tlv_n && !memcmp(dl[0], tlv_f, tlv_n), "B2: patch bytes differ from crbtfw21.tlv");
+		nvm_f[40] = 0;	/* expected edit: tag 17 data[2] 0x11 -> 0 (115200); data[0] 0x82 and tag 27 01 already set */
+		CHECK(dln[1] == nvm_n && !memcmp(dl[1], nvm_f, nvm_n), "B2: NVM bytes differ from the edited crnv21.bin");
+		CHECK(ibs_wakes >= 1, "B2: chip never woken after its sleep indication");
+		CHECK(strstr(logbuf, "bt2 end rc 00000000 00000000 ok") != NULL, "B2 end line");
+	}
+	if (fail_is("btnack"))
+		CHECK(bt == -26, "B2 NVM nack: rc %d", bt);
+	/* W2 */
+	if (w1 == 0) {
+		CHECK(strstr(logbuf, " dbg/smp2p 00000000 00000002 ok") != NULL, "W2: err-ready not logged");
+		if (getenv("SIM_MSSCRASH"))
+			CHECK(strstr(logbuf, " sfr 73696d3a 206d6366 ok") != NULL, "W2: failure reason not logged");
+	}
+	/* A1 */
+	for (int i = 0; i < 3; i++)
+		CHECK(*R(0x03900000 + 0x1000 * (i == 2 ? 73 : 26 + i)) == a_pins0[i], "A1 pin %d not restored", i);
+	CHECK(!(*R(GCC + 0x2a008) & 1), "A1: QUP3 clock left on");
+	if (!fail_is("tasabsent"))
+		CHECK(tas_reads == 4, "A1: TAS reads %u", tas_reads);
+	else
+		CHECK(a1 == -4, "A1 tas absent: rc %d", a1);
+	CHECK(pas_state == 4 || pas_state == 0, "A1: ADSP not shut down (state %d)", pas_state);
+	CHECK(rwlc_swen == 0, "A1: rwlc vote left on (%d)", rwlc_swen);
+	if (!fail_is("tasabsent") && !fail_is("adspauth"))
+		CHECK(a1 == 0 && strstr(logbuf, "a1 t ms/smp2p") && adsp_stage == 1, "A1 rc %d", a1);
+	if (fail_is("adspauth"))
+		CHECK(a1 == -8, "A1 auth failure: rc %d", a1);
 	CHECK(!(*R(GCC + 0x27004) & 1), "UART clock left on");
 	if (nown) {
 		CHECK(own_of(MBA, 0x100000)->vms == 8, "MBA buffer not back with HLOS");
@@ -720,8 +1074,9 @@ int main(int argc, char **argv)
 	unsigned lines = 0;
 	for (unsigned i = 0; i < loglen; i++)
 		lines += logbuf[i] == '\n';
-	printf("== log %u bytes, %u lines (the shim's cpu_log holds 32768 with the CPU probe's lines before)\n", loglen,
-	       lines);
+	printf("== log %u bytes, %u lines (the shim's cpu_log holds 32768; boot #56 had 8715 bytes before the tests)\n",
+	       loglen, lines);
+	CHECK(loglen + 8715 <= 32768 - 256, "log too long: %u + 8715 bytes", loglen);
 	printf("%s (%d check failures)\n", failures ? "SIM FAIL" : "SIM PASS", failures);
 	return failures ? 1 : 0;
 }

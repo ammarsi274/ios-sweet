@@ -34,6 +34,9 @@
  *   HCI commands: Reset 0x0c03, Read_Local_Version 0x1001; Qualcomm
  *     EDL_PATCH_CMD_OPCODE 0xfc00 with EDL_PATCH_VER_REQ_CMD 0x19, answer
  *     decoded as struct rome_version (btqca.h, btqca.c rome_patch_ver_req).
+ * Boot #56 (logs/pull56): B1 complete (reset, version: manufacturer 0x1d,
+ * EDL: product 0x0a, ROM 0x0201, SoC 0x40020140). B2 (below bt_run's
+ * step 9): firmware download, see the B2 comment.
  * Boot #55 (logs/pull55): chip alive (EDL answer 04 ff 0e 00 02 0a, then
  * cut), HCI Reset got one 0x00 (a break: ISR RXBREAK set), Read_Local_Version
  * nothing. Causes: MR1 0xc0 = auto-RFR level 0, and the 100 ms boot wait
@@ -55,6 +58,8 @@
 #include "drg_bt.h"
 #include "drg_rpm.h"
 #include "drg_gpu.h"
+#include "drg_fat.h"
+#include "drg_part.h"
 #include "console.h"
 
 #define GCC			0x00100000UL
@@ -507,6 +512,430 @@ static int stop(int step, const char *why)
 	return -step;
 }
 
+/*
+ * ---- B2: firmware download (research/reports/wifi-bt-plan.md) ----
+ * Files: bluetooth_a (GPT name), FAT16 with 4096-byte sectors (drg_fat.c),
+ * image/crbtfwNN.tlv + image/crnvNN.bin, read-only. Backup 2026-11-06:
+ * CRBTFW21.TLV 116552 bytes CRC 0x719bada6 (TLV type 1, length = size - 4,
+ * product 0x000a, rom_build 0x0201, patch_version 0x0002, download_mode
+ * byte 3), CRNV21.BIN 4493 bytes CRC 0xc81da8b0 (TLV type 4 holding sub-TLVs
+ * type 2 (43 NVM tags) and type 3; tag 17 = 82 01 11 .., tag 27 = 01).
+ * Choice: NN from the EDL version as B1 logged it, then the patch's own
+ * header must match the chip (product id, rom_build = EDL rom version);
+ * if not, the other crbtfw files are tried and the matching one is used.
+ * Download = HMD btqca.c rome_download_firmware / rome_tlv_download_request
+ * / rome_tlv_send_segment: the whole file, header included, in 243-byte
+ * segments, each as HCI command 0xFC00 {0x1E, len, data}, answered by the
+ * vendor event 04 FF 03 00 04 result (EDL_CMD_REQ_RES_EVT, EDL_TVL_DNLD_RES_EVT,
+ * result 0 = ok); patch, then NVM, then HCI Reset (rome_reset).
+ * Deviations from HMD, all logged:
+ *   - HMD's size checks are not used: the if/else in rome_download_firmware
+ *     rejects every file (its final else always runs), and 116552 bytes is
+ *     over its MAX_PATCH_FILE_SIZE (100 KiB) anyway [F, btqca.c:303-317]:
+ *     HMD's kernel never downloads this chip; Android's vendor HAL does.
+ *     Only the header-length check (size - 4 == length) is kept.
+ *   - [E] upstream btqca.c (from memory): byte 14 of a patch TLV is
+ *     download_mode; 1/2/3 = the chip acks only the last segment. Handled
+ *     by measurement: the first segment waits 150 ms for an ack; with an
+ *     ack every segment waits for its own (HMD), without, only the last.
+ *   - NVM edits of rome_tlv_check_data (tag 17 data[0] |= 0x80 in-band
+ *     sleep, data[2] = baud code, tag 27 data[0] |= 1 deep sleep) are made
+ *     in the type-2 sub-block of the type-4 container (HMD's flat walk
+ *     would misread this file); baud code 0 = QCA_BAUDRATE_115200 because
+ *     the UART stays at 115200 (no EDL_SET_BAUDRATE, which HMD's hci_qca
+ *     sends first for its 3 Mbaud). Old/new bytes are logged.
+ *   - In-band sleep is then on in the chip: bytes FE (sleep), FD (wake),
+ *     FC (wake ack) between packets are counted; FD is answered with FC
+ *     (hci_qca.c device_want_to_wakeup) and a command after an FE is
+ *     preceded by FD + wait for FC (hci_qca.c TX_ASLEEP -> WAKING).
+ * After the reset: Read_BD_ADDR (0x1009), Read_Local_Version, EDL version.
+ * Build with -DDRG_BT_NO_B2 for B1 only.
+ */
+#ifndef DRG_BT_NO_B2
+#define SEG_MAX			243		/* MAX_SIZE_PER_TLV_SEGMENT */
+#define PATCH_MAX		(128u * 1024)
+#define NVM_MAX			(16u * 1024)
+#define CRC_TLV21		0x719bada6u
+#define SIZE_TLV21		116552u
+#define CRC_NVM21		0xc81da8b0u
+#define SIZE_NVM21		4493u
+
+static uint8_t patch_buf[PATCH_MAX] __attribute__((aligned(64)));
+static uint8_t nvm_buf[NVM_MAX] __attribute__((aligned(64)));
+static struct fat16 bfs;
+static uint64_t bpart_first;
+
+static uint32_t le32p(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
+static uint32_t le16p(const uint8_t *p) { return (uint32_t)(p[0] | p[1] << 8); }
+
+/* packet stream after the patch: events, in-band sleep bytes, everything else */
+static struct {
+	uint32_t vse_ok, vse_bad, cc, other, sleep, wake, ack, junk, wake_tx;
+	uint32_t last_res, other_logged;
+} es;
+static int chip_asleep;
+static uint8_t last_cc[16];
+static uint32_t last_cc_n, want_op;
+
+#define SEEN_VSE	1	/* TLV download result event */
+#define SEEN_CC		2	/* Command Complete for want_op */
+#define SEEN_OTHER	4
+#define SEEN_ACK	8	/* in-band wake ack */
+#define SEEN_VSE_OTHER	16	/* another vendor event (e.g. the EDL version answer) */
+
+static uint8_t vse_copy[24];
+static uint32_t vse_copy_n;
+
+static uint32_t parse_rx(void)
+{
+	uint32_t p = 0, seen = 0;
+	while (p < rxn) {
+		uint8_t b = rx[p];
+		if (b == 0x04) {
+			if (p + 3 > rxn || p + 3u + rx[p + 2] > rxn)
+				break;	/* incomplete: wait for the rest */
+			const uint8_t *e = rx + p;
+			uint32_t n = 3u + e[2];
+			if (e[1] == 0xff && n >= 6 && e[3] == 0x00 && e[4] == 0x04) {
+				es.last_res = e[5];
+				if (e[5] == 0)
+					es.vse_ok++;
+				else
+					es.vse_bad++;
+				seen |= SEEN_VSE;
+			} else if (e[1] == 0xff) {
+				vse_copy_n = n < sizeof(vse_copy) ? n : sizeof(vse_copy);
+				for (uint32_t k = 0; k < vse_copy_n; k++)
+					vse_copy[k] = e[k];
+				seen |= SEEN_VSE_OTHER;
+			} else if (e[1] == 0x0e && n >= 6) {
+				es.cc++;
+				if (le16p(e + 4) == want_op) {
+					last_cc_n = n < sizeof(last_cc) ? n : sizeof(last_cc);
+					for (uint32_t k = 0; k < last_cc_n; k++)
+						last_cc[k] = e[k];
+					seen |= SEEN_CC;
+				}
+			} else {
+				es.other++;
+				seen |= SEEN_OTHER;
+				if (es.other_logged < 3) {
+					es.other_logged++;
+					L("bt2 other event code/len", e[1], n);
+				}
+			}
+			p += n;	/* an event does not end the sleep state: only FD/FC do (hci_qca.c) */
+		} else if (b == 0xfe) {		/* HCI_IBS_SLEEP_IND */
+			es.sleep++, chip_asleep = 1, p++;
+		} else if (b == 0xfd) {		/* HCI_IBS_WAKE_IND: answer WAKE_ACK */
+			static const uint8_t wack[1] = { 0xfc };
+			es.wake++, chip_asleep = 0, p++;
+			(void)uart_tx(wack, 1, 50);
+		} else if (b == 0xfc) {		/* HCI_IBS_WAKE_ACK */
+			es.ack++, chip_asleep = 0, p++;
+			seen |= SEEN_ACK;
+		} else {
+			es.junk++, p++;
+		}
+	}
+	for (uint32_t k = p; k < rxn; k++)	/* keep an incomplete packet */
+		rx[k - p] = rx[k];
+	rxn -= p;
+	return seen;
+}
+
+/* receive and parse until one of want is seen or ms passed; returns everything seen */
+static uint32_t pump(uint32_t want, uint32_t ms)
+{
+	uint64_t t0 = now();
+	uint32_t seen = 0;
+	do {
+		uint32_t before = rxn;
+		if (rx_poll() || rxn != before)
+			seen |= parse_rx();
+		if (seen & want)
+			break;
+	} while (ms_since(t0) < ms);
+	if (!(seen & want) && ms) {	/* push out the packing buffer, as rx_event */
+		uwr(U_CR, CR_FORCE_STALE);
+		udelay(1000);
+		(void)rx_poll();
+		seen |= parse_rx();
+	}
+	return seen;
+}
+
+static uint8_t seg_cmd[6 + SEG_MAX];
+
+/* one EDL_PATCH_TLV_REQ segment; 0 sent (and acked if wait_ms) */
+static int send_seg(const uint8_t *d, uint32_t n, uint32_t wait_ms, uint32_t *seen_out)
+{
+	(void)pump(0, 0);	/* whatever arrived meanwhile */
+	seg_cmd[0] = 0x01, seg_cmd[1] = 0x00, seg_cmd[2] = 0xfc, seg_cmd[3] = (uint8_t)(n + 2);
+	seg_cmd[4] = 0x1e, seg_cmd[5] = (uint8_t)n;
+	for (uint32_t i = 0; i < n; i++)
+		seg_cmd[6 + i] = d[i];
+	want_op = 0xfc00;
+	uint32_t ok_before = es.vse_ok;
+	int rc = uart_tx(seg_cmd, 6 + n, 1000);
+	if (rc)
+		return -1;
+	uint32_t seen = wait_ms ? pump(SEEN_VSE, wait_ms) : 0;
+	if (seen_out)
+		*seen_out = seen;
+	if (!wait_ms)
+		return 0;
+	return es.vse_ok > ok_before ? 0 : es.vse_bad ? -3 : -2;
+}
+
+/*
+ * The whole file as segments. mode: 0 every segment acked (HMD), 1 only the
+ * last, 2 decide on the first segment. Returns 0, or -(1 + failing segment).
+ */
+static int download(const char *what, const uint8_t *f, uint32_t size, int mode)
+{
+	uint32_t nseg = (size + SEG_MAX - 1) / SEG_MAX, seen = 0;
+	uint64_t t0 = now();
+	es.vse_ok = es.vse_bad = 0;
+	L(what, size, nseg);
+	for (uint32_t i = 0; i < nseg; i++) {
+		uint32_t off = i * SEG_MAX, n = size - off < SEG_MAX ? size - off : SEG_MAX;
+		int last = i + 1 == nseg;
+		uint32_t wait = last ? 2000 : mode == 0 ? 500 : mode == 2 && i == 0 ? 150 : 0;
+		int rc = send_seg(f + off, n, wait, &seen);
+		if (mode == 2 && i == 0 && !last) {
+			mode = rc == 0 ? 0 : 1;
+			L("bt2 seg0 ack -> mode/seen", (uint32_t)mode, seen);
+			if (rc == -2)	/* no ack is what mode 1 expects: not an error */
+				rc = 0;
+		}
+		if (rc) {
+			LX("bt2 seg FAIL idx/rc", i, (uint32_t)rc);
+			LX("bt2 seg res/vse ok", es.last_res, es.vse_ok);
+			L("bt2 seg sr/isr", urd(U_SR), urd(U_ISR));
+			return -(int)(1 + i);
+		}
+	}
+	(void)pump(0, 20);	/* a trailing Command Complete */
+	L("bt2 dl ms/acks", ms_since(t0), es.vse_ok);
+	L("bt2 dl cc/other", es.cc, es.other);
+	return 0;
+}
+
+/* one HCI command after the patch: wake the chip first if it said it sleeps; the event for opcode op */
+static int cmd2(const char *label, const uint8_t *c, uint32_t n, uint32_t timeout_ms)
+{
+	int rc = 0, ok = 0;
+	/*
+	 * A sleep indication can cross the command on the line: with no answer
+	 * and an FE seen meanwhile, wake the chip and send the command once more.
+	 */
+	for (int attempt = 0; attempt < 2 && !ok; attempt++) {
+		(void)pump(0, 2);
+		if (attempt && !chip_asleep)
+			break;
+		if (chip_asleep) {
+			static const uint8_t wind[1] = { 0xfd };
+			es.wake_tx++;
+			(void)uart_tx(wind, 1, 50);
+			uint32_t s = pump(SEEN_ACK, 100);
+			L("bt2 wake ind -> ack", es.wake_tx, (s & SEEN_ACK) ? 1 : 0);
+		}
+		want_op = le16p(c + 1);
+		last_cc_n = 0;
+		vse_copy_n = 0;
+		rc = uart_tx(c, n, 200);
+		uint32_t s = rc ? 0 : pump(want_op == 0xfc00 ? SEEN_VSE_OTHER : SEEN_CC, timeout_ms);
+		ok = want_op == 0xfc00 ? (s & SEEN_VSE_OTHER) != 0 : (s & SEEN_CC) != 0;
+	}
+	const uint8_t *e = want_op == 0xfc00 ? vse_copy : last_cc;
+	uint32_t en = want_op == 0xfc00 ? vse_copy_n : last_cc_n;
+	logp(label, (uint32_t)rc << 16 | en, ok ? (uint32_t)(want_op == 0xfc00 ? 0 : e[6]) : 0xffffffffu, ok ? 0 : -1);
+	if (ok)
+		for (uint32_t i = 0; i < en; i += 8) {
+			uint32_t a = 0, v = 0;
+			for (uint32_t k = 0; k < 4; k++) {
+				a = a << 8 | (i + k < en ? e[i + k] : 0);
+				v = v << 8 | (i + 4 + k < en ? e[i + 4 + k] : 0);
+			}
+			L(" bytes", a, v);
+		}
+	return ok ? 0 : -1;
+}
+
+/* patch header: type 1, length = size - 4, product id, rom_build */
+static int tlv_matches(const uint8_t *f, uint32_t size, uint32_t product, uint32_t rom)
+{
+	return size > 24 && f[0] == 1 && (le32p(f) >> 8) == size - 4 && le16p(f + 16) == (product & 0xffff) &&
+	       le16p(f + 18) == rom;
+}
+
+static int read_file(const char *path, uint8_t *dst, uint32_t max, uint32_t *crc)
+{
+	struct fat16_ent e;
+	int rc = fat16_lookup(&bfs, path, &e);
+	int32_t n = rc ? rc : fat16_read(&bfs, &e, dst, max, 0);
+	*crc = n > 0 ? drg_crc32(0, dst, (uint32_t)n) : 0;
+	return n;
+}
+
+static void fwname(char *p, const char *pre, uint32_t nn, const char *ext)
+{
+	int i = 0;
+	for (const char *s = "image/"; *s; s++)
+		p[i++] = *s;
+	for (; *pre; pre++)
+		p[i++] = *pre;
+	p[i++] = (char)('0' + (nn >> 4));
+	p[i++] = (char)('0' + (nn & 15));
+	for (; *ext; ext++)
+		p[i++] = *ext;
+	p[i] = 0;
+}
+
+/* HMD rome_tlv_check_data's NVM edits, in the type-2 sub-block (see above); 0 ok */
+static int nvm_edit(uint8_t *f, uint32_t size)
+{
+	uint32_t tl = le32p(f), off = 4, end = 4 + (tl >> 8), edits = 0;
+	if (end != size)
+		return -1;
+	uint32_t blk_off = 0, blk_end = 0;
+	if ((tl & 0xff) == 2) {		/* plain NVM TLV as HMD expects */
+		blk_off = 4, blk_end = end;
+	} else {			/* container: find the type-2 sub-TLV */
+		while (off + 4 <= end) {
+			uint32_t st = le32p(f + off), sl = st >> 8;
+			if (off + 4 + sl > end)
+				return -2;
+			if ((st & 0xff) == 2) {
+				blk_off = off + 4, blk_end = off + 4 + sl;
+				break;
+			}
+			off += 4 + sl;
+		}
+	}
+	L("bt2 nvm type/block", tl & 0xff, blk_off << 16 | (blk_end - blk_off));
+	if (!blk_end)
+		return -3;
+	for (uint32_t i = blk_off; i + 12 <= blk_end;) {
+		uint32_t tag = le16p(f + i), len = le16p(f + i + 2);
+		uint8_t *d = f + i + 12;
+		if (i + 12 + len > blk_end)
+			return -4;
+		if (tag == 17 && len >= 3) {		/* EDL_TAG_ID_HCI */
+			uint32_t old = (uint32_t)d[0] << 16 | d[1] << 8 | d[2];
+			d[0] |= 0x80;
+			d[2] = 0;	/* QCA_BAUDRATE_115200 */
+			L("bt2 nvm tag17 old/new", old, (uint32_t)d[0] << 16 | d[1] << 8 | d[2]);
+			edits++;
+		} else if (tag == 27 && len >= 1) {	/* EDL_TAG_ID_DEEP_SLEEP */
+			uint32_t old = d[0];
+			d[0] |= 0x01;
+			L("bt2 nvm tag27 old/new", old, d[0]);
+			edits++;
+		}
+		i += 12 + len;
+	}
+	return edits == 2 ? 0 : -5;
+}
+
+/* B2 proper; called with the chip answering at 115200, flow control on. 0 = patched and answering */
+static int b2_run(uint32_t product, uint32_t rom, uint32_t nn)
+{
+	L("bt2 start", 0x42320001, nn);
+	con_str("BT", "B2 firmware download");
+	/* 1. files */
+	uint64_t first = 0, last = 0;
+	uint32_t idx = 0;
+	int rc = drg_gpt_find("bluetooth_a", &first, &last, &idx);
+	logp("bt2 gpt rc/index", (uint32_t)rc, idx, rc ? -1 : 0);
+	if (rc || last < first || last - first + 1 > 0xffffffffULL)
+		return -20;
+	L("bt2 part first/sectors", (uint32_t)first, (uint32_t)(last - first + 1));
+	bpart_first = first;
+	bfs.read = drg_part_read;
+	bfs.ctx = &bpart_first;
+	rc = fat16_mount(&bfs, (uint32_t)(last - first + 1));
+	logp("bt2 fat rc/bps", (uint32_t)rc, bfs.bps << 8 | bfs.oversize, rc ? -1 : 0);
+	if (rc)
+		return -21;
+	static const uint8_t cand[3] = { 0x21, 0x20, 0x11 };
+	char name[24];
+	uint32_t crc = 0, use = 0;
+	int32_t n = 0;
+	for (int k = -1; k < 3 && !use; k++) {	/* the EDL number first, then the others */
+		uint32_t c = k < 0 ? nn : cand[k];
+		if (k >= 0 && c == nn)
+			continue;
+		fwname(name, "crbtfw", c, ".tlv");
+		n = read_file(name, patch_buf, PATCH_MAX, &crc);
+		int m = n > 0 && tlv_matches(patch_buf, (uint32_t)n, product, rom);
+		logp("bt2 tlv NN/size", c, (uint32_t)n, m ? 0 : -2);
+		if (n > 24)
+			L(" tlv crc/prod.rom", crc, le16p(patch_buf + 16) << 16 | le16p(patch_buf + 18));
+		if (m)
+			use = c;
+	}
+	if (!use)
+		return -22;
+	uint32_t psize = (uint32_t)n, mode_byte = patch_buf[14];
+	logp("bt2 tlv use NN/crc ok", use, crc, use == 0x21 && (psize != SIZE_TLV21 || crc != CRC_TLV21) ? -2 : 0);
+	L("bt2 tlv patchver/mode", le16p(patch_buf + 20), mode_byte);
+	fwname(name, "crnv", use, ".bin");
+	n = read_file(name, nvm_buf, NVM_MAX, &crc);
+	logp("bt2 nvm size/crc", (uint32_t)n, crc,
+	     n <= 0 ? -1 : use == 0x21 && ((uint32_t)n != SIZE_NVM21 || crc != CRC_NVM21) ? -2 : 0);
+	if (n <= 12)
+		return -23;
+	uint32_t nsize = (uint32_t)n;
+	rc = nvm_edit(nvm_buf, nsize);
+	logp("bt2 nvm edit rc", (uint32_t)rc, 0, rc ? -1 : 0);
+	if (rc)
+		return -24;
+	flushp();
+
+	/* 2. patch, 3. NVM (each segment acked: upstream's NVM has no skip mode [E]) */
+	rc = download("bt2 patch size/segs", patch_buf, psize, mode_byte ? 2 : 0);
+	flushp();
+	if (rc)
+		return -25;
+	rc = download("bt2 nvm size/segs", nvm_buf, nsize, 0);
+	flushp();
+	if (rc)
+		return -26;
+
+	/* 4. HCI reset (rome_reset); one retry after 100 ms */
+	static const uint8_t reset[4] = { 0x01, 0x03, 0x0c, 0x00 };
+	rc = cmd2("bt2 reset rc.len/status", reset, 4, 1000);
+	if (rc) {
+		(void)pump(0, 100);
+		rc = cmd2("bt2 reset(2) rc.len/st", reset, 4, 1000);
+	}
+	L("bt2 ibs sleep/wake", es.sleep, es.wake);
+	L("bt2 ibs ack/junk", es.ack, es.junk);
+	if (rc)
+		return -27;
+	con_str("BT", "B2: patched, HCI reset answered");
+
+	/* 5. Read_BD_ADDR -> 04 0E 0A 01 09 10 status addr[6] (little endian) */
+	static const uint8_t bdaddr[4] = { 0x01, 0x09, 0x10, 0x00 };
+	int r1 = cmd2("bt2 bdaddr rc.len/status", bdaddr, 4, 500);
+	/* 6. Read_Local_Version (patched LMP subversion) */
+	static const uint8_t ver[4] = { 0x01, 0x01, 0x10, 0x00 };
+	int r2 = cmd2("bt2 version rc.len/status", ver, 4, 500);
+	if (!r2 && last_cc_n >= 15)
+		L("bt2 manuf/lmp sub", le16p(last_cc + 11), le16p(last_cc + 13));
+	/* 7. EDL version again: patch version after the download */
+	static const uint8_t edl[5] = { 0x01, 0x00, 0xfc, 0x01, 0x19 };
+	int r3 = cmd2("bt2 edl ver rc.len", edl, 5, 1000);
+	if (!r3 && vse_copy_n >= 17)
+		L("bt2 edl patch/rom", le16p(vse_copy + 9), le16p(vse_copy + 11));
+	L("bt2 ibs sleep/wake end", es.sleep, es.wake);
+	L("bt2 other/junk end", es.other, es.junk);
+	return r1 ? -28 : r2 ? -29 : r3 ? -30 : 0;
+}
+#endif
+
 static int bt_run(void)
 {
 	/* 1. supplies and clock buffer, in bluetooth_power(1) order */
@@ -712,6 +1141,16 @@ static int bt_run(void)
 		L("bt rome version", rome, 0);
 		logp("bt fw crbtfw/crnv NN [E]", nn, (uint32_t)have, have ? 0 : -2);
 		con_hex2("BT", "soc_ver=", rome, " crbtfw", nn);
+		flushp();
+#ifndef DRG_BT_NO_B2
+		if (reset_ok) {
+			rx_clear();
+			int b2 = b2_run(product, rom, nn);
+			logp("bt2 end rc", (uint32_t)b2, 0, b2 ? -1 : 0);
+			con_hex2("BT", "B2 rc=", (uint32_t)b2, "", 0);
+			return b2 ? b2 : ver_ok ? 0 : -8;
+		}
+#endif
 	} else {
 		LX("bt edl version bad", len, at >= 0 ? e[4] : 0xff);
 	}
