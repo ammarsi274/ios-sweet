@@ -899,6 +899,7 @@ static void cpu_put(const char *label, uint32_t a, uint32_t v, int rc);
  * Silver (vol_up_early) and again for 1 s here, with a hint on screen.
  */
 static volatile uint32_t vol_up_early = 0x200;	/* not sampled */
+static volatile uint32_t drg_charger_seen;	/* bootargs had androidboot.mode=charger */
 
 static void drg_slots(void)
 {
@@ -921,6 +922,28 @@ static void drg_slots(void)
 	struct gpt_slots_result r;
 	int rc = drg_emmc_slots(up ? GPT_SLOTS_TWRP_ONCE : GPT_SLOTS_NORMAL, &r);
 	cpu_put("slots pon early late", raw_early, raw, 0);
+	/*
+	 * Why this start happened (#54: 55 starts in a row at 0 %, ~133 s each,
+	 * no charging screen: power-off or warm restart?). PM660 PON GEN2
+	 * reason registers, read-only (HMD qpnp-power-on.c): PON_REASON1 0x08,
+	 * WARM_RESET_REASON1 0x0a, POFF_REASON1/2 0x0c/0x0d, FAULT_REASON1/2
+	 * 0xc8/0xc9, S3_RESET_REASON 0xca; bytes 0x08-0x0f and 0xc8-0xcb as
+	 * two words each.
+	 */
+	{
+		unsigned int papid = drg_spmi_apid(DRG_PON_PPID_SLOTS);
+		uint32_t w[4] = { 0, 0, 0, 0 };
+		static const uint8_t base[4] = { 0x08, 0x0c, 0xc8, 0xcc };
+		for (unsigned int k = 0; papid != 0xffff && k < 4; k++)
+			for (unsigned int j = 0; j < 4; j++) {
+				uint8_t v = 0xee;
+				(void)drg_spmi_read(papid, (uint8_t)(base[k] + j), &v);
+				w[k] |= (uint32_t)v << (8 * j);
+			}
+		cpu_put("pon reason 08-0b 0c-0f", w[0], w[1], 0);
+		cpu_put("pon fault c8-cb cc-cf", w[2], w[3], 0);
+		cpu_put("pon charger mode seen", 0, drg_charger_seen, 0);
+	}
 	cpu_put("slots vol-up mode", waited, (uint32_t)up, 0);
 	cpu_put("slots rc primary backup", (uint32_t)r.primary << 16 | ((uint32_t)r.backup & 0xffff), (uint32_t)rc,
 		rc < 0);
@@ -1382,7 +1405,8 @@ static void __attribute__((noreturn)) drg_main(uint64_t dtb)
 
 	vol_up_early = pon_rt_raw();	/* as early as possible: see drg_slots */
 	stage = "drg charger";
-	if (fdt_chosen_has(dtb, "bootargs", "androidboot.mode=charger"))
+	drg_charger_seen = fdt_chosen_has(dtb, "bootargs", "androidboot.mode=charger") ? 1 : 2;
+	if (drg_charger_seen == 1)
 		drg_charger_mode();
 
 	stage = "drg console";
