@@ -221,7 +221,7 @@ static void submit_note(const struct gpu_command *c, long rc)
 		sub_maxcmds = c->numcmds;
 	for (uint32_t i = 0; i < c->numcmds && c->cmdlist; i++) {
 		struct cmdobj o = { 0 };
-		memcpy(&o, (const uint8_t *)(uintptr_t)c->cmdlist + (uint64_t)i * c->cmdsize,
+		memcpy(&o, (const uint8_t *)(uintptr_t)c->cmdlist + (uint64_t)i * sizeof(o),
 		       c->cmdsize < sizeof(o) ? c->cmdsize : sizeof(o));
 		sub_entries++;
 		if (!(o.flags & 1))

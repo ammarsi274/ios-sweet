@@ -757,7 +757,7 @@ static long gpu_command(struct kdev *d, struct gpu_command *c)
 	for (uint32_t i = 0; i < c->numsyncs; i++) {	/* wait first, as KGSL's syncpoints do */
 		struct command_syncpoint sp;
 		struct syncpoint_timestamp ts;
-		memcpy(&sp, (const uint8_t *)(uintptr_t)c->synclist + (uint64_t)i * c->syncsize,
+		memcpy(&sp, (const uint8_t *)(uintptr_t)c->synclist + (uint64_t)i * sizeof(sp),
 		       c->syncsize < sizeof(sp) ? c->syncsize : sizeof(sp));
 		if (sp.type != KGSL_CMD_SYNCPOINT_TYPE_TIMESTAMP || sp.size != sizeof(ts) || !sp.priv) {
 			host_log("drgles: GPU_COMMAND syncpoint type %u not supported\n", sp.type);
@@ -771,7 +771,7 @@ static long gpu_command(struct kdev *d, struct gpu_command *c)
 	}
 	for (uint32_t i = 0; i < c->numcmds; i++) {
 		struct command_object co;
-		memcpy(&co, (const uint8_t *)(uintptr_t)c->cmdlist + (uint64_t)i * c->cmdsize,
+		memcpy(&co, (const uint8_t *)(uintptr_t)c->cmdlist + (uint64_t)i * sizeof(co),
 		       c->cmdsize < sizeof(co) ? c->cmdsize : sizeof(co));
 		if (!(co.flags & KGSL_CMDLIST_IB)) {	/* preambles: not in the measured set */
 			if (!skipped_preamble_logged++)
@@ -796,7 +796,7 @@ static long gpu_command(struct kdev *d, struct gpu_command *c)
 				want = ibs[k].gpuaddr >= o->va && ibs[k].gpuaddr < o->va + o->size;
 			for (uint32_t k = 0; k < c->numobjs && !want; k++) {
 				struct command_object ob;
-				memcpy(&ob, (const uint8_t *)(uintptr_t)c->objlist + (uint64_t)k * c->objsize,
+				memcpy(&ob, (const uint8_t *)(uintptr_t)c->objlist + (uint64_t)k * sizeof(ob),
 				       c->objsize < sizeof(ob) ? c->objsize : sizeof(ob));
 				want = ob.gpuaddr >= o->va && ob.gpuaddr < o->va + o->size;
 			}

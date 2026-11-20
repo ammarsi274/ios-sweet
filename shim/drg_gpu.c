@@ -1841,7 +1841,7 @@ static __attribute__((unused)) void g3_replay(void)
 			uint32_t sub = cle32(d);
 			const uint8_t *c = d + 4;
 			uint64_t flags = cle64(c);
-			uint32_t cmdsize = cle32(c + 16), numcmds = cle32(c + 20);
+			uint32_t numcmds = cle32(c + 20);	/* cmdsize (c + 16) is not the stride: see below */
 			put("submit ");
 			puthex(sub);
 			put(" flags ");
@@ -1870,7 +1870,10 @@ static __attribute__((unused)) void g3_replay(void)
 				break;
 			}
 			for (uint32_t i = 0; i < numcmds; i++) {
-				const uint8_t *co = c + 64 + i * cmdsize;
+				/* stride sizeof(struct kgsl_command_object) = 32, not cmdsize: HMD kgsl_drawobj.c
+				 * add_cmdlist copies min(cmdsize, 32) and steps ptr += sizeof(obj). The blob
+				 * declares cmdsize 64 for two-IB submits whose second IB sits at +32 (2026-11-20). */
+				const uint8_t *co = c + 64 + i * 32;
 				uint64_t ga = cle64(co + 8), sz = cle64(co + 16);
 				if (!(cle32(co + 24) & KGSL_CMDLIST_IB))
 					continue;
@@ -2298,7 +2301,7 @@ static void g4_core(void)
 		} else if (type == 4) {
 			const uint8_t *c = d + 4;
 			uint64_t flags = cle64(c);
-			uint32_t cmdsize = cle32(c + 16), numcmds = cle32(c + 20), ctx = cle32(c + 56), ts = cle32(c + 60);
+			uint32_t numcmds = cle32(c + 20), ctx = cle32(c + 56), ts = cle32(c + 60);	/* not cmdsize */
 			if (flags & KGSL_CMDBATCH_MARKER)
 				continue;
 			if (dirty && drgpu_tlb_flush(g)) {
@@ -2309,7 +2312,10 @@ static void g4_core(void)
 			struct drgpu_ib ibs[8];
 			unsigned n = 0;
 			for (uint32_t i = 0; i < numcmds && n < 8; i++) {
-				const uint8_t *co = c + 64 + i * cmdsize;
+				/* stride sizeof(struct kgsl_command_object) = 32, not cmdsize: HMD kgsl_drawobj.c
+				 * add_cmdlist copies min(cmdsize, 32) and steps ptr += sizeof(obj). The blob
+				 * declares cmdsize 64 for two-IB submits whose second IB sits at +32 (2026-11-20). */
+				const uint8_t *co = c + 64 + i * 32;
 				if (cle32(co + 24) & KGSL_CMDLIST_IB)
 					ibs[n++] = (struct drgpu_ib){ cle64(co + 8), (uint32_t)(cle64(co + 16) >> 2) };
 			}
