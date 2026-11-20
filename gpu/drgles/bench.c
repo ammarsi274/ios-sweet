@@ -1466,16 +1466,23 @@ int mkdir(const char *, uint16_t);
 int unlink(const char *);
 int chmod(const char *, uint16_t);
 
-static int springboard_running(void)
+int kill(int, int);
+
+static int pid_of(const char *name)
 {
 	static int pids[4096];
 	int n = proc_listallpids(pids, (int)sizeof(pids));
 	for (int i = 0; i < n && i < 4096; i++) {
 		char nm[64] = "";
-		if (pids[i] > 0 && proc_name(pids[i], nm, sizeof(nm)) > 0 && !strcmp(nm, "SpringBoard"))
-			return 1;
+		if (pids[i] > 0 && proc_name(pids[i], nm, sizeof(nm)) > 0 && !strcmp(nm, name))
+			return pids[i];
 	}
 	return 0;
+}
+
+static int springboard_running(void)
+{
+	return pid_of("SpringBoard") != 0;
 }
 
 static double mono_s(void)
@@ -1539,6 +1546,16 @@ static int selftest_boot(const char *self, const char *cache, int delay_s, char 
 		unlink(DRG_FAULT_FILE);
 	host_log("selftest-boot: verdict %d (-1 = none) written to %s: %s (self-test took %.0f s)\n", v, cache,
 		 rc ? "FAILED" : "ok", mono_s() - t1 - delay_s);
+	/*
+	 * A passing verdict takes effect in this boot: backboardd read "no verdict" when it started, so
+	 * it is restarted once (SIGTERM; launchd starts it again) and libdrgeagl's decide() then finds the
+	 * verdict and no GPU use in this boot yet (BOOT_FILE is written only when the GPU is used), so it
+	 * draws with the GPU. A second restart in this boot stays on the CPU and sets the fault mark.
+	 */
+	if (!rc && v >= 0) {
+		int bb = pid_of("backboardd");
+		host_log("selftest-boot: restarting backboardd (pid %d) for GPU drawing: %d\n", bb, bb ? kill(bb, 15) : -1);
+	}
 	return rc ? 1 : 0;
 }
 #endif
