@@ -2319,7 +2319,13 @@ static void g4_core(void)
 			last_ctx = ctx;
 			last_ts = ts;
 			uint64_t s0 = ticks();
+#ifdef DRG_GPU_RT_PREEMPT
+			/* as HMD's kernel: context 2 was created with preemption style 2 (fine grain) */
+			uint32_t got = drgpu_submit_ex(g, &space_a, ctx, ibs, n, ts,
+						       DRGPU_SUBMIT_KGSL_PREEMPT | (ctx == 2 ? DRGPU_SUBMIT_FINEGRAIN : 0));
+#else
 			uint32_t got = drgpu_submit(g, &space_a, ctx, ibs, n, ts);
+#endif
 			int w = got ? drgpu_wait(g, ctx, ts, 2000000) : -1;
 			put("submit ctx ");
 			puthex(ctx);
