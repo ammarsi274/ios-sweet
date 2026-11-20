@@ -30,6 +30,25 @@ void kgsl_ios_options(int dsb, int deferfree);	/* kgsl_ios.c only: boot #42 isol
 void kgsl_ios_framing(uint32_t opts);
 int kgsl_ios_faulted(void);			/* a submit was refused: GPU fault */
 void kgsl_ios_readback(int mode);	/* CPU read-back before submits: 1 its objects, 2 all */
+/* kgsl_ios.c only: cache maintenance before each submit (research/reports/gpu-fault-2.md §4A) */
+#define KGSL_IOS_FLUSH_IBS	0	/* dc civac over the IB1 ranges, dsb sy (r23) */
+#define KGSL_IOS_FLUSH_ALL	1	/* also every live object that is not an import */
+#define KGSL_IOS_DELAY		2	/* no dc civac; dsb sy, then a 2 ms spin */
+void kgsl_ios_flush(int mode);
+/*
+ * Self-test modes (bench -selftest, read back by libdrgeagl from /private/var/run/drg-gpu-mode as
+ * "mode N"): bits 0-1 DrgGPU framing, bits 2-3 CPU read-back, bit 4 flushall, bit 5 delay.
+ */
+#define DRG_MODE_FLUSHALL	16
+#define DRG_MODE_DELAY		32
+#define DRG_MODE_MAX		63
+static inline void kgsl_ios_mode(int mode)
+{
+	kgsl_ios_framing((uint32_t)mode & 3);
+	kgsl_ios_readback((mode >> 2) & 3);
+	kgsl_ios_flush(mode & DRG_MODE_DELAY ? KGSL_IOS_DELAY : mode & DRG_MODE_FLUSHALL ? KGSL_IOS_FLUSH_ALL
+											: KGSL_IOS_FLUSH_IBS);
+}
 /* kgsl_ios.c only: a placeholder fd that stands for an IOSurface as a dma-buf (GPUOBJ_IMPORT type 3) */
 int kgsl_ios_surface_fd(uint32_t surface);			/* capture without waiting for each submit (phase 1 = right after it) */
 /* kgsl_cap.c, called by each platform's layer around every ioctl and mmap */

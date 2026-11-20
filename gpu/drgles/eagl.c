@@ -760,9 +760,13 @@ static int gpu_up(void)
 		LOG("self-test verdict \"%s\" after %.0f ms: staying on SWContext\n", b, now_ms() - t0);
 		return 0;
 	}
-	LOG("self-test passed with framing %d (waited %.0f ms)\n", mode, now_ms() - t0);
-	kgsl_ios_framing((uint32_t)mode & 3);	/* mode: framing bits 0-1, CPU read-back << 2 (bench -selftest) */
-	kgsl_ios_readback(mode >> 2);
+	LOG("self-test passed with mode %d (waited %.0f ms)\n", mode, now_ms() - t0);
+	if (mode > DRG_MODE_MAX) {
+		LOG("self-test mode %d unknown: staying on SWContext\n", mode);
+		return 0;
+	}
+	/* mode: framing bits 0-1, CPU read-back bits 2-3, flushall bit 4, delay bit 5 (bench -selftest) */
+	kgsl_ios_mode(mode);
 	if (load_gl() || build_stubs())
 		return 0;
 	gpu_state = 1;

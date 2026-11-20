@@ -1292,29 +1292,51 @@ static int stress_test(EGLDisplay d)
 
 static int selftest_child = -1;
 
-/* the parent: one child per mode, the verdict into `out` */
+static const char *mode_name(int m)
+{
+	switch (m) {
+	case 4: return "mode 4 (read-back of the submit's objects, IB1 flush)";
+	case 8: return "mode 8 (read-back of every object, IB1 flush)";
+	case DRG_MODE_FLUSHALL: return "flushall (mode 16: dc civac of every live non-import object, no read-back)";
+	case DRG_MODE_DELAY: return "delay (mode 32: 2 ms spin before each submit, no flush, no read-back)";
+	default: return "mode ?";
+	}
+}
+
+/*
+ * The parent: one child per mode, the verdict into `out`.
+ * mode = framing (DRGPU_UC_OPT_*, bits 0-1) | CPU read-back << 2 | flushall (bit 4) | delay (bit 5)
+ * (kgsl_ios_mode). Boot #51: framings 0-3 alone all fault; boot #53: mode 4 failed 7/7, mode 8 2/7.
+ * Root r24 (research/reports/gpu-fault-2.md §4A): mode 4, flushall and delay, each in its own process
+ * and each whatever the others did, so that one boot tells H1 (stale CPU-written data outside IB1:
+ * flushall passes, delay fails) from H2 (GPU-side stale line: delay passes, flushall fails). Mode 8
+ * (r23's fallback) runs only if all three fail. The verdict is the first that passed, in that order;
+ * "none" keeps backboardd on CPU drawing (SWContext).
+ */
 static int selftest(const char *self, const char *out, char **envp)
 {
-	/*
-	 * mode = framing (DRGPU_UC_OPT_*, bits 0-1) | CPU read-back << 2 (kgsl_ios_readback). Boot #51:
-	 * framings 0-3 alone all fault. Runs: read-back of the submit's objects, then of every object;
-	 * the verdict is the cheaper one that passes.
-	 */
-	enum { NRUN = 2 };
-	static const int order[NRUN] = { 4, 8 };
-	int pass[16] = { 0 };
+	enum { NRUN = 4 };
+	static const int order[NRUN] = { 4, DRG_MODE_FLUSHALL, DRG_MODE_DELAY, 8 };
+	int pass[DRG_MODE_MAX + 1] = { 0 }, ran[DRG_MODE_MAX + 1] = { 0 };
 	for (int i = 0; i < NRUN; i++) {
-		char m[3] = { (char)('0' + order[i] / 10), (char)('0' + order[i] % 10), 0 };
-		char *argv[] = { (char *)self, "-selftest-child", m, "/usr/local/drgles/adreno", 0 };
-		pid_t pid = 0;
-		int st = 0;
-		host_log("selftest: mode %d (framing %d, read-back %d) starting\n", order[i], order[i] & 3, order[i] >> 2);
-		if (posix_spawn(&pid, self, 0, 0, argv, envp) != 0 || waitpid(pid, &st, 0) != pid) {
-			host_log("selftest: mode %d: could not run\n", order[i]);
+		int m = order[i];
+		if (m == 8 && (pass[4] || pass[DRG_MODE_FLUSHALL] || pass[DRG_MODE_DELAY])) {
+			host_log("selftest: mode 8 not run (a cheaper mode passed)\n");
 			continue;
 		}
-		pass[order[i]] = (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0;
-		host_log("selftest: mode %d: %s (status 0x%x)\n", order[i], pass[order[i]] ? "PASS" : "FAIL", st);
+		char ms[3] = { (char)('0' + m / 10), (char)('0' + m % 10), 0 };
+		char *argv[] = { (char *)self, "-selftest-child", ms, "/usr/local/drgles/adreno", 0 };
+		pid_t pid = 0;
+		int st = 0;
+		host_log("selftest: ---- %s: starting (framing %d, read-back %d, flush %s)\n", mode_name(m), m & 3,
+			 (m >> 2) & 3, m & DRG_MODE_DELAY ? "none + 2 ms delay" : m & DRG_MODE_FLUSHALL ? "all objects" : "IB1");
+		if (posix_spawn(&pid, self, 0, 0, argv, envp) != 0 || waitpid(pid, &st, 0) != pid) {
+			host_log("selftest: VERDICT %s: could not run\n", mode_name(m));
+			continue;
+		}
+		ran[m] = 1;
+		pass[m] = (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0;
+		host_log("selftest: VERDICT %s: %s (status 0x%x)\n", mode_name(m), pass[m] ? "PASS" : "FAIL", st);
 	}
 	char verdict[16] = "none\n";
 	for (int i = 0; i < NRUN; i++)
@@ -1327,7 +1349,15 @@ static int selftest(const char *self, const char *out, char **envp)
 		write(fd, verdict, strlen(verdict));
 		close(fd);
 	}
-	host_log("selftest: mode 4 %s, mode 8 %s; verdict %s", pass[4] ? "PASS" : "FAIL", pass[8] ? "PASS" : "FAIL",
+	static const char *const res[3] = { "not run", "FAIL", "PASS" };
+	const int f = DRG_MODE_FLUSHALL, dl = DRG_MODE_DELAY;
+	const char *h = !ran[f] || !ran[dl]   ? "incomplete"
+			: pass[f] && !pass[dl] ? "H1 (stale CPU-written data outside IB1)"
+			: !pass[f] && pass[dl] ? "H2 (GPU-side stale line, timing)"
+			: pass[f] && pass[dl]  ? "both cures work (H1/H2 not separated)"
+					       : "neither H1 nor H2 alone";
+	host_log("selftest: SUMMARY mode 4 %s, flushall %s, delay %s, mode 8 %s; points to %s; verdict %s",
+		 res[ran[4] + pass[4]], res[ran[f] + pass[f]], res[ran[dl] + pass[dl]], res[ran[8] + pass[8]], h,
 		 verdict);
 	return 0;
 }
@@ -1486,12 +1516,10 @@ static int main_(int argc, char **argv, char **envp)
 			selftest_child = 0;
 			for (const char *p = argv[++i]; *p >= '0' && *p <= '9'; p++)
 				selftest_child = selftest_child * 10 + (*p - '0');
-			if (selftest_child > 15)
+			if (selftest_child > DRG_MODE_MAX)
 				return 2;
-			kgsl_ios_framing((uint32_t)selftest_child & 3);
-			kgsl_ios_readback(selftest_child >> 2);
-			host_log("selftest child: mode %d (framing %d, read-back %d)\n", selftest_child, selftest_child & 3,
-				 selftest_child >> 2);
+			kgsl_ios_mode(selftest_child);
+			host_log("selftest child: %s\n", mode_name(selftest_child));
 			continue;
 		}
 		if (!strcmp(argv[i], "-dsb") || !strcmp(argv[i], "-deferfree")) {	/* boot #42 */

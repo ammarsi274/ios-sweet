@@ -157,6 +157,56 @@ void kgsl_ios_readback(int mode)
 	opt_readback = mode;
 }
 
+/*
+ * Cache maintenance before each submit (research/reports/gpu-fault-2.md §4A;
+ * the self-test picks one, bench -selftest):
+ *   KGSL_IOS_FLUSH_IBS    clean+invalidate each IB1's lines (r23, boot #51 fix)
+ *   KGSL_IOS_FLUSH_ALL    that, plus every live object that is not an import
+ *                         (IB2s and state the blob wrote outside IB1: H1)
+ *   KGSL_IOS_DELAY        no cache maintenance; spin 2 ms before the kick (H2)
+ * All end with dsb sy. Imported IOSurfaces are never touched: their
+ * mappings belong to the surface (and can be big render targets).
+ */
+static int opt_flush = KGSL_IOS_FLUSH_IBS;
+void kgsl_ios_flush(int mode)
+{
+	opt_flush = mode;
+}
+
+#define DELAY_NS 2000000
+
+#if defined(KGSL_IOS_TEST_FLUSH)	/* host test: record the ranges instead (test/kgsl_flush_test.c) */
+void kgsl_test_flush(uint64_t va, uint64_t len);
+static void flush_range(uint64_t va, uint64_t len)
+{
+	kgsl_test_flush(va, len);
+}
+#elif defined(__aarch64__)
+static void flush_range(uint64_t va, uint64_t len)
+{
+	for (uint64_t a = va & ~63ull; a < va + len; a += 64)	/* Kryo 260: 64-byte lines */
+		__asm__ volatile("dc civac, %0" : : "r"(a) : "memory");
+}
+#else
+static void flush_range(uint64_t va, uint64_t len)
+{
+	(void)va;
+	(void)len;
+}
+#endif
+
+static void spin_ns(int64_t ns)
+{
+	struct host_ts t;
+	if (host_clock(1, &t))
+		return;
+	int64_t end = t.sec * 1000000000 + t.nsec + ns;
+	do {
+		if (host_clock(1, &t))
+			return;
+	} while (t.sec * 1000000000 + t.nsec < end);
+}
+
 static uint64_t read_range(uint64_t va, uint64_t len)
 {
 	uint64_t s = 0;
@@ -552,20 +602,32 @@ static long gpu_command(struct kdev *d, struct gpu_command *c)
 		(void)sink;
 	}
 	uint64_t in[3] = { c->context_id, c->flags, c->timestamp }, out[1] = { 0 };
-#if defined(__aarch64__)	/* (the host test builds this file for x86) */
 	/*
 	 * Boot #51 (research/reports/gpu-fault.md): the GPU read the newest lines
 	 * of each IB as zeros. Clean and invalidate every IB's lines to the point
 	 * of coherency (what iOS's sys_dcache_flush does at EL0) and wait for it,
 	 * in case any alias of them is cacheable; the kernel then drains every
 	 * core's write buffer and checks the IB in RAM before it kicks the GPU.
+	 * FLUSH_ALL also covers every live non-import object (IB2s, state), DELAY
+	 * none of it (see kgsl_ios_flush).
 	 */
-	for (unsigned k = 0; k < n; k++)
-		for (uint64_t a = ibs[k].gpuaddr & ~63ull; a < ibs[k].gpuaddr + ibs[k].bytes; a += 64)
-			__asm__ volatile("dc civac, %0" : : "r"(a) : "memory");
+	if (opt_flush != KGSL_IOS_DELAY) {
+		for (unsigned k = 0; k < n; k++)
+			flush_range(ibs[k].gpuaddr, ibs[k].bytes);
+	}
+	if (opt_flush == KGSL_IOS_FLUSH_ALL) {
+		for (uint32_t i = 0; i < d->nobjs; i++) {
+			struct kobj *o = &d->objs[i];
+			if (o->live && !o->imports)
+				flush_range(o->va, o->size);
+		}
+	}
+#if defined(__aarch64__)
 	__asm__ volatile("dsb sy" ::: "memory");
-	(void)opt_dsb;
 #endif
+	if (opt_flush == KGSL_IOS_DELAY)
+		spin_ns(DELAY_NS);
+	(void)opt_dsb;
 	int rc = call(d, DRGPU_UC_SUBMIT, in, 3, n ? ibs : 0, n * sizeof(ibs[0]), out, 1, 0, 0);
 	if (rc == -E_DEADLK && !gpu_faulted) {
 		gpu_faulted = 1;
