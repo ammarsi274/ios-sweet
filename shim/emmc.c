@@ -344,7 +344,11 @@ void drg_emmc_probe(void)
  * the result back (dd from userdata's last 64 MiB + LOG_IN_SCRATCH). Same
  * safety rule as the R6 test: only inside the scratch area.
  */
+#ifdef DRG_GPU_RT_REPLAY	/* its own place: a normal start after the test overwrote the result (2026-11-20) */
+#define LOG_IN_SCRATCH		(WTEST_IN_SCRATCH + 0x300ULL)
+#else
 #define LOG_IN_SCRATCH		(WTEST_IN_SCRATCH + 0x100ULL)
+#endif
 #define LOG_BLOCKS		64
 
 static uint64_t log_lba;	/* 0: not found / not safe */
