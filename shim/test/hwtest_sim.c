@@ -16,10 +16,16 @@
  *     owners is refused, as TZ would
  *   - eMMC: a GPT whose modem_a is the saved modem_a.img (read-only)
  *   - RPM: logs each request
- *   - UART + WCN3990: power pulses, HCI Reset / Read_Local_Version / EDL
+ *   - MSS restart register 0 at the start (boot #55); asserting it clears
+ *     the RMB status registers
+ *   - UART + WCN3990: see the model below (receiver timing, auto RFR,
+ *     breaks, chip boot time)
  * Failure injection (env SIM_FAIL): pbl, mdt, seg, auth, smcN (Nth SMC
- * fails), probe (QDSP6 dry read faults), ram (RAM touch fails), btdead,
- * btprobe.
+ * fails), probe (QDSP6 dry read faults), ram (RAM touch fails), mssrun (Q6
+ * found running: must be left alone), mssstale (PBL/MBA status left from
+ * an earlier boot: restart cycle, then a normal boot), btdead, btprobe.
+ * B1 must end with rc 0 and the decoded SoC version unless btdead/btprobe:
+ * the drg_bt.c of commit 430e9f8 fails here the way boot #55 did.
  *   gcc -O2 -Wall -Wextra -DDRG_HOST_SIM -DBOARD_DRG -static -no-pie -pthread -I.. \
  *       -o hwtest_sim hwtest_sim.c ../drg_w1.c ../drg_bt.c ../drg_fat.c
  *   ./hwtest_sim modem_a.img extracted-files-dir
@@ -27,6 +33,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,6 +72,9 @@ static inline volatile uint32_t *R(uintptr_t a) { return (volatile uint32_t *)a;
 /* ---- timer ---- */
 uint64_t sim_now(void)
 {
+	static unsigned calls;
+	if (++calls % 64 == 0)
+		sched_yield();	/* the model thread must keep up with the code's 200 us branch polls on a busy host */
 	struct timespec t;
 	clock_gettime(CLOCK_MONOTONIC, &t);
 	return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
@@ -360,8 +370,10 @@ static void *model(void *arg)
 		setbit31(QDSP6 + 0x38, !(cb & 1));
 		*R(QDSP6 + 0xc4) = (*R(QDSP6 + 0x30) >> 24) & 1;
 		/* PBL / MBA */
+		if (*R(GCC + 0x79000) & 1)	/* block reset: RMB statuses back to 0 */
+			*R(RMB + 4) = 0, *R(RMB + 0xc) = 0;
 		int running = !(*R(GCC + 0x79000) & 1) && !(*R(QDSP6 + 0x14) & 3) && (*R(QDSP6 + 0x20) & 2);
-		if (running && !pbl_done && !fail_is("pbl")) {
+		if (running && !pbl_done && !fail_is("pbl") && !fail_is("mssrun")) {
 			int ok = *R(RMB + 0) == MBA && mss_only(MBA, 0x100000) && !memcmp((void *)MBA, mba_f, mba_n);
 			*R(RMB + 4) = ok ? 1 : 3;
 			usleep(2000);
@@ -397,63 +409,177 @@ static void *model(void *arg)
 	return NULL;
 }
 
-/* ---- UART + WCN3990 ---- */
+/* ---- UART + WCN3990 ----
+ * Time-based model of the UART DM v1.4 receiver and the chip, built to
+ * behave as boot #55 showed (logs/pull55/cpuprobe.txt):
+ *   - bytes arrive one per character time (86.8 us at 115200) into a
+ *     packing buffer; whole words go to the RX FIFO (RXRDY), the partial
+ *     word only at a stale event (line idle for the IPR stale count of
+ *     character times) or FORCE_STALE; RX_TOTAL_SNAP = bytes of the
+ *     transfer at the stale event, a DMRX write starts the next transfer
+ *   - auto RFR (MR1 RX_RDY_CTL): "ready" while FIFO + packing bytes <= the
+ *     MR1 level; the chip still sends 5 bytes after RFR goes not-ready
+ *     (its own FIFO; 1 + 5 = the 6 bytes boot #55 got with level 0) [model]
+ *   - a break (chip TX low) sets ISR RXBREAK until RESET_BREAK_INT and puts
+ *     a 0x00 into the FIFO unless MR2 RX_BREAK_ZERO_CHAR_OFF
+ *   - chip after the 0xFC pulse: break at +0 and +5 ms, ignores commands
+ *     until +60 ms (env SIM_BTBOOT_MS) [model: boot time unknown, boot #55 only shows it is
+ *     more than a few ms and less than ~1 s], answers 1 ms after a command
+ *   - EDL answer: 04 ff 0e 00 02 + product 0x0a (seen on boot #55), patch,
+ *     rom 0x0201, soc id (invented values: crbtfw21)
+ */
 static uint32_t ur[0x200 / 4];
-static uint8_t rxq[256];
-static unsigned rxh, rxt, snap, stale, stale_en, ncf, txn, chip_on;
+#define FIFO_WORDS 16				/* 64 bytes (uport->fifosize) */
+static uint32_t fw_[FIFO_WORDS], fwn_[FIFO_WORDS];	/* RX FIFO: word, valid bytes */
+static unsigned fh, ft;				/* FIFO head/tail (count = ft - fh) */
+static uint32_t pk, pkn;			/* packing buffer */
+static uint32_t xfer, snap_latch, stale_pend, stale_en, brk_latch, overrun, rfr_manual;
+static uint64_t last_rx_t;
+static unsigned ncf, txn, chip_on, chip_slack;
+static uint64_t chip_boot_t;
 static uint8_t txb[64];
-static unsigned bt_cmds;
+static unsigned bt_cmds, bt_ignored;
+struct cq { uint64_t t; int16_t b; };		/* b = -1: break */
+static struct cq cq[512];
+static unsigned cqh, cqt;
+static uint64_t chip_next_t;
 
-static void chip_send(const uint8_t *b, unsigned n)
+static uint64_t byte_ns(void) { return ur[0xa0 / 4] == 0x33 ? 4166667 : 86806; }
+
+static void fifo_push(uint32_t w, uint32_t n)
+{
+	if (ft - fh >= FIFO_WORDS) {
+		overrun = 1;
+		return;
+	}
+	fw_[ft % FIFO_WORDS] = w, fwn_[ft % FIFO_WORDS] = n;
+	ft++;
+}
+static void rx_byte(uint8_t b, uint64_t t)
+{
+	pk |= (uint32_t)b << (8 * pkn);
+	if (++pkn == 4) {
+		fifo_push(pk, 4);
+		pk = pkn = 0;
+	}
+	xfer++;
+	last_rx_t = t;
+}
+static void fire_stale(void)
+{
+	if (pkn) {
+		fifo_push(pk, pkn);
+		pk = pkn = 0;
+	}
+	snap_latch = xfer;
+	stale_pend = 1;
+	stale_en = 0;
+}
+static unsigned rx_level(void) { return (ft - fh) * 4 + pkn; }
+static int rfr_ready(void)
+{
+	uint32_t mr1 = ur[0];
+	if (!(mr1 & 0x80))
+		return rfr_manual;
+	uint32_t lvl = (mr1 & 0x3f) | ((mr1 & 0xffffff00u) >> 2);
+	return rx_level() <= lvl;
+}
+static void chip_queue(const uint8_t *b, unsigned n, uint64_t t)
 {
 	for (unsigned i = 0; i < n; i++)
-		rxq[(rxt++) & 255] = b[i];
-	snap += n;
-	stale = 1;
+		cq[(cqt++) & 511] = (struct cq){ t, b ? b[i] : -1 };
 }
+static void tick(void)
+{
+	uint64_t t = sim_now();
+	while (cqh != cqt) {
+		uint64_t due = cq[cqh & 511].t > chip_next_t ? cq[cqh & 511].t : chip_next_t;
+		if (t < due)
+			break;
+		if (rfr_ready())
+			chip_slack = 5;
+		else if (!chip_slack) {
+			chip_next_t = t;	/* stalled until RFR is ready again */
+			break;
+		} else
+			chip_slack--;
+		int16_t b = cq[(cqh++) & 511].b;
+		if (b < 0) {
+			brk_latch = 1;
+			if (!(ur[1] & 0x100))
+				rx_byte(0, due);
+		} else {
+			rx_byte((uint8_t)b, due);
+		}
+		chip_next_t = due + byte_ns();
+	}
+	uint32_t ipr = ur[0x18 / 4], stale_chars = (ipr & 0x1f) | ((ipr & 0xffffff80u) >> 2);
+	if (stale_en && !stale_pend && xfer > 0 && t - last_rx_t > (uint64_t)stale_chars * byte_ns())
+		fire_stale();
+}
+
 static void chip_frame(void)
 {
 	uint32_t csr = ur[0xa0 / 4];
 	printf("[chip] got %u byte(s) at CSR %02x:", txn, csr);
 	for (unsigned i = 0; i < txn; i++)
 		printf(" %02x", txb[i]);
-	printf("\n");
+	uint64_t t = sim_now();
+	const char *bm = getenv("SIM_BTBOOT_MS");	/* chip boot time, default 60 ms */
+	int ready = chip_on && t - chip_boot_t >= (bm ? strtoull(bm, NULL, 0) : 60) * 1000000ull;
 	if (txn == 1 && txb[0] == 0xc0) {
 		CHECK(csr == 0x33, "power-off pulse not at 2400");
 		chip_on = 0;
+		cqh = cqt;
 	} else if (txn == 1 && txb[0] == 0xfc) {
 		CHECK(csr == 0xcc, "power-on pulse not at 115200");
 		chip_on = !fail_is("btdead");
-	} else if (chip_on && csr == 0xcc && txn >= 4 && txb[0] == 1) {
+		chip_boot_t = t;
+		if (chip_on) {
+			chip_queue(NULL, 1, t);
+			chip_queue(NULL, 1, t + 5000000);
+		}
+	} else if (ready && csr == 0xcc && txn >= 4 && txb[0] == 1) {
 		bt_cmds++;
 		uint16_t op = (uint16_t)(txb[1] | txb[2] << 8);
+		uint64_t at = t + 1000000;
 		if (op == 0x0c03) {
 			const uint8_t ev[] = { 4, 0x0e, 4, 1, 0x03, 0x0c, 0 };
-			chip_send(ev, sizeof(ev));
+			chip_queue(ev, sizeof(ev), at);
 		} else if (op == 0x1001) {
 			const uint8_t ev[] = { 4, 0x0e, 0x0c, 1, 0x01, 0x10, 0, 0x08, 0x00, 0x00, 0x08, 0x1d, 0x00, 0x01, 0x02 };
-			chip_send(ev, sizeof(ev));
+			chip_queue(ev, sizeof(ev), at);
 		} else if (op == 0xfc00) {
-			const uint8_t ev[] = { 4, 0xff, 0x0e, 0x00, 0x19, 0x21, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x21, 0x04, 0x00, 0x00 };
-			chip_send(ev, sizeof(ev));
+			const uint8_t ev[] = { 4, 0xff, 0x0e, 0x00, 0x02, 0x0a, 0x00, 0x00, 0x00, 0x2d, 0x00, 0x01, 0x02,
+					       0x14, 0x02, 0x01, 0x40 };
+			chip_queue(ev, sizeof(ev), at);
 		}
+	} else if (chip_on) {
+		bt_ignored++;
+		printf("  (ignored: chip %s)", ready ? "?" : "still booting");
 	}
+	printf("\n");
 	txn = 0;
 }
 uint32_t sim_urd(uint32_t o)
 {
+	tick();
 	switch (o) {
-	case 0xa4:	/* SR: TXRDY, TXEMT always; RXRDY with bytes queued */
-		return 0xc | (rxh != rxt ? 1 : 0);
+	case 0xa4:	/* SR: TXRDY, TXEMT always; RXRDY with a word in the FIFO; OVERRUN */
+		return 0xc | (ft != fh ? 1 : 0) | (overrun ? 0x10 : 0);
 	case 0xb4:
-	case 0xac:
-		return (stale && stale_en ? 0x8 : 0) | (chip_on ? 0x40 : 0);
+	case 0xac: {
+		uint32_t isr = (stale_pend ? 0x8 : 0) | (brk_latch ? 0x4 : 0) | (chip_on ? 0x40 : 0) |
+			       (ft - fh > ur[0x20 / 4] ? 0x10 : 0);
+		return o == 0xac ? isr & ur[0xb0 / 4] : isr;
+	}
 	case 0xbc:
-		return snap;
+		return snap_latch;
 	case 0x140: {
-		uint32_t w = 0;
-		for (int k = 0; k < 4 && rxh != rxt; k++)
-			w |= (uint32_t)rxq[(rxh++) & 255] << (8 * k);
+		if (ft == fh)
+			return 0;
+		uint32_t w = fw_[fh % FIFO_WORDS];
+		fh++;
 		return w;
 	}
 	default:
@@ -462,13 +588,23 @@ uint32_t sim_urd(uint32_t o)
 }
 void sim_uwr(uint32_t o, uint32_t v)
 {
+	tick();
 	if (o == 0xa8) {	/* CR */
-		if (v == 0x10)
-			rxh = rxt, snap = 0, stale = 0;
-		else if (v == 0x80)
-			stale = 0, snap = 0;
-		else if (v == 0x500)
-			stale_en = 1;
+		switch (v) {
+		case 0x10: fh = ft = 0, pk = pkn = 0, xfer = snap_latch = 0, stale_pend = stale_en = 0; break;
+		case 0x30: overrun = 0; break;
+		case 0x40: brk_latch = 0; break;
+		case 0x80: stale_pend = 0; break;
+		case 0x400: fire_stale(); break;
+		case 0x500: stale_en = 1; break;
+		case 0xd0: rfr_manual = 1; break;
+		case 0xe0: rfr_manual = 0; break;
+		}
+		return;
+	}
+	if (o == 0x34) {	/* DMRX: next transfer; bytes after the latched snap carry over */
+		xfer -= snap_latch;
+		snap_latch = 0;
 		return;
 	}
 	if (o == 0x40) {
@@ -521,7 +657,11 @@ int main(int argc, char **argv)
 	map(MODEM, 0x7e00000, 0xee);	/* garbage: the tails must be zeroed */
 	map(MBA, 0x200000, 0xee);
 	map(FIH, 0x800000, 0xee);
-	*R(GCC + 0x79000) = 1;			/* MSS held in reset */
+	*R(GCC + 0x79000) = 0;			/* boot #55: restart register reads 0 */
+	if (fail_is("mssrun"))			/* Q6 running: BHS on, core out of reset, clock on */
+		*R(QDSP6 + 0x30) = 1u << 24, *R(QDSP6 + 0x14) = 0, *R(QDSP6 + 0x20) = 2, *R(QDSP6 + 0xc4) = 1;
+	if (fail_is("mssstale"))		/* statuses left by an earlier boot, Q6 stopped */
+		*R(RMB + 4) = 1, *R(RMB + 0xc) = 4;
 	*R(GCC + 0x52004) = 0x00000400;		/* boot rom vote already on: must stay on */
 	*R(GCC + 0x5200c) = 0;
 	*R(0x01f63004) = 1, *R(0x01f64004) = 1, *R(0x01f65004) = 1;	/* halt acks */
@@ -548,7 +688,21 @@ int main(int argc, char **argv)
 	printf("== ownership at the end\n");
 	for (int i = 0; i < nown; i++)
 		printf("   %08llx+%08llx vms %04x\n", (unsigned long long)owns[i].a, (unsigned long long)owns[i].s, owns[i].vms);
-	CHECK(*R(GCC + 0x79000) & 1, "MSS not back in reset");
+	if (fail_is("mssrun"))
+		CHECK(!(*R(GCC + 0x79000) & 1) && w1 == -9 && smc_calls == 0 && *R(QDSP6 + 0x14) == 0,
+		      "running Q6 touched (restart %x, rc %d, SMCs %u)", *R(GCC + 0x79000), w1, smc_calls);
+	else if (w1 < 0 && w1 > -8)	/* stopped before step 8: the restart register is untouched */
+		CHECK(*R(GCC + 0x79000) == 0, "restart register written before step 8");
+	else
+		CHECK(*R(GCC + 0x79000) & 1, "MSS not back in reset");
+	if (fail_is("mssstale"))
+		CHECK(w1 == 0, "stale RMB state: W1 rc %d", w1);
+	if (!fail_is("btdead") && !fail_is("btprobe")) {
+		CHECK(bt == 0, "B1 rc %d", bt);
+		logbuf[loglen < sizeof(logbuf) ? loglen : sizeof(logbuf) - 1] = 0;
+		CHECK(strstr(logbuf, "bt rome version 02140201") != NULL, "SoC version not decoded");
+		CHECK(strstr(logbuf, "bt fw crbtfw/crnv NN [E] 00000021 00000001 ok") != NULL, "firmware number");
+	}
 	CHECK(*R(GCC + 0x52004) == vote0, "GCC vote register %x, was %x", *R(GCC + 0x52004), vote0);
 	CHECK(!(*R(GCC + 0x8a000) & 1) && !(*R(GCC + 0x4401c) & 1) && !(*R(GCC + 0x8a03c) & 1) &&
 		      !(*R(GCC + 0x8a004) & 1) && !(*R(GCC + 0x5200c) & 4),

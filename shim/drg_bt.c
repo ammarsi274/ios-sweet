@@ -25,12 +25,23 @@
  *   Pins (blsp2_uart1_*_active): GPIO16 TX, 17 CTS, 18 RX, 19 RFR,
  *     function blsp_uart5 = mux 1 (pinctrl-sdm660.c PINGROUP 16-19),
  *     2 mA, bias-disable; CENTER tile: cfg at 0x3500000 + 0x1000 * n.
- *   PIO receive as msm_serial.c msm_handle_rx_dm (stale event, snap count).
+ *   PIO receive as msm_serial.c msm_handle_rx_dm (stale event, snap count,
+ *     4 bytes per RX FIFO word); MR1 auto-RFR level 48 (msm_hs_startup:
+ *     fifosize 64 - 16), MR2 RX_BREAK_ZERO_CHAR_OFF | RX_ERROR_CHAR_OFF
+ *     (msm_hs_probe). An exchange collects bytes across stale events until
+ *     a whole H4 event (04, code, plen, plen bytes) is in; every byte is
+ *     logged.
  *   HCI commands: Reset 0x0c03, Read_Local_Version 0x1001; Qualcomm
- *     EDL_PATCH_CMD_OPCODE 0xfc00 with EDL_PATCH_VER_REQ_CMD 0x19 (btqca.h).
+ *     EDL_PATCH_CMD_OPCODE 0xfc00 with EDL_PATCH_VER_REQ_CMD 0x19, answer
+ *     decoded as struct rome_version (btqca.h, btqca.c rome_patch_ver_req).
+ * Boot #55 (logs/pull55): chip alive (EDL answer 04 ff 0e 00 02 0a, then
+ * cut), HCI Reset got one 0x00 (a break: ISR RXBREAK set), Read_Local_Version
+ * nothing. Causes: MR1 0xc0 = auto-RFR level 0, and the 100 ms boot wait
+ * ended at the first stale event; both fixed (steps 5, 6).
  * Guesses, logged as such:
  *   [E] power pulses: 0xC0 at 2400 baud (power off), then 0xFC at 115200
- *     (power on), 100 ms boot time, flow control off for the pulse: upstream
+ *     (power on), 100 ms boot time, flow control off (RFR not ready) for
+ *     the pulse and on for the boot wait; one HCI Reset retry: upstream
  *     hci_qca.c qca_wcn3990_init / qca_send_power_pulse, from memory. HMD's
  *     4.4 hci_qca.c/btqca.c have no WCN3990 code and the vendor_b backup
  *     holds no readable BT HAL, so they could not be checked locally.
@@ -75,13 +86,20 @@
 
 #define SR_RXRDY		(1u << 0)
 #define SR_OVERRUN		(1u << 4)
+#define SR_PAR_FRAME		(1u << 5)
 #define SR_TXRDY		(1u << 2)
 #define SR_TXEMT		(1u << 3)
+#define ISR_RXBREAK		(1u << 2)	/* UARTDM_ISR_RXBREAK_BMSK: break start/end seen */
 #define ISR_RXSTALE		(1u << 3)
 #define ISR_RXLEV		(1u << 4)
 #define ISR_CTS			(1u << 6)	/* UARTDM_ISR_CURRENT_CTS_BMSK */
 #define MR1_CTS_CTL		(1u << 6)
 #define MR1_RX_RDY_CTL		(1u << 7)
+#define MR1_RFR_LEVEL(l)	(((l) & 0x3fu) | (((l) << 2) & 0xffffff00u))	/* AUTO_RFR_LEVEL0 / LEVEL1 */
+#define MR2_8N1			0x34		/* 8 bits, 1 stop bit, no parity */
+#define MR2_ERROR_MODE		0x40
+#define MR2_BREAK_ZERO_OFF	0x100		/* RX_BREAK_ZERO_CHAR_OFF */
+#define MR2_ERROR_CHAR_OFF	0x200		/* RX_ERROR_CHAR_OFF */
 #define CR_RX_EN		0x01
 #define CR_TX_EN		0x04
 #define CR_RESET_RX		0x10
@@ -94,6 +112,7 @@
 #define CR_STALE_ENABLE		0x500
 #define CR_FORCE_STALE		0x400
 #define CR_RFR_LOW		0xd0
+#define CR_RFR_HIGH		0xe0
 
 #define RPM_RES_LDOA		0x616f646cu	/* "ldoa" */
 #define RPM_RES_BOBB		0x62626f62u	/* "bobb" */
@@ -250,7 +269,7 @@ static void stale_arm(void)
 	dsb();
 }
 
-/* CSR code and stale count (msm_hs_set_bps_locked) */
+/* CSR code and stale count (msm_hs_set_bps_locked), then RX/TX reset */
 static void set_baud(uint32_t csr, uint32_t rxstale)
 {
 	uint64_t t0 = now();
@@ -261,19 +280,29 @@ static void set_baud(uint32_t csr, uint32_t rxstale)
 	uwr(U_CR, CR_RESET_TX);
 	uwr(U_CR, CR_RESET_RX);
 	uwr(U_CR, CR_RESET_ERR);
+	uwr(U_CR, CR_RESET_BREAK);
 	uwr(U_CR, CR_RX_EN);
 	uwr(U_CR, CR_TX_EN);
 	old_snap = 0;
 	stale_arm();
 }
 
+/*
+ * on: msm_hs_set_termios with CRTSCTS (RFR_LOW, CTS_CTL | RX_RDY_CTL); the
+ * auto-RFR level in MR1 stays as step 5 set it. off: msm_hs_disable_flow_control
+ * (RX_RDY_CTL off, RFR_HIGH = "not ready"), CTS ignored.
+ */
 static void flow(int on)
 {
 	uint32_t mr1 = urd(U_MR1) & ~(MR1_CTS_CTL | MR1_RX_RDY_CTL);
-	uwr(U_CR, CR_RFR_LOW);
-	if (on)
+	if (on) {
+		uwr(U_CR, CR_RFR_LOW);
 		mr1 |= MR1_CTS_CTL | MR1_RX_RDY_CTL;
-	uwr(U_MR1, mr1);
+		uwr(U_MR1, mr1);
+	} else {
+		uwr(U_MR1, mr1);
+		uwr(U_CR, CR_RFR_HIGH);
+	}
 	dsb();
 }
 
@@ -300,71 +329,157 @@ static int uart_tx(const uint8_t *b, uint32_t n, uint32_t timeout_ms)
 	return 0;
 }
 
-static uint32_t rx_words(uint8_t *b, uint32_t got, uint32_t max, uint32_t count)
+/*
+ * Receive buffer for one exchange: every byte the UART hands over is kept
+ * here in order and logged; H4 events are found in it afterwards.
+ */
+#define RXMAX 272
+static uint8_t rx[RXMAX];
+static uint32_t rxn, rx_lost, rx_breaks, rx_errs, rx_log_budget;
+
+/*
+ * Up to count bytes out of the RX FIFO, one 32-bit word (4 bytes, first
+ * byte in bits 7:0) per read while RXRDY; returns the bytes taken (as
+ * msm_serial.c msm_handle_rx_dm: a word that is not there yet stays counted
+ * for the next stale/RXLEV round).
+ */
+static uint32_t rx_words(uint32_t count)
 {
-	while (count > 0 && (urd(U_SR) & SR_RXRDY)) {
+	uint32_t taken = 0;
+	while (taken < count && (urd(U_SR) & SR_RXRDY)) {
 		uint32_t w = urd(U_RF);
-		for (uint32_t k = 0; k < 4 && k < count; k++, w >>= 8)
-			if (got < max)
-				b[got++] = (uint8_t)w;
-		count = count > 4 ? count - 4 : 0;
+		for (uint32_t k = 0; k < 4 && taken < count; k++, taken++, w >>= 8) {
+			if (rxn < RXMAX)
+				rx[rxn++] = (uint8_t)w;
+			else
+				rx_lost++;
+		}
 	}
-	return got;
+	return taken;
 }
 
-/* bytes until a stale event ends a burst, or timeout_ms; returns the byte count */
-static uint32_t uart_rx(uint8_t *b, uint32_t max, uint32_t timeout_ms)
+/*
+ * One pass over the receiver (msm_serial.c msm_handle_rx_dm in PIO form):
+ * RXLEV moves whole words and adds them to old_snap; a stale event (the
+ * line idle for rxstale character times) also hands over the partial last
+ * word and RX_TOTAL_SNAP - old_snap is what is left. Breaks and framing
+ * errors are counted and logged (MR2 keeps them out of the FIFO, as
+ * msm_hs_probe sets it). Returns 1 when a stale event ended a burst.
+ */
+static int rx_poll(void)
 {
-	uint32_t got = 0;
-	uint64_t t0 = now();
-	while (ms_since(t0) < timeout_ms) {
-		uint32_t isr = urd(U_ISR) | urd(U_MISR), sr = urd(U_SR);
-		if (sr & SR_OVERRUN) {
-			LX("bt rx overrun sr", sr, got);
+	uint32_t isr = urd(U_ISR) | urd(U_MISR), sr = urd(U_SR);
+	int burst_end = 0;
+	if (sr & (SR_OVERRUN | SR_PAR_FRAME) || isr & ISR_RXBREAK) {
+		if (sr & (SR_OVERRUN | SR_PAR_FRAME))
+			rx_errs++;
+		if (isr & ISR_RXBREAK)
+			rx_breaks++;
+		if (rx_log_budget) {
+			rx_log_budget--;
+			LX("bt rx err sr/isr", sr, isr);
+		}
+		if (sr & (SR_OVERRUN | SR_PAR_FRAME))
 			uwr(U_CR, CR_RESET_ERR);
-		}
-		if (isr & ISR_RXSTALE) {
-			uint32_t snap = urd(U_SNAP);
-			got = rx_words(b, got, max, snap - old_snap);
-			old_snap = 0;
-			stale_arm();
-			if (got)
-				return got;
-		} else if (isr & ISR_RXLEV) {
-			uint32_t c = 4 * urd(U_RFWR);
-			got = rx_words(b, got, max, c);
-			old_snap += c;
-		}
+		if (isr & ISR_RXBREAK)
+			uwr(U_CR, CR_RESET_BREAK);
 	}
-	/* nothing ended the burst: push out what sits in the packing buffer */
-	if (urd(U_SR) & SR_RXRDY || got) {
-		uwr(U_CR, CR_FORCE_STALE);
-		udelay(1000);
-		got = rx_words(b, got, max, urd(U_SNAP) - old_snap);
+	if (isr & ISR_RXSTALE) {
+		uint32_t snap = urd(U_SNAP), left = snap - old_snap;
+		uint32_t got = rx_words(left);
+		if (got != left && rx_log_budget) {
+			rx_log_budget--;
+			LX("bt rx short snap/got", snap, old_snap + got);
+		}
 		old_snap = 0;
 		stale_arm();
+		burst_end = 1;
+	} else if (isr & ISR_RXLEV) {
+		old_snap += rx_words(4 * urd(U_RFWR));
 	}
-	return got;
+	return burst_end;
 }
 
-static void log_bytes(const char *label, const uint8_t *b, uint32_t n)
+/* receive for exactly ms milliseconds, keeping everything */
+static void rx_for(uint32_t ms)
 {
-	L(label, n, n ? b[0] : 0);
-	for (uint32_t i = 0; i < n && i < 64; i += 8) {
+	uint64_t t0 = now();
+	while (ms_since(t0) < ms)
+		(void)rx_poll();
+}
+
+/*
+ * Offset of the first complete H4 event (0x04, code, plen, plen bytes) in
+ * rx[from..rxn), or -1. Bytes before it that are not 0x04 are skipped
+ * (they stay in the log).
+ */
+static int h4_event(uint32_t from, uint32_t *len)
+{
+	for (uint32_t p = from; p + 3 <= rxn; p++) {
+		if (rx[p] != 0x04)
+			continue;
+		uint32_t n = 3u + rx[p + 2];
+		if (p + n <= rxn) {
+			*len = n;
+			return (int)p;
+		}
+		return -1;	/* the event has started: wait for the rest */
+	}
+	return -1;
+}
+
+/* until a complete H4 event is in rx[] (across any number of stale events) or timeout_ms */
+static int rx_event(uint32_t timeout_ms, uint32_t *len)
+{
+	uint64_t t0 = now();
+	int at = -1;
+	while (ms_since(t0) < timeout_ms) {
+		uint32_t before = rxn;
+		if ((rx_poll() || rxn != before) && (at = h4_event(0, len)) >= 0)
+			break;
+	}
+	if (at < 0) {	/* nothing ended the last burst: push out the packing buffer */
+		uwr(U_CR, CR_FORCE_STALE);
+		udelay(1000);
+		(void)rx_poll();
+		at = h4_event(0, len);
+	}
+	return at;
+}
+
+/* every byte of rx[0..n), 8 per line, in order */
+static void log_bytes(const char *label, uint32_t n)
+{
+	L(label, n, rx_breaks << 16 | rx_errs << 8 | (rx_lost > 255 ? 255 : rx_lost));
+	for (uint32_t i = 0; i < n; i += 8) {
 		uint32_t a = 0, v = 0;
 		for (uint32_t k = 0; k < 4; k++) {
-			a = a << 8 | (i + k < n ? b[i + k] : 0);
-			v = v << 8 | (i + 4 + k < n ? b[i + 4 + k] : 0);
+			a = a << 8 | (i + k < n ? rx[i + k] : 0);
+			v = v << 8 | (i + 4 + k < n ? rx[i + 4 + k] : 0);
 		}
-		L(" bytes", a, v);	/* the bytes in order, 8 per line */
+		L(" bytes", a, v);	/* the bytes in order, 8 per line; past n: 00 padding */
 	}
 }
 
-static uint8_t rx[96];
-
-/* one HCI command, its event logged; returns the byte count */
-static uint32_t hci(const char *label, const uint8_t *cmd, uint32_t n)
+static void rx_clear(void)
 {
+	rxn = rx_lost = rx_breaks = rx_errs = 0;
+	rx_log_budget = 6;
+}
+
+/*
+ * One HCI command and its event. Stray bytes still arriving are logged
+ * first; after the event, 20 ms more are kept (a trailing event, e.g. a
+ * Command Complete after a vendor event) and logged with it. Returns the
+ * event's offset in rx[] (-1 none) and its length in *len.
+ */
+static int hci(const char *label, const uint8_t *cmd, uint32_t n, uint32_t timeout_ms, uint32_t *len)
+{
+	rx_clear();
+	rx_for(2);
+	if (rxn || rx_breaks || rx_errs)
+		log_bytes("bt rx stray", rxn);
+	rx_clear();
 	uint32_t isr = urd(U_ISR);
 	L("bt cts/isr before tx", (isr & ISR_CTS) ? 1 : 0, isr);
 	int rc = uart_tx(cmd, n, 200);
@@ -372,11 +487,16 @@ static uint32_t hci(const char *label, const uint8_t *cmd, uint32_t n)
 		LX("bt tx timeout rc/sr", (uint32_t)rc, urd(U_SR));
 		uwr(U_CR, CR_RESET_TX);
 		uwr(U_CR, CR_TX_EN);
-		return 0;
+		return -1;
 	}
-	uint32_t got = uart_rx(rx, sizeof(rx), 500);
-	log_bytes(label, rx, got);
-	return got;
+	uint64_t t0 = now();
+	int at = rx_event(timeout_ms, len);
+	uint32_t ms = ms_since(t0);
+	rx_for(20);
+	log_bytes(label, rxn);
+	logp("bt event at/len", at < 0 ? 0xffffffffu : (uint32_t)at, at < 0 ? 0 : *len, at < 0 ? -1 : 0);
+	L("bt event ms", ms, 0);
+	return at;
 }
 
 static int stop(int step, const char *why)
@@ -480,23 +600,41 @@ static int bt_run(void)
 	L("bt uart mr1/mr2", urd(U_MR1), urd(U_MR2));
 	L("bt uart ipr/dmen", urd(U_IPR), urd(U_DMEN));
 
-	/* 5. PIO setup (msm_hs_startup without the BAM): 8N1, 2400 baud, flow control off */
+	/*
+	 * 5. PIO setup (msm_hs_startup without the BAM): 8N1, auto-RFR level
+	 * fifosize 64 - 16 = 48 (boot #55 ran with MR1 0xc0 = level 0: RFR went
+	 * "not ready" with the first byte in the FIFO and the chip stopped after
+	 * 6 bytes of a 17-byte event), breaks and bad characters kept out of the
+	 * FIFO (msm_hs_probe MR2 RX_BREAK_ZERO_CHAR_OFF | RX_ERROR_CHAR_OFF; on
+	 * boot #55 the 0x00 bytes came with ISR RXBREAK set), 2400 baud, flow
+	 * control off.
+	 */
 	uwr(U_IMR, 0);
 	uwr(U_DMEN, 0);
+	L("bt uart bcr (left)", 0xc8, urd(0xc8));
+	uwr(U_MR1, MR1_RFR_LEVEL(48));
+	uwr(U_MR2, MR2_8N1 | MR2_ERROR_MODE | MR2_BREAK_ZERO_OFF | MR2_ERROR_CHAR_OFF);
 	uwr(U_CR, CR_RESET_RX);
 	uwr(U_CR, CR_RESET_TX);
 	uwr(U_CR, CR_RESET_ERR);
 	uwr(U_CR, CR_RESET_BREAK);
 	uwr(U_CR, CR_RESET_STALE);
 	uwr(U_CR, CR_RESET_CTS);
-	uwr(U_MR2, 0x74);		/* 8 bits, 1 stop, no parity, ERROR_MODE */
 	uwr(U_RFWR, 8);
 	flow(0);
 	uwr(U_IMR, ISR_RXSTALE | ISR_RXLEV);
 	set_baud(0x33, 1);		/* 2400 */
+	L("bt uart mr1/mr2 set", urd(U_MR1), urd(U_MR2));
 	L("bt uart sr/isr", urd(U_SR), urd(U_ISR));
 
-	/* 6. [E] power pulses */
+	/*
+	 * 6. [E] power pulses with flow control off (RFR "not ready"), then
+	 * flow control on and the full 100 ms boot wait (qca_send_power_pulse
+	 * msleep(100)) with everything received kept. Boot #55 ended this wait
+	 * at the first stale event (the 0x00 break byte), a few ms after the
+	 * pulse, so HCI Reset and Read_Local_Version went to a chip still
+	 * booting; only the EDL command ~1 s later was answered.
+	 */
 	static const uint8_t off_pulse[1] = { 0xc0 }, on_pulse[1] = { 0xfc };
 	rc = uart_tx(off_pulse, 1, 100);
 	logp("bt pulse 0xC0 @2400 [E]", (uint32_t)rc, urd(U_SR), rc ? -1 : 0);
@@ -504,36 +642,80 @@ static int bt_run(void)
 	set_baud(0xcc, 31);		/* 115200 */
 	rc = uart_tx(on_pulse, 1, 100);
 	logp("bt pulse 0xFC @115200 [E]", (uint32_t)rc, urd(U_SR), rc ? -1 : 0);
-	uint32_t got = uart_rx(rx, sizeof(rx), 100);	/* the 100 ms boot wait, logging anything sent */
-	log_bytes("bt rx after pulse", rx, got);
+	flow(1);
+	rx_clear();
+	rx_for(100);
+	log_bytes("bt rx boot 100ms", rxn);
 	set_baud(0xcc, 31);		/* reopen: RX/TX reset (qca_wcn3990_init closes and opens the port) */
 	flow(1);
 	L("bt flow on mr1/isr", urd(U_MR1), urd(U_ISR));
 
-	/* 7. HCI Reset -> 04 0E 04 01 03 0C 00 */
+	/* 7. HCI Reset -> 04 0E 04 01 03 0C 00; once more after 400 ms if nothing came [E] */
 	static const uint8_t reset[4] = { 0x01, 0x03, 0x0c, 0x00 };
-	got = hci("bt rx hci reset", reset, 4);
-	int reset_ok = got >= 7 && rx[0] == 0x04 && rx[1] == 0x0e && rx[4] == 0x03 && rx[5] == 0x0c && rx[6] == 0x00;
-	logp("bt HCI RESET event ok", got, reset_ok, reset_ok ? 0 : -1);
+	uint32_t len = 0;
+	int at = hci("bt rx hci reset", reset, 4, 500, &len);
+	if (at < 0) {
+		rx_clear();
+		rx_for(400);
+		if (rxn)
+			log_bytes("bt rx late", rxn);
+		at = hci("bt rx hci reset (2)", reset, 4, 500, &len);
+	}
+	const uint8_t *e = at >= 0 ? rx + at : rx;
+	int reset_ok = at >= 0 && len == 7 && e[1] == 0x0e && e[4] == 0x03 && e[5] == 0x0c && e[6] == 0x00;
+	logp("bt HCI RESET event ok", len, (uint32_t)reset_ok, reset_ok ? 0 : -1);
 	con_str("BT", reset_ok ? "HCI reset answered" : "no HCI reset answer");
 
-	/* 8. Read_Local_Version -> manufacturer 0x001D */
+	/* 8. Read_Local_Version -> 04 0E 0C 01 01 10 status hci_ver rev(2) lmp_ver manuf(2) lmp_sub(2) */
 	static const uint8_t ver[4] = { 0x01, 0x01, 0x10, 0x00 };
-	got = hci("bt rx local version", ver, 4);
-	if (got >= 15 && rx[0] == 0x04 && rx[1] == 0x0e && rx[4] == 0x01 && rx[5] == 0x10) {
-		uint32_t manuf = rx[11] | rx[12] << 8, subver = rx[13] | rx[14] << 8;
+	at = hci("bt rx local version", ver, 4, 500, &len);
+	e = at >= 0 ? rx + at : rx;
+	int ver_ok = at >= 0 && len == 15 && e[1] == 0x0e && e[4] == 0x01 && e[5] == 0x10 && e[6] == 0x00;
+	if (ver_ok) {
+		uint32_t manuf = e[11] | e[12] << 8, subver = e[13] | e[14] << 8;
 		logp("bt manufacturer/lmp sub", manuf, subver, manuf == 0x1d ? 0 : -2);
-		L("bt hci ver/rev", rx[7], (uint32_t)(rx[8] | rx[9] << 8));
+		L("bt hci ver/rev", e[7], (uint32_t)(e[8] | e[9] << 8));
+		L("bt lmp ver", e[10], 0);
+	} else {
+		LX("bt local version bad", len, at >= 0 ? e[6] : 0xff);
 	}
 
-	/* 9. Qualcomm EDL get version (0xFC00, 0x19) */
+	/*
+	 * 9. Qualcomm EDL get version (0xFC00, 0x19) -> vendor event
+	 * 04 FF 0E 00 02 + struct rome_version {le32 product_id, le16 patch_ver,
+	 * le16 rome_ver, le32 soc_id} (HMD btqca.c rome_patch_ver_req / btqca.h:
+	 * plen 2 + 12, cresp EDL_CMD_REQ_RES_EVT 0, rtype EDL_APP_VER_RES_EVT 2,
+	 * version = soc_id << 16 | rome_ver). Boot #55 got 04 ff 0e 00 02 0a
+	 * before the truncation: product id 0x0a.
+	 */
 	static const uint8_t edl[5] = { 0x01, 0x00, 0xfc, 0x01, 0x19 };
-	got = hci("bt rx edl version", edl, 5);
-	if (!got) {	/* a slow vendor event: keep listening a little longer */
-		got = uart_rx(rx, sizeof(rx), 300);
-		log_bytes("bt rx edl late", rx, got);
+	at = hci("bt rx edl version", edl, 5, 1000, &len);
+	e = at >= 0 ? rx + at : rx;
+	int edl_ok = at >= 0 && len == 17 && e[1] == 0xff && e[3] == 0x00 && e[4] == 0x02;
+	if (edl_ok) {
+		const uint8_t *d = e + 5;
+		uint32_t product = (uint32_t)d[0] | (uint32_t)d[1] << 8 | (uint32_t)d[2] << 16 | (uint32_t)d[3] << 24;
+		uint32_t patch = d[4] | d[5] << 8, rom = d[6] | d[7] << 8;
+		uint32_t soc = (uint32_t)d[8] | (uint32_t)d[9] << 8 | (uint32_t)d[10] << 16 | (uint32_t)d[11] << 24;
+		uint32_t rome = soc << 16 | rom;
+		/*
+		 * [E] firmware number as upstream btqca.c qca_uart_setup (from
+		 * memory; HMD's 4.4 btqca.c only knows rampatch_%08x for ROME):
+		 * rom_ver = (soc_ver & 0xf00) >> 4 | (soc_ver & 0xf), files
+		 * crbtfw%02x.tlv / crnv%02x.bin. bluetooth_a holds 11, 20, 21.
+		 */
+		uint32_t nn = ((rome & 0xf00) >> 4) | (rome & 0xf);
+		int have = nn == 0x11 || nn == 0x20 || nn == 0x21;
+		L("bt edl product id", product, product == 0x0a);
+		L("bt edl patch/rom ver", patch, rom);
+		L("bt edl soc id", soc, 0);
+		L("bt rome version", rome, 0);
+		logp("bt fw crbtfw/crnv NN [E]", nn, (uint32_t)have, have ? 0 : -2);
+		con_hex2("BT", "soc_ver=", rome, " crbtfw", nn);
+	} else {
+		LX("bt edl version bad", len, at >= 0 ? e[4] : 0xff);
 	}
-	return reset_ok ? 0 : -7;
+	return reset_ok && ver_ok && edl_ok ? 0 : !reset_ok ? -7 : !ver_ok ? -8 : -9;
 }
 
 int drg_bt_test(drg_log_fn log, drg_flush_fn fl)

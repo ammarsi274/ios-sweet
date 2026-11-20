@@ -16,6 +16,9 @@
  *   pil-msa.c pil_mss_make_proxy_votes / pil-q6v5.c pil_q6v5_make_proxy_votes:
  *     vdd_mx level 0x180 + enable, xo, qdss, vdd_cx level 0x180, load
  *     100 mA, enable.
+ *   Order deviation: pil_mss_reset's restart_reg 0 + clocks run before the
+ *     FIH NV / MBA assignments (steps 8-9) so the Q6 state is checked before
+ *     any memory changes hands; nothing runs until step 12 releases the core.
  *   pil-msa.c pil_mss_reset_load_mba (CONFIG_FIH_NV=y, fih_ramtable.h):
  *     FIH NV 0xAC000000 + 8 MiB -> {HLOS RW, MSS RW}; mba.mbn into a 1 MiB
  *     buffer of pil_mba_region, -> MSS RW; pil_mss_reset: restart_reg 0,
@@ -53,8 +56,11 @@
  * the modem owns at that point stays its (XNU never maps the low bank).
  *
  * Safety: assignments only inside modem_fw_region, pil_mba_region and the
- * FIH NV region, all below 4 GiB; the modem must be held in reset when the
- * test starts; every wait has a timeout; the first access to each MSS
+ * FIH NV region, all below 4 GiB; a Q6 found running (step 9: headswitch
+ * on, core out of reset, core clock on) is left alone, and RMB status left
+ * from an earlier boot is cleared with the restart cycle Linux uses on a
+ * subsystem restart (the restart register itself reads 0 after XBL/ABL,
+ * boot #55, and Linux's cold boot does not assert it); every wait has a timeout; the first access to each MSS
  * register block and to each RAM target runs on a spare core (a bus error
  * or a stall there is caught); no eMMC writes (drg_emmc_read only).
  */
@@ -396,7 +402,6 @@ static int clk_enable(int i)
 {
 	const struct clk_desc *c = &mss_clks[i];
 	uintptr_t en = GCC + c->en_reg;
-	clk_was_on[i] = (rd32(en) >> c->en_bit) & 1;
 	wr32(en, rd32(en) | (1u << c->en_bit));
 	dsb();
 	if (c->kind == CK_GATE) {
@@ -651,11 +656,20 @@ int drg_w1_test(drg_log_fn log, drg_flush_fn fl)
 	L("w1 start", 0x57310001, 0);
 	con_str("W1", "modem boot test");
 
-	/* 1. the modem must be in reset (cold boot state) */
+	/*
+	 * 1. state before anything is touched, logged only. Boot #55 read the
+	 * restart register as 0: XBL/ABL leave the MSS block reset deasserted,
+	 * and Linux does not need it asserted either (pil_mss_reset writes 0
+	 * on a cold boot without asserting first; only pil_mss_shutdown writes
+	 * 1). Whether the Q6 runs is decided in step 9 from QDSP6SS/RMB, which
+	 * can only be read with the MSS clocks on.
+	 */
 	uint32_t rr = rd32(MSS_RESTART);
 	L("w1 mss restart reg", MSS_RESTART, rr);
-	if (!(rr & 1))
-		return stop(1, "mss not in reset");
+	for (int i = 0; i < 6; i++)
+		L("w1 mss clk before", mss_clks[i].en_reg,
+		  mss_clks[i].kind == CK_BRANCH ? rd32(GCC + mss_clks[i].en_reg)
+						: (rd32(GCC + mss_clks[i].en_reg) >> mss_clks[i].en_bit) & 1);
 
 	/* 2. modem_a from the GPT */
 	uint64_t first = 0, last = 0;
@@ -775,40 +789,37 @@ int drg_w1_test(drg_log_fn log, drg_flush_fn fl)
 			return stop(7, "cx vote");
 	}
 
-	/* 8. FIH NV -> {HLOS RW, MSS RW} (pil_assign_mem_to_subsys_and_linux) */
-	if (assign("w1 asg fih nv", FIH_NV, FIH_NV_SIZE, VMID_HLOS, 0, VMID_HLOS, PERM_R | PERM_W, VMID_MSS_MSA,
-		   PERM_R | PERM_W))
-		return stop(8, "fih assign");
-
-	/* 9. MBA buffer -> MSS RW (pil_assign_mem_to_subsys) */
-	if (assign("w1 asg mba", MBA_BUF, MBA_BUF_SIZE, VMID_HLOS, 0, VMID_MSS_MSA, PERM_R | PERM_W, 0, 0))
-		return stop(9, "mba assign");
-	mba_assigned = 1;
-
-	/* 10. pil_mss_reset: restart_reg 0, 2 us, clocks */
+	/*
+	 * 8. pil_mss_reset, first half: restart_reg 0, 2 us, the 6 active
+	 * clocks. Linux does this after the FIH NV / MBA assignments; it is
+	 * done first here (independent steps: nothing runs before the Q6 core
+	 * reset is released in step 12) so that step 9 can look at the Q6
+	 * before any memory changes hands.
+	 */
 	wr32(MSS_RESTART, 0);
 	dsb();
 	udelay(2);
 	L("w1 restart reg now", MSS_RESTART, rd32(MSS_RESTART));
+	for (int i = 0; i < 6; i++)	/* all six first: a failed enable must not make clks_restore turn off one never touched */
+		clk_was_on[i] = (rd32(GCC + mss_clks[i].en_reg) >> mss_clks[i].en_bit) & 1;
 	clks_on = 1;
 	for (int i = 0; i < 6; i++)
 		if (clk_enable(i)) {
 			wr32(MSS_RESTART, 1);
 			dsb();
 			clks_restore();
-			mba_reclaim();
-			return stop(10, "clock");
+			return stop(8, "clock");
 		}
 
-	/* 11. dry read of every QDSP6SS / RMB / halt register this test touches, on a spare core */
+	/* 9. dry read of every QDSP6SS / RMB / halt register this test touches, on a spare core; is the Q6 running? */
 	{
 		static const uint16_t q6r[6] = { Q6_RESET, Q6_GFMUX, Q6_PWR_CTL, Q6_MEM_PWR_CTL, Q6_XO_CBCR, Q6_BHS_STATUS };
-		uint32_t v;
+		uint32_t v, q6v[6] = { 0 }, rmbv[9] = { 0 };
 		int bad = 0;
 		for (int i = 0; i < 6 && !bad; i++)
-			bad = safe_rd("w1 q6ss", QDSP6 + q6r[i], &v);
+			bad = safe_rd("w1 q6ss", QDSP6 + q6r[i], &q6v[i]);
 		for (uint32_t o = 0; o <= RMB_MBA_DEBUG_INFO && !bad; o += 4)
-			bad = safe_rd("w1 rmb (dry)", RMB + o, &v);
+			bad = safe_rd("w1 rmb (dry)", RMB + o, &rmbv[o / 4]);
 		uintptr_t hb[3] = { HALT_Q6, HALT_MODEM, HALT_NC };
 		for (int i = 0; i < 3 && !bad; i++)
 			for (uint32_t o = 0; o <= 8 && !bad; o += 4)
@@ -819,10 +830,66 @@ int drg_w1_test(drg_log_fn log, drg_flush_fn fl)
 			wr32(MSS_RESTART, 1);
 			dsb();
 			clks_restore();
-			mba_reclaim();
-			return stop(11, "dry read");
+			return stop(9, "dry read");
+		}
+		/*
+		 * Running = what __pil_q6v55_reset leaves behind: headswitch on
+		 * (PWR_CTL bit 24), CORE_ARES and STOP_CORE clear (RESET bits 1, 0),
+		 * core clock on (GFMUX bit 1). Such a Q6 is left alone: no restart
+		 * write, clocks back as they were (they were on).
+		 */
+		int running = (q6v[2] & (1u << 24)) && !(q6v[0] & 3u) && (q6v[1] & 2u);
+		logp("w1 q6 running?", q6v[0], q6v[1], running ? -1 : 0);
+		if (running) {
+			clks_restore();
+			return stop(9, "q6 running");
+		}
+		/*
+		 * PBL/MBA status left over (a modem booted before, then stopped
+		 * without the restart): the restart cycle of pil_mss_shutdown ->
+		 * pil_mss_reset (halt ports, restart 1, then 0), as Linux does on a
+		 * subsystem restart. The 1 ms hold is a guess [E]; Linux holds it
+		 * for at least the ramdump/powerup path between the two writes.
+		 */
+		if (rmbv[RMB_PBL_STATUS / 4] || rmbv[RMB_MBA_STATUS / 4]) {
+			LX("w1 rmb stale pbl/mba", rmbv[RMB_PBL_STATUS / 4], rmbv[RMB_MBA_STATUS / 4]);
+			halt_port(HALT_Q6);
+			halt_port(HALT_MODEM);
+			halt_port(HALT_NC);
+			wr32(MSS_RESTART, 1);
+			dsb();
+			udelay(1000);
+			wr32(MSS_RESTART, 0);
+			dsb();
+			udelay(2);
+			uint32_t pbl = rd32(RMB + RMB_PBL_STATUS), st = rd32(RMB + RMB_MBA_STATUS);
+			logp("w1 rmb after cycle", pbl, st, pbl || st ? -1 : 0);
+			if (pbl || st) {
+				wr32(MSS_RESTART, 1);
+				dsb();
+				clks_restore();
+				return stop(9, "rmb not clear");
+			}
 		}
 	}
+
+	/* 10. FIH NV -> {HLOS RW, MSS RW} (pil_assign_mem_to_subsys_and_linux) */
+	if (assign("w1 asg fih nv", FIH_NV, FIH_NV_SIZE, VMID_HLOS, 0, VMID_HLOS, PERM_R | PERM_W, VMID_MSS_MSA,
+		   PERM_R | PERM_W)) {
+		wr32(MSS_RESTART, 1);	/* undo step 8, as pil_mss_reset err_clks */
+		dsb();
+		clks_restore();
+		return stop(10, "fih assign");
+	}
+
+	/* 11. MBA buffer -> MSS RW (pil_assign_mem_to_subsys) */
+	if (assign("w1 asg mba", MBA_BUF, MBA_BUF_SIZE, VMID_HLOS, 0, VMID_MSS_MSA, PERM_R | PERM_W, 0, 0)) {
+		wr32(MSS_RESTART, 1);
+		dsb();
+		clks_restore();
+		return stop(11, "mba assign");
+	}
+	mba_assigned = 1;
 
 	/* 12. RMB image address, no debug policy, Q6 out of reset (__pil_q6v55_reset), PBL and MBA */
 	wr32(RMB + RMB_MBA_IMAGE, (uint32_t)MBA_BUF);
