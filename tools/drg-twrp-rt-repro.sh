@@ -15,7 +15,7 @@ BENCH=${1:-F:/Nokia-HackiOs/logs/drgles-bench-rt}
 V=F:/Nokia-HackiOs/research/vendor-adreno
 LOG=F:/Nokia-HackiOs/logs/twrp-rt-frames-$(date +%Y%m%d-%H%M%S).log
 export MSYS_NO_PATHCONV=1
-adb get-state | grep -qx device || { echo "no adb device (TWRP RAM boot expected)" >&2; exit 1; }
+adb get-state | grep -qxE "device|recovery" || { echo "no adb device (TWRP RAM boot expected)" >&2; exit 1; }
 adb shell 'id -u' | grep -qx 0 || { echo "adb shell is not root" >&2; exit 1; }
 adb shell 'mkdir -p /tmp/adreno /vendor/lib64/hw /vendor/firmware'
 for f in "$V"/files/lib64/*.so "$V"/files/lib64/egl/*.so; do adb push "$f" /tmp/adreno/ >/dev/null; done
