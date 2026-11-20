@@ -1932,7 +1932,11 @@ static __attribute__((unused)) void g3_replay(void)
  * the situation XNU is in. Then cap1 replayed through drgpu_map/submit/wait
  * and every object compared with Linux, as G3r did with the old code.
  */
+#ifdef DRG_GPU_RT_REPLAY
+static uint8_t core_pool[0x1000000] __attribute__((aligned(4096)));	/* + the 0xad4000 render target */
+#else
 static uint8_t core_pool[0x400000] __attribute__((aligned(4096)));
+#endif
 static uint64_t core_pool_used;
 
 static uintptr_t c_mmio(void *ctx, uint64_t pa, uint64_t len)
@@ -1992,6 +1996,13 @@ static struct drgpu_ib last_ibs[8];
 static unsigned last_n;
 static uint32_t last_ctx, last_ts;
 static uint64_t last_rt_pa, last_rt_len, last_rt_hash;
+#ifdef DRG_GPU_RT_REPLAY
+#define RT_GPUVA	0x500000000ULL
+#define RT_LEN		0xad4000ULL
+#define RT_W		1125
+#define RT_H		2436
+#define RT_BPR		4608
+#endif
 extern void (*volatile drg_irq_hook)(uint32_t intid);	/* shim.c */
 int drg_gic_spi(uint32_t intid, int on, uint32_t *grp_before, uint32_t *grp_after);
 static volatile uint32_t gpu_irqs, gpu_irq_status;
@@ -2158,6 +2169,26 @@ static void g4_core(void)
 	 * frees, maps and uploads are not applied, so that draw's memory stays as
 	 * it ran for the G4 5 redraw.
 	 */
+#ifdef DRG_GPU_RT_REPLAY
+	/*
+	 * rt1.cap (TWRP 2026-11-20, drgles -capture -owngbuf 1125 2436 5 -gbufcraft
+	 * -gbufframes 1): one frame of the iOS self-test's render-target pattern,
+	 * which Linux draws right (2,740,500 of 2,740,500) and iOS 1,324,512 of them.
+	 * The target is a gralloc import the capture does not record; its GPUOBJ_INFO
+	 * (logs/twrp-rtcap1.log): GPU address 0x500000000, 0xad4000 bytes, id 41,
+	 * stride 1152 px. Backed here by pool memory filled with 0xee (untouched).
+	 */
+	struct drgpu_mem rtm;
+	if (c_alloc(0, RT_LEN, 0x1000, &rtm) || drgpu_map(g, &space_a, RT_GPUVA, rtm.pa, RT_LEN, 0)) {
+		put("rt map failed\n");
+		con_str("G4", "FAIL rt map");
+		flush();
+		return;
+	}
+	for (uint64_t i = 0; i < RT_LEN; i++)
+		((volatile uint8_t *)(uintptr_t)rtm.pa)[i] = 0xee;
+	lv("rt pa", (uint32_t)rtm.pa);
+#endif
 	const uint8_t *last_draw = 0;
 	for (const uint8_t *q = p; q + 16 <= end && cle32(q) == 0x43475244 && q + 16 + cle32(q + 8) <= end;
 	     q += 16 + cle32(q + 8))
@@ -2292,6 +2323,44 @@ static void g4_core(void)
 	lv("gpu-written", gpuw);
 	lv("gpu-written matching", gpuw_ok);
 	lv("pool used", (uint32_t)core_pool_used);
+#ifdef DRG_GPU_RT_REPLAY
+	{
+		/* the self-test's check (bench.c stress_test), last frame k = 0 */
+		const volatile uint8_t *m = (const volatile uint8_t *)(uintptr_t)rtm.pa;
+		uint32_t good = 0, first_bad = 0xffffffff, untouched = 0;
+		char row[24];
+		put("rt map (64x64 blocks, # all right, . none, + some, ' ' untouched):\n");
+		for (int by = 0; by < (RT_H + 63) / 64; by++) {
+			for (int bx = 0; bx < (RT_W + 63) / 64; bx++) {
+				uint32_t ok = 0, n = 0, ee = 0;
+				for (int y = by * 64; y < by * 64 + 64 && y < RT_H; y++)
+					for (int x = bx * 64; x < bx * 64 + 64 && x < RT_W; x++) {
+						const volatile uint8_t *t = m + (uint64_t)y * RT_BPR + (uint64_t)x * 4;
+						int r = t[0] == (y & 0xff) && t[1] == (x >> 8) && t[2] == (x & 0xff) && t[3] == (y >> 8);
+						ok += r;
+						n++;
+						ee += t[0] == 0xee && t[1] == 0xee && t[2] == 0xee && t[3] == 0xee;
+						if (!r && first_bad == 0xffffffff)
+							first_bad = (uint32_t)(y * RT_BPR + x * 4);
+					}
+				good += ok;
+				untouched += ee;
+				row[bx] = ee == n ? ' ' : ok == n ? '#' : ok ? '+' : '.';
+			}
+			row[(RT_W + 63) / 64] = '\n';
+			row[(RT_W + 63) / 64 + 1] = 0;
+			put(row);
+		}
+		lv("rt texels right", good);
+		lv("rt texels untouched", untouched);
+		lv("rt first wrong byte", first_bad);
+		put(good == (uint32_t)RT_W * RT_H ? "G4R RESULT: PASS (our GPU core draws the render target right)\n"
+						  : "G4R RESULT: FAIL (our GPU core draws the render target wrong)\n");
+		con_hex2("G4R", "right=", good, "first=", first_bad);
+		flush();
+		return;	/* a test start: nothing after this */
+	}
+#endif
 	if (bad || executed != 3 || !compared || matched != compared || !gpuw || gpuw_ok != gpuw)
 		pass = 0;
 	if (bad) {	/* the GPU is stuck: the later stages would only hang the phone */

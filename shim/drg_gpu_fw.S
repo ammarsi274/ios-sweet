@@ -56,6 +56,9 @@ drg_zap_b02_end:
 	.balign	8
 	.global	drg_cap, drg_cap_end
 drg_cap:
-	.incbin	"cap1.bin"
+#ifndef DRG_CAP_FILE
+#define DRG_CAP_FILE "cap1.bin"
+#endif
+	.incbin	DRG_CAP_FILE
 drg_cap_end:
 	.balign	8

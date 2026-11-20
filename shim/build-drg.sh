@@ -18,10 +18,11 @@ sums=$(grep -E ' \./firmware/(a530_(pm4|pfp)\.fw|a512_zap\.(mdt|b02))$' "$FW/../
 	{ echo "error: GPU firmware missing or changed in $FW" >&2; exit 1; }
 # GPU work captured from Nokia's driver in TWRP (kept out of git), replayed by drg_gpu.c
 CAP=${DRG_GPU_CAP:-../../research/vendor-adreno/capture}
-(cd "$CAP" && grep -E ' \./capture/cap1\.bin$' SHA256SUMS | sed 's# \./capture/# #' | grep -q . &&
-	grep -E ' \./capture/cap1\.bin$' SHA256SUMS | sed 's# \./capture/# #' | sha256sum -c --quiet -) ||
-	{ echo "error: GPU capture missing or changed in $CAP" >&2; exit 1; }
-$CC $CFLAGS -I "$FW" -I "$CAP" -c drg_gpu_fw.S -o $OUT/drg_gpu_fw.o
+CAPFILE=${DRG_GPU_CAPFILE:-cap1.bin}	# rt1.cap: the 1125x2436 render-target frame (with -DDRG_GPU_RT_REPLAY)
+(cd "$CAP" && grep -F " ./capture/$CAPFILE" SHA256SUMS | sed 's# \./capture/# #' | grep -q . &&
+	grep -F " ./capture/$CAPFILE" SHA256SUMS | sed 's# \./capture/# #' | sha256sum -c --quiet -) ||
+	{ echo "error: GPU capture $CAPFILE missing or changed in $CAP" >&2; exit 1; }
+$CC $CFLAGS -I "$FW" -I "$CAP" -DDRG_CAP_FILE="\"$CAPFILE\"" -c drg_gpu_fw.S -o $OUT/drg_gpu_fw.o
 for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c emmc.c gptslot.c drg_rpm.c drg_ts.c drg_gpu.c drg_fat.c drg_part.c drg_smem.c drg_w1.c drg_bt.c drg_a1.c; do
 	$CC $CFLAGS -I ../gpu/drgpu -c $f -o $OUT/${f%.*}.o
 done
