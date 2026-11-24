@@ -1,0 +1,47 @@
+drg: IOSurface CreateChild/WrapClientImage/WrapClientMemory refused (patch 0920)
+
+Boot #58: CoreAnimation's GL path in backboardd called IOSurface selector 6
+(WrapClientImage) three times; DrgSurface answered every unknown selector
+with success and a zeroed output, so IOSurface.framework built a client
+whose state page pointer (lock result +0x08 -> client +0x70) was NULL, and
+iosurface_get_edr_factor -> IOSurfaceClientGetBulkAttachments read it:
+backboardd SIGSEGV at 0x30, x3. Selectors 1, 6 and 7 (the ones that build a
+client from the reply) now return kIOReturnUnsupported; the framework then
+returns NULL and CA's retain_image skips the wrap.
+
+diff --git a/iokit/Kernel/arm/DrgSurface.cpp b/iokit/Kernel/arm/DrgSurface.cpp
+index c911c99..672b768 100644
+--- a/iokit/Kernel/arm/DrgSurface.cpp
++++ b/iokit/Kernel/arm/DrgSurface.cpp
+@@ -46,6 +46,10 @@ enum {
+ 	kDrgSurfaceLimits             = 13,
+ 	kDrgSurfaceLookupFromPort     = 34,
+ 	kDrgSurfaceCreatePort         = 35,
++	/* answered with a lock result the framework builds a client from (patch 0920) */
++	kDrgSurfaceCreateChild        = 1,
++	kDrgSurfaceWrapClientImage    = 6,
++	kDrgSurfaceWrapClientMemory   = 7,
+ };
+ 
+ enum {
+@@ -772,6 +776,20 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		drg_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
++	case kDrgSurfaceCreateChild:
++	case kDrgSurfaceWrapClientImage:
++	case kDrgSurfaceWrapClientMemory:
++		/*
++		 * Not supported: refuse, never "succeed" with a zero lock result. IOSurface.framework
++		 * (iOS 16.7: IOSurfaceClientWrapClientImage 0x1a3986580, ...Memory 0x1a3986834,
++		 * ...CreateChild 0x1a398107c) copies the result into a new IOSurfaceClient at +0x68;
++		 * a zero result left its state page (+0x70) NULL, and CoreAnimation's GL path then read
++		 * it in IOSurfaceClientGetBulkAttachments (iosurface_get_edr_factor): backboardd SIGSEGV
++		 * at 0x30, boot #58. On an error the framework returns NULL, and CA's retain_image skips
++		 * the wrap (cbz before wrap_buffer).
++		 */
++		drg_surf_log_once("sel", selector);
++		return kIOReturnUnsupported;
+ 	default:
+ 		/* Values, notifications, ownership, timestamps...: accept and ignore. */
+ 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {

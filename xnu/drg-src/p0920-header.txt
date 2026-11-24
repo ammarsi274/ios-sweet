@@ -1,0 +1,10 @@
+drg: IOSurface CreateChild/WrapClientImage/WrapClientMemory refused (patch 0920)
+
+Boot #58: CoreAnimation's GL path in backboardd called IOSurface selector 6
+(WrapClientImage) three times; DrgSurface answered every unknown selector
+with success and a zeroed output, so IOSurface.framework built a client
+whose state page pointer (lock result +0x08 -> client +0x70) was NULL, and
+iosurface_get_edr_factor -> IOSurfaceClientGetBulkAttachments read it:
+backboardd SIGSEGV at 0x30, x3. Selectors 1, 6 and 7 (the ones that build a
+client from the reply) now return kIOReturnUnsupported; the framework then
+returns NULL and CA's retain_image skips the wrap.

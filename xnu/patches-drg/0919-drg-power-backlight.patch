@@ -12,6 +12,10 @@ The panel is an LCD: DrgFramebuffer's "display off" painted black but
 left the WLED at level 2047 (boot #53 drew 400-900 mA). Display off/on
 now also switches the WLED module (DrgBacklight.cpp, patch 0917).
 
+Power off writes PS_HOLD_RST_CTL/CTL2 as constants (0x5b=0, 500 us,
+0x5a=type, 0x5b=0x80): boots #54-#57 read them back as noise, so the
+read-modify-write could have written garbage.
+
 diff --git a/iokit/Kernel/arm/DrgFramebuffer.cpp b/iokit/Kernel/arm/DrgFramebuffer.cpp
 index 91c95cb..2bafe1f 100644
 --- a/iokit/Kernel/arm/DrgFramebuffer.cpp
@@ -57,10 +61,10 @@ index 91c95cb..2bafe1f 100644
  		break;
  	case kDrgFBSwapWait:
 diff --git a/iokit/Kernel/arm/DrgPlatformExpert.cpp b/iokit/Kernel/arm/DrgPlatformExpert.cpp
-index a2eb5ca..b267ff7 100644
+index a2eb5ca..379dc37 100644
 --- a/iokit/Kernel/arm/DrgPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/DrgPlatformExpert.cpp
-@@ -22,6 +22,165 @@ public:
+@@ -22,6 +22,169 @@ public:
  
  OSDefineMetaClassAndStructors(DrgPlatformExpert, IODTPlatformExpert);
  
@@ -183,19 +187,23 @@ index a2eb5ca..b267ff7 100644
 +	}
 +}
 +
++/*
++ * Constants, no read-modify-write (patch 0920): boots #54-#57 read PS_HOLD_RST_CTL/CTL2 back as noise
++ * on every start (10/98, 06/05, 62/77, f6/78; TWRP: 01/80 and 04/00). Linux's values: RESET_EN (0x5b
++ * bit 7) cleared, 500 us, the type in 0x5a[3:0] with the upper bits 0 (as TWRP reads them), RESET_EN set.
++ */
 +static void
 +hr_pon_type(uint8_t type)
 +{
 +	for (unsigned k = 0; k < 2; k++) {
 +		struct hr_pon *p = &hr_pons[k];
-+		uint8_t ctl = 0, ctl2 = 0;
-+		if (!p->obs || !p->chan || !hr_rd(p, 0x5a, &ctl) || !hr_rd(p, 0x5b, &ctl2)) {
++		if (!p->chan) {
 +			continue;
 +		}
-+		(void)hr_wr(p, 0x5b, ctl2 & 0x7f);
++		(void)hr_wr(p, 0x5b, 0x00);
 +		IODelay(500);
-+		(void)hr_wr(p, 0x5a, (uint8_t)((ctl & 0xf0) | type));
-+		(void)hr_wr(p, 0x5b, ctl2 | 0x80);
++		(void)hr_wr(p, 0x5a, type & 0x0f);
++		(void)hr_wr(p, 0x5b, 0x80);
 +	}
 +}
 +
@@ -226,7 +234,7 @@ index a2eb5ca..b267ff7 100644
  bool
  DrgPlatformExpert::start(IOService *provider)
  {
-@@ -29,6 +188,8 @@ DrgPlatformExpert::start(IOService *provider)
+@@ -29,6 +192,8 @@ DrgPlatformExpert::start(IOService *provider)
  	if (!IODTPlatformExpert::start(provider)) {
  		return false;
  	}

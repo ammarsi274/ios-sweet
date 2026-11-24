@@ -141,19 +141,23 @@ hr_setup(void)
 	}
 }
 
+/*
+ * Constants, no read-modify-write (patch 0920): boots #54-#57 read PS_HOLD_RST_CTL/CTL2 back as noise
+ * on every start (10/98, 06/05, 62/77, f6/78; TWRP: 01/80 and 04/00). Linux's values: RESET_EN (0x5b
+ * bit 7) cleared, 500 us, the type in 0x5a[3:0] with the upper bits 0 (as TWRP reads them), RESET_EN set.
+ */
 static void
 hr_pon_type(uint8_t type)
 {
 	for (unsigned k = 0; k < 2; k++) {
 		struct hr_pon *p = &hr_pons[k];
-		uint8_t ctl = 0, ctl2 = 0;
-		if (!p->obs || !p->chan || !hr_rd(p, 0x5a, &ctl) || !hr_rd(p, 0x5b, &ctl2)) {
+		if (!p->chan) {
 			continue;
 		}
-		(void)hr_wr(p, 0x5b, ctl2 & 0x7f);
+		(void)hr_wr(p, 0x5b, 0x00);
 		IODelay(500);
-		(void)hr_wr(p, 0x5a, (uint8_t)((ctl & 0xf0) | type));
-		(void)hr_wr(p, 0x5b, ctl2 | 0x80);
+		(void)hr_wr(p, 0x5a, type & 0x0f);
+		(void)hr_wr(p, 0x5b, 0x80);
 	}
 }
 

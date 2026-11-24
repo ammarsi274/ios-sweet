@@ -11,3 +11,7 @@ the SPMI ownership table gives it to EE 0. Panics keep their screen.
 The panel is an LCD: DrgFramebuffer's "display off" painted black but
 left the WLED at level 2047 (boot #53 drew 400-900 mA). Display off/on
 now also switches the WLED module (DrgBacklight.cpp, patch 0917).
+
+Power off writes PS_HOLD_RST_CTL/CTL2 as constants (0x5b=0, 500 us,
+0x5a=type, 0x5b=0x80): boots #54-#57 read them back as noise, so the
+read-modify-write could have written garbage.
