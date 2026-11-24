@@ -697,7 +697,17 @@ static EGLImage surface_image(IOSurfaceRef s)
 	uint32_t bpr = (uint32_t)IOSurfaceGetBytesPerRow(s), size = (uint32_t)IOSurfaceGetAllocSize(s);
 	uint32_t fourcc = IOSurfaceGetPixelFormat(s);
 	int32_t fmt = fourcc == 0x42475241 ? DRGWIN_FMT_BGRA_8888 : fourcc == 0x52474241 ? DRGWIN_FMT_RGBA_8888 : 0;
-	if (!fmt || IOSurfaceGetPlaneCount(s) > 1 || bpr % 4 || !w || !h || (uint64_t)bpr * h > size) {
+	size_t planes = IOSurfaceGetPlaneCount(s);
+	/*
+	 * 'b3a8' (boot #58: backboardd's 1125x2436 display surfaces once on the GPU, 2 planes, bpe 4, bpr 4544,
+	 * 13,893,632 B): plane 0 = 4 bytes per pixel at offset 0, plane 1 = an 8-bit alpha plane behind it.
+	 * Plane 0 is drawn as BGRA and the alpha plane left alone [E: channel order not measured].
+	 */
+	if (fourcc == 0x62336138 && planes == 2) {
+		fmt = DRGWIN_FMT_BGRA_8888;
+		planes = 1;
+	}
+	if (!fmt || planes > 1 || bpr % 4 || !w || !h || (uint64_t)bpr * h > size) {
 		if (unsupported_logged++ < 16)
 			LOG("IOSurface %u %ux%u '%c%c%c%c' bpr %u planes %zu: not supported\n", id, w, h, fourcc >> 24,
 			    fourcc >> 16 & 0xff, fourcc >> 8 & 0xff, fourcc & 0xff, bpr, IOSurfaceGetPlaneCount(s));
