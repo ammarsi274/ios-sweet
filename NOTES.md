@@ -1,5 +1,22 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> DRG (Nokia 6.1 Plus) handoff, 2026-11-24 (read first; full log: F:\Nokia-HackiOs\drg\BOOTLOG.md, newest first) <<<
+- Branch drg-port, fork `ammarsi274/ios-sweet` (`git -c credential.helper= -c "credential.helper=!gh auth git-credential"
+  push nokia drg-port`: the Windows credential manager holds another account, plain push gets 403).
+- On the phone: boot_a = #58 (kernel CI 42447376310 + shim with hw tests off), root **r27** (backboardd GPU switch:
+  crashes, see below). Safe image built, not flashed: **r28** (`/root/ipsw/ios16-root-r28.img`, backboardd on CPU).
+- Buttons: Volume Up at power-on = TWRP once (shim gptslot.c: boot_b gets the boot type GUID; ABL falls back to A
+  after). After a TWRP visit, `fastboot --set-active=a` before flashing from fastboot (else ABL hangs on the logo).
+- **GPU:** list-stride bug fixed (kgsl_ios.c 3ac80fe: KGSL lists step by sizeof(entry), not cmdsize); iOS self-test
+  draws 2,740,500/2,740,500. backboardd on the GPU crashed: IOSurface sel 6 (WrapClientImage) answered with a zero
+  result (fix = xnu patch 0920, CI 45438698318), render-thread EGL_BAD_ACCESS (c0f470f), 'b3a8' surfaces (475c745).
+  Next: kernel from CI 45438698318 + root with libdrgeagl built -DDRG_EAGL_GPU, then one boot.
+- Loader-only GPU replay (no iOS): `SHIM_CFLAGS=-DDRG_GPU_RT_REPLAY DRG_GPU_CAPFILE=rt1.cap shim/build-drg.sh`,
+  `fastboot boot`, log at userdata LBA 101,040,863 (catch with a TWRP RAM boot at once).
+- Hardware (shim tests, off by default now): modem MBA boot + TZ auth works; WCN3990 BT answers (ROM 0x201,
+  crbtfw21); BT firmware download stops at the last segment; audio amp I2C and ADSP region probe failed;
+  #57 (all tests on) panicked in XNU before userland. Wi-Fi/BT/audio in iOS: months away (reports in research/reports).
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
