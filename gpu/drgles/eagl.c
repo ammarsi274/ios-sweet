@@ -875,7 +875,8 @@ static id m_initWithAPI(id self, SEL cmd, uint64_t api, id props)
 	n_glGetIntegerv(0x8872 /* GL_MAX_TEXTURE_IMAGE_UNITS */, &units);
 	LOG("EAGLContext %p: ES3 context, GL \"%s\" \"%s\", %d texture units\n", (void *)self,
 	    n_glGetString(0x1F01), n_glGetString(0x1F02), units);
-	n_eglMakeCurrent(dpy, 0, 0, 0);	/* free for whichever thread draws */
+	if (!n_eglMakeCurrent(dpy, 0, 0, 0))	/* free for whichever thread draws */
+		LOG("initWithAPI: eglMakeCurrent(none) failed: EGL error %x\n", n_eglGetError());
 	cur = 0;
 	return self;
 }
@@ -900,9 +901,34 @@ static void *m_getMacroContextPrivate(id self, SEL cmd)
 	return c ? c->table : 0;
 }
 
-static int bind_surface(struct ectx *c, GLenum target, IOSurfaceRef s, int invert, const char *what)
+/*
+ * EAGLContext methods borrow the context and give it back. Boot #58: attachImage: (CoreAnimation
+ * attaching the display's surfaces on its setup thread) made the context current there for good, and
+ * the render thread's eglMakeCurrent failed from then on with EGL_BAD_ACCESS (0x3002): a context can
+ * be current on one thread only. The GL table calls (the render thread's own drawing) keep it.
+ */
+static struct ectx *borrow(struct ectx *c)
 {
+	struct ectx *prev = cur;
 	make_current(c);
+	return prev;
+}
+
+static void give_back(struct ectx *c, struct ectx *prev)
+{
+	if (prev == c || cur != c)
+		return;
+	if (prev) {
+		make_current(prev);
+	} else if (n_eglMakeCurrent(dpy, 0, 0, 0)) {
+		cur = 0;
+	} else {
+		LOG("give_back: eglMakeCurrent(none) failed: EGL error %x\n", n_eglGetError());
+	}
+}
+
+static int bind_surface_current(GLenum target, IOSurfaceRef s, int invert, const char *what)
+{
 	if (invert) {
 		LOG("%s: inverted surfaces not supported\n", what);
 		return 0;
@@ -917,6 +943,14 @@ static int bind_surface(struct ectx *c, GLenum target, IOSurfaceRef s, int inver
 		return 0;
 	}
 	return 1;
+}
+
+static int bind_surface(struct ectx *c, GLenum target, IOSurfaceRef s, int invert, const char *what)
+{
+	struct ectx *prev = borrow(c);
+	int ok = cur == c && bind_surface_current(target, s, invert, what);
+	give_back(c, prev);
+	return ok;
 }
 
 /* OpenGLES 0x1d3f51c60: x2 target, x3 the IOSurface (its pixel format read first), x4 invertedRender */

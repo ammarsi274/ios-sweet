@@ -54,10 +54,10 @@ ld64.lld-21 -arch arm64 -platform_version ios 16.0 16.0 -dylib -install_name /us
 
 # checks: the dylibs it loads, a dylib, iOS 16 arm64 (not arm64e), signed, ARMv8.0 only, an initialiser
 llvm-otool-21 -L "$OUT/libdrgeagl.dylib"
-llvm-otool-21 -hv "$OUT/libdrgeagl.dylib" | grep -q 'ARM64 *ALL *0x00 *DYLIB' || { echo "error: not a plain arm64 dylib" >&2; exit 1; }
-llvm-otool-21 -l "$OUT/libdrgeagl.dylib" | grep -q LC_CODE_SIGNATURE || { echo "error: not signed" >&2; exit 1; }
-llvm-otool-21 -l "$OUT/libdrgeagl.dylib" | grep -A4 LC_BUILD_VERSION | grep -q 'minos 16.0' || { echo "error: not iOS 16" >&2; exit 1; }
-llvm-otool-21 -l "$OUT/libdrgeagl.dylib" | grep -q -E 'sectname __mod_init_func|sectname __init_offsets' ||
+llvm-otool-21 -hv "$OUT/libdrgeagl.dylib" | grep 'ARM64 *ALL *0x00 *DYLIB' >/dev/null || { echo "error: not a plain arm64 dylib" >&2; exit 1; }
+llvm-otool-21 -l "$OUT/libdrgeagl.dylib" | grep LC_CODE_SIGNATURE >/dev/null || { echo "error: not signed" >&2; exit 1; }
+llvm-otool-21 -l "$OUT/libdrgeagl.dylib" | grep -A4 LC_BUILD_VERSION | grep 'minos 16.0' >/dev/null || { echo "error: not iOS 16" >&2; exit 1; }
+llvm-otool-21 -l "$OUT/libdrgeagl.dylib" | grep -E 'sectname __mod_init_func|sectname __init_offsets' >/dev/null ||
 	{ echo "error: no initialiser" >&2; exit 1; }
 PATH=/usr/lib/llvm-21/bin:$PATH MIN_LINES=1000 bash "$SRC/../../tools/check-armv80.sh" "$OUT/libdrgeagl.dylib"
 for f in libsystem libz iokit iosurface objc opengles; do printf '%s %s, ' "$(wc -l < "$OBJ/$f")" $f; done; echo

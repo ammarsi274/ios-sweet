@@ -53,10 +53,10 @@ ld64.lld-21 -arch arm64 -platform_version ios 16.0 16.0 -o "$OUT/drgles-bench" \
 
 # checks: the dylibs it loads, an LC_MAIN entry, iOS 16 arm64 (not arm64e), signed, ARMv8.0 only
 llvm-otool-21 -L "$OUT/drgles-bench"
-llvm-otool-21 -hv "$OUT/drgles-bench" | grep -q 'ARM64 *ALL' || { echo "error: not plain arm64" >&2; exit 1; }
-llvm-otool-21 -l "$OUT/drgles-bench" | grep -q LC_MAIN || { echo "error: no LC_MAIN" >&2; exit 1; }
-llvm-otool-21 -l "$OUT/drgles-bench" | grep -q LC_CODE_SIGNATURE || { echo "error: not signed" >&2; exit 1; }
-llvm-otool-21 -l "$OUT/drgles-bench" | grep -A4 LC_BUILD_VERSION | grep -q 'minos 16.0' || { echo "error: not iOS 16" >&2; exit 1; }
+llvm-otool-21 -hv "$OUT/drgles-bench" | grep 'ARM64 *ALL' >/dev/null || { echo "error: not plain arm64" >&2; exit 1; }
+llvm-otool-21 -l "$OUT/drgles-bench" | grep LC_MAIN >/dev/null || { echo "error: no LC_MAIN" >&2; exit 1; }
+llvm-otool-21 -l "$OUT/drgles-bench" | grep LC_CODE_SIGNATURE >/dev/null || { echo "error: not signed" >&2; exit 1; }
+llvm-otool-21 -l "$OUT/drgles-bench" | grep -A4 LC_BUILD_VERSION | grep 'minos 16.0' >/dev/null || { echo "error: not iOS 16" >&2; exit 1; }
 PATH=/usr/lib/llvm-21/bin:$PATH MIN_LINES=1000 bash "$SRC/../../tools/check-armv80.sh" "$OUT/drgles-bench"
 echo "imports: $(wc -l < "$OBJ/libsystem") libSystem, $(wc -l < "$OBJ/libz") libz, $(wc -l < "$OBJ/iokit") IOKit," \
 	"$(wc -l < "$OBJ/iosurface") IOSurface, $(wc -l < "$OBJ/cf") CoreFoundation"
