@@ -283,8 +283,11 @@ static void mark_fault(const char *why)
 	LOG("fault mark %s: %s (fd %d)\n", DRG_FAULT_FILE, why, fd);
 }
 
+static volatile uint64_t frame_thread;	/* the thread that ends frames: it keeps the context (MC below) */
+
 static void frame_end(void)
 {
+	frame_thread = host_thread_self();	/* this thread draws: it keeps the context (MC) */
 	double t0 = now_ms();
 	n_glFinish();
 	double t1 = now_ms();
@@ -315,7 +318,20 @@ static void frame_end(void)
  * Each makes its context current on the calling thread and calls Nokia's.
  */
 #define C struct ectx *c
-#define MC make_current(c)
+/*
+ * Boot #59: after initWithAPI released the context, CoreAnimation's GL calls on its setup thread made it
+ * current there again and nothing released it, so the render thread got EGL_BAD_ACCESS (0x3002) on every
+ * frame and the screen stayed black. Now a table call on any thread but the one that ends frames
+ * (frame_end: glFinish/presentation) gives the context back when it returns; that thread keeps it.
+ */
+static void give_back(struct ectx *c, struct ectx *prev);
+struct mc_guard { struct ectx *c, *prev; };
+static void mc_end(struct mc_guard *g)
+{
+	if (g->prev != g->c && host_thread_self() != frame_thread)
+		give_back(g->c, g->prev);
+}
+#define MC struct mc_guard mc_g __attribute__((cleanup(mc_end))) = { c, cur }; make_current(c)
 static void t_glBindTexture(C, GLenum a, GLuint b) { MC; n_glBindTexture(a, b); }
 static void t_glBlendFunc(C, GLenum a, GLenum b) { MC; n_glBlendFunc(a, b); }
 static void t_glClear(C, GLbitfield a) { MC; n_glClear(a); }
