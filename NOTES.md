@@ -5,7 +5,9 @@
   log), root **r30** (libdrgeagl -DDRG_EAGL_GPU). Boot #60: backboardd drew with the GPU ~15 min, then crashed
   (gralloc1 Lock was NULL); touch fingers 2+ were read one byte late (stuck corner touch). Both fixed in source,
   plus empty-frame skip and per-surface CPU sync in libdrgeagl (BOOTLOG 2026-11-26); not built into an image.
-  Next: kernel CI with patch 0922 + root r31 with the new libdrgeagl and bench, then one boot.
+  Next: kernel CI with patch 0922 (NOT started: permission refused 2026-11-26) + root r31 (**built**: f17c90a2,
+  /root/ipsw/ios16-root-r31.img), then build boot image #62 from the CI kernel, flash r31 + #62, one boot.
+  Bluetooth download PASSES in TWRP via Linux's UART (bt-twrp): fix the shim UART receive next. Gaps: drg/REGULAR-PHONE-GAPS.md.
 - **Boot #61 GPU log (logs/boot61/drgeagl.log) had 2 more failures, fixed 2026-11-26 in eagl.c:** CoreAnimation's
   colour-lookup filter shader uses `sampler2DRect`/`texture2DRect` (Adreno: "Reserved word", program 13 did not
   link) -> rewritten to sampler2D + `texture2D(S, (c) * drg_rinv_S)`, drg_rinv_S set per draw from the bound
