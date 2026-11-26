@@ -299,6 +299,79 @@ static void mark_fault(const char *why)
 
 static volatile uint64_t frame_thread;	/* the thread that ends frames: it keeps the context (MC below) */
 
+/*
+ * Pixel check (boots #60 and #62: GPU drawing ran without errors, 24 frames/s, but the user saw a black
+ * screen). On a few frames: what each draw used (diag_draw), then 7 pixels of the bound framebuffer as
+ * the GPU reads them back (glReadPixels) and the same pixels from the surface memory after the CPU sync
+ * (both row orders), plus a 32x32-point count of non-black pixels. Tells whether black comes from the
+ * GPU's drawing or from the CPU's view of it.
+ */
+static unsigned diag_frame;	/* non-zero while this frame is sampled */
+static GLuint cur_fbo;
+static uint32_t surface_of_tex(GLuint t);
+static GLuint fbo_color_tex(GLuint f);
+
+static GLuint diag_fbo;	/* the framebuffer the sampled frame drew into last */
+static void diag_draw(const char *what, GLenum mode, GLsizei n)
+{
+	diag_fbo = cur_fbo;
+	GLint prog = 0, tex = 0, unit = 0, vp[4] = { 0, 0, 0, 0 };
+	n_glGetIntegerv(0x8B8D /* GL_CURRENT_PROGRAM */, &prog);
+	n_glGetIntegerv(0x84E0 /* GL_ACTIVE_TEXTURE */, &unit);
+	n_glActiveTexture(0x84C0 /* GL_TEXTURE0 */);
+	n_glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+	n_glActiveTexture((GLenum)unit);
+	n_glGetIntegerv(0x0BA2 /* GL_VIEWPORT */, vp);
+	LOG("diag frame %u: %s mode %x n %d fbo %u (surface %u) program %d unit0 texture %d (surface %u) viewport %d,%d %dx%d\n",
+	    diag_frame, what, mode, n, cur_fbo, surface_of_tex(fbo_color_tex(cur_fbo)), prog, tex,
+	    surface_of_tex((GLuint)tex), vp[0], vp[1], vp[2], vp[3]);
+}
+
+static void diag_pixels(int after_sync)
+{
+	static const int pts[7][2] = { { 100, 100 }, { 562, 200 }, { 562, 1218 }, { 1000, 1218 },
+				       { 100, 1218 }, { 562, 2200 }, { 1000, 2300 } };
+	uint32_t s = surface_of_tex(fbo_color_tex(diag_fbo));
+	if (!after_sync) {
+		GLint prev = 0, rb = (GLint)diag_fbo;
+		n_glGetIntegerv(0x8CAA /* GL_READ_FRAMEBUFFER_BINDING */, &prev);
+		n_glBindFramebuffer(0x8CA8 /* GL_READ_FRAMEBUFFER */, diag_fbo);
+		char line[400];
+		int o = snprintf(line, sizeof(line), "diag frame %u: GPU read fbo %d:", diag_frame, rb);
+		for (int i = 0; i < 7; i++) {
+			uint8_t px[4] = { 0, 0, 0, 0 };
+			n_glReadPixels(pts[i][0], pts[i][1], 1, 1, 0x1908 /* GL_RGBA */, 0x1401 /* GL_UNSIGNED_BYTE */, px);
+			o += snprintf(line + o, sizeof(line) - (size_t)o, " (%d,%d)=%02x%02x%02x%02x", pts[i][0], pts[i][1], px[0],
+				      px[1], px[2], px[3]);
+		}
+		LOG("%s; GL error %x\n", line, n_glGetError());
+		n_glBindFramebuffer(0x8CA8 /* GL_READ_FRAMEBUFFER */, (GLuint)prev);
+		return;
+	}
+	uint64_t size = 0;
+	const uint8_t *va = s ? kgsl_ios_surface_va(s, &size) : 0;
+	if (!va || size < 4544ull * 2436) {
+		LOG("diag frame %u: CPU view: surface %u not mapped (va %p size %llu)\n", diag_frame, s, va,
+		    (unsigned long long)size);
+		return;
+	}
+	char line[480];
+	int o = snprintf(line, sizeof(line), "diag frame %u: CPU surface %u:", diag_frame, s);
+	for (int i = 0; i < 7; i++) {
+		const uint8_t *a = va + (size_t)pts[i][1] * 4544 + (size_t)pts[i][0] * 4;
+		const uint8_t *b = va + (size_t)(2435 - pts[i][1]) * 4544 + (size_t)pts[i][0] * 4;
+		o += snprintf(line + o, sizeof(line) - (size_t)o, " (%d,%d)=%02x%02x%02x%02x/%02x%02x%02x%02x", pts[i][0],
+			      pts[i][1], a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
+	}
+	unsigned nonblack = 0;
+	for (int y = 0; y < 32; y++)
+		for (int x = 0; x < 32; x++) {
+			const uint8_t *p = va + (size_t)(y * 2436 / 32 + 38) * 4544 + (size_t)(x * 1125 / 32 + 17) * 4;
+			nonblack += (p[0] | p[1] | p[2]) != 0;
+		}
+	LOG("%s; non-black %u of 1024 grid points\n", line, nonblack);
+}
+
 static void frame_end(void)
 {
 	frame_thread = host_thread_self();	/* this thread draws: it keeps the context (MC) */
@@ -314,6 +387,8 @@ static void frame_end(void)
 		double t0 = now_ms();
 		n_glFinish();
 		double t1 = now_ms();
+		if (diag_frame)
+			diag_pixels(0);
 		if (kgsl_ios_faulted()) {
 			LOG("GPU fault seen at a flush after %u frames: aborting backboardd (launchd restarts it on SWContext)\n",
 			    frames);
@@ -327,8 +402,12 @@ static void frame_end(void)
 			LOG("CPU sync after frame %u: wait error %d\n", frames, sr);
 		flush_ms += t1 - t0;
 		sync_ms += t2 - t1;
+		if (diag_frame)
+			diag_pixels(1);
 	}
 	frames++;
+	/* the next frame is sampled: frames 3-6 after the start, then every 600th */
+	diag_frame = (frames + 1 >= 3 && frames + 1 <= 6) || (frames + 1) % 600 == 0 ? frames + 1 : 0;
 	if (frames % 120 == 0) {
 		double t3 = now_ms();
 		uint64_t calls, bytes, ns;
@@ -423,6 +502,14 @@ static void fbo_attach(GLuint f, GLuint t)
 	fbo_tex[slot].tex = t;
 }
 
+static GLuint fbo_color_tex(GLuint f)
+{
+	for (int i = 0; i < NTRACK; i++)
+		if (f && fbo_tex[i].fbo == f)
+			return fbo_tex[i].tex;
+	return 0;
+}
+
 static GLuint bound_tex(GLenum target)
 {
 	GLint t = 0;
@@ -487,31 +574,41 @@ static void mc_end(struct mc_guard *g)
 		give_back(g->c, g->prev);
 }
 #define MC struct mc_guard mc_g __attribute__((cleanup(mc_end))) = { c, cur }; make_current(c)
-static void t_glBindTexture(C, GLenum a, GLuint b) { MC; n_glBindTexture(RT(a), b); }
+static void t_glBindTexture(C, GLenum a, GLuint b) { MC; if (diag_frame) LOG("diag frame %u: BindTexture %x %u (surface %u)\n", diag_frame, a, b, surface_of_tex(b)); n_glBindTexture(RT(a), b); }
 static void t_glBlendFunc(C, GLenum a, GLenum b) { MC; n_glBlendFunc(a, b); }
-static void t_glClear(C, GLbitfield a) { MC; drew(); n_glClear(a); }
+static void t_glClear(C, GLbitfield a) { MC; drew(); if (diag_frame) diag_draw("Clear", a, 0); n_glClear(a); }
 static void t_glClearColor(C, GLfloat r, GLfloat g, GLfloat b, GLfloat a) { MC; n_glClearColor(r, g, b, a); }
 static void t_glCopyTexSubImage2D(C, GLenum t, GLint l, GLint xo, GLint yo, GLint x, GLint y, GLsizei w, GLsizei h)
 { MC; t = RT(t); tex_written(t); n_glCopyTexSubImage2D(t, l, xo, yo, x, y, w, h); }
 static void t_glDeleteTextures(C, GLsizei n, const GLuint *t) { MC; for (GLsizei i = 0; i < n; i++) tex_forget(t[i]); n_glDeleteTextures(n, t); }
 static void t_glDisable(C, GLenum a) { MC; if (a != GL_TEXTURE_RECTANGLE) n_glDisable(a); }
 static void rect_update(void);
-static void t_glDrawArrays(C, GLenum m, GLint f, GLsizei n) { MC; drew(); rect_update(); n_glDrawArrays(m, f, n); }
-static void t_glDrawElements(C, GLenum m, GLsizei n, GLenum t, const void *p) { MC; drew(); rect_update(); n_glDrawElements(m, n, t, p); }
+static void t_glDrawArrays(C, GLenum m, GLint f, GLsizei n) { MC; drew(); rect_update(); if (diag_frame) diag_draw("DrawArrays", m, n); n_glDrawArrays(m, f, n); }
+static void t_glDrawElements(C, GLenum m, GLsizei n, GLenum t, const void *p) { MC; drew(); rect_update(); if (diag_frame) diag_draw("DrawElements", m, n); n_glDrawElements(m, n, t, p); }
 static void t_glEnable(C, GLenum a) { MC; if (a != GL_TEXTURE_RECTANGLE) n_glEnable(a); }
 static void t_glFinish(C) { MC; frame_end(); }
 static void t_glFlush(C) { MC; frame_end(); }
-static void t_glGenTextures(C, GLsizei n, GLuint *t) { MC; n_glGenTextures(n, t); }
+static void t_glGenTextures(C, GLsizei n, GLuint *t) { MC; n_glGenTextures(n, t); if (diag_frame) LOG("diag frame %u: GenTextures %d first %u\n", diag_frame, n, n > 0 ? t[0] : 0); }
 static GLenum t_glGetError(C) { MC; return n_glGetError(); }
 static void t_glGetIntegerv(C, GLenum p, GLint *v) { MC; n_glGetIntegerv(p == GL_TEXTURE_BINDING_RECTANGLE ? GL_TEXTURE_BINDING_2D : p, v); }
 static void t_glPixelStorei(C, GLenum p, GLint v) { MC; n_glPixelStorei(p, v); }
 static void t_glScissor(C, GLint x, GLint y, GLsizei w, GLsizei h) { MC; n_glScissor(x, y, w, h); }
+/* on sampled frames: an upload's size, format and how much of its first 4 KiB is non-zero */
+static void diag_upload(const char *what, GLenum t, GLsizei w, GLsizei h, GLenum f, GLenum ty, const void *p)
+{
+	unsigned nz = 0;
+	if (p)
+		for (int k = 0; k < 4096 && k < w * h * 4; k++)
+			nz += ((const uint8_t *)p)[k] != 0;
+	LOG("diag frame %u: %s target %x texture %u %dx%d format %x type %x data %p (%u of first 4096 bytes non-zero)\n",
+	    diag_frame, what, t, bound_tex(t), w, h, f, ty, p, nz);
+}
 static void t_glTexImage2D(C, GLenum t, GLint l, GLint i, GLsizei w, GLsizei h, GLint b, GLenum f, GLenum ty,
-			   const void *p) { MC; t = RT(t); tex_replaced(t); n_glTexImage2D(t, l, i, w, h, b, f, ty, p); }
+			   const void *p) { MC; t = RT(t); if (diag_frame) diag_upload("TexImage2D", t, w, h, f, ty, p); tex_replaced(t); n_glTexImage2D(t, l, i, w, h, b, f, ty, p); }
 static void t_glTexParameterf(C, GLenum t, GLenum p, GLfloat v) { MC; n_glTexParameterf(RT(t), p, v); }
 static void t_glTexParameteri(C, GLenum t, GLenum p, GLint v) { MC; n_glTexParameteri(RT(t), p, v); }
 static void t_glTexSubImage2D(C, GLenum t, GLint l, GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLenum ty,
-			      const void *p) { MC; t = RT(t); tex_written(t); n_glTexSubImage2D(t, l, x, y, w, h, f, ty, p); }
+			      const void *p) { MC; t = RT(t); if (diag_frame) diag_upload("TexSubImage2D", t, w, h, f, ty, p); tex_written(t); n_glTexSubImage2D(t, l, x, y, w, h, f, ty, p); }
 static void t_glViewport(C, GLint x, GLint y, GLsizei w, GLsizei h) { MC; n_glViewport(x, y, w, h); }
 static void t_glBlendFuncSeparate(C, GLenum a, GLenum b, GLenum d, GLenum e) { MC; n_glBlendFuncSeparate(a, b, d, e); }
 static void t_glBlendEquation(C, GLenum a) { MC; n_glBlendEquation(a); }
@@ -539,7 +636,7 @@ static GLuint t_glCreateProgram(C) { MC; return n_glCreateProgram(); }
 static void t_glAttachShader(C, GLuint p, GLuint s) { MC; n_glAttachShader(p, s); }
 static void t_glLinkProgram(C, GLuint p);
 static GLuint cur_prog;
-static void t_glUseProgram(C, GLuint p) { MC; cur_prog = p; n_glUseProgram(p); }
+static void t_glUseProgram(C, GLuint p) { MC; cur_prog = p; if (diag_frame) LOG("diag frame %u: UseProgram %u\n", diag_frame, p); n_glUseProgram(p); }
 static void t_glUniform1f(C, GLint l, GLfloat a) { MC; n_glUniform1f(l, a); }
 static void t_glUniform4f(C, GLint l, GLfloat a, GLfloat b, GLfloat d, GLfloat e) { MC; n_glUniform4f(l, a, b, d, e); }
 static void t_glUniform1i(C, GLint l, GLint a) { MC; n_glUniform1i(l, a); }
@@ -1376,11 +1473,18 @@ static int m_attachImage(id self, SEL cmd, uint64_t target, IOSurfaceRef s, _Boo
 static int m_texImageIOSurface(id self, SEL cmd, IOSurfaceRef s, uint64_t target, uint64_t ifmt, uint32_t w,
 			       uint32_t h, uint64_t fmt, uint64_t type, uint32_t plane, _Bool invert)
 {
-	(void)cmd, (void)ifmt, (void)w, (void)h, (void)fmt, (void)type;
+	(void)cmd;
 	struct ectx *c = ectx_of(self);
-	if (!c || plane != 0)
-		return 0;
-	return bind_surface(c, RT(target), s, invert, "texImageIOSurface");
+	static unsigned calls;
+	int r = !c || plane != 0 ? 0 : bind_surface(c, RT(target), s, invert, "texImageIOSurface");
+	if (calls++ < 40)
+		LOG("texImageIOSurface #%u: ctx %s surface %u '%c%c%c%c' %ux%u target %llx ifmt %llx fmt %llx type %llx plane %u "
+		    "invert %d -> %d\n", calls, c ? "ours" : "UNKNOWN", s ? IOSurfaceGetID(s) : 0,
+		    s ? IOSurfaceGetPixelFormat(s) >> 24 : '-', s ? IOSurfaceGetPixelFormat(s) >> 16 & 0xff : '-',
+		    s ? IOSurfaceGetPixelFormat(s) >> 8 & 0xff : '-', s ? IOSurfaceGetPixelFormat(s) & 0xff : '-', w, h,
+		    (unsigned long long)target, (unsigned long long)ifmt, (unsigned long long)fmt, (unsigned long long)type, plane,
+		    invert, r);
+	return r;
 }
 
 static void m_dealloc(id self, SEL cmd)
