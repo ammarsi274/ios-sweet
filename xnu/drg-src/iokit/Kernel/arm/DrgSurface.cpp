@@ -66,7 +66,14 @@ enum {
 #define DRG_SURFACE_MAX_DIM           16384
 #define DRG_SURFACE_MAX_ALLOC         (256u << 20)
 #define DRG_SURFACE_MAX_PROPS         (64u << 10)
-#define DRG_SURFACE_ROW_ALIGN         64
+/*
+ * Row (and plane offset) alignment told to IOSurface.framework (sel 13) and used for default rows. Boots #60-#64:
+ * backboardd's 1125-wide display surfaces got 4544-byte rows (1136 px) with 64, and Nokia's Adreno driver renders
+ * NOTHING into a 1136 px pitch (TWRP 2026-11-26, bench -gbufstride 1136: 0 of 2,806,784 words written; 1152 px:
+ * every texel exactly in place; Nokia's gralloc itself picks 1152 px for width 1125). 256 bytes = 64 px makes
+ * CoreAnimation choose 4608-byte rows (1152 px).
+ */
+#define DRG_SURFACE_ROW_ALIGN         256
 #define DRG_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
 #define DRG_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
 #define kIOSurfaceLockReadOnly          0x1

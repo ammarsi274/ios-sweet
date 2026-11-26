@@ -307,6 +307,7 @@ static volatile uint64_t frame_thread;	/* the thread that ends frames: it keeps 
  * GPU's drawing or from the CPU's view of it.
  */
 static unsigned diag_frame;	/* non-zero while this frame is sampled */
+static uint32_t surface_bpr(uint32_t surface);
 static GLuint cur_fbo;
 static uint32_t surface_of_tex(GLuint t);
 static GLuint fbo_color_tex(GLuint f);
@@ -350,23 +351,24 @@ static void diag_pixels(int after_sync)
 	}
 	uint64_t size = 0;
 	const uint8_t *va = s ? kgsl_ios_surface_va(s, &size) : 0;
-	if (!va || size < 4544ull * 2436) {
+	size_t bpr = surface_bpr(s);
+	if (!va || !bpr || size < (uint64_t)bpr * 2436) {
 		LOG("diag frame %u: CPU view: surface %u not mapped (va %p size %llu)\n", diag_frame, s, va,
 		    (unsigned long long)size);
 		return;
 	}
 	char line[480];
-	int o = snprintf(line, sizeof(line), "diag frame %u: CPU surface %u:", diag_frame, s);
+	int o = snprintf(line, sizeof(line), "diag frame %u: CPU surface %u (%zu bytes per row):", diag_frame, s, bpr);
 	for (int i = 0; i < 7; i++) {
-		const uint8_t *a = va + (size_t)pts[i][1] * 4544 + (size_t)pts[i][0] * 4;
-		const uint8_t *b = va + (size_t)(2435 - pts[i][1]) * 4544 + (size_t)pts[i][0] * 4;
+		const uint8_t *a = va + (size_t)pts[i][1] * bpr + (size_t)pts[i][0] * 4;
+		const uint8_t *b = va + (size_t)(2435 - pts[i][1]) * bpr + (size_t)pts[i][0] * 4;
 		o += snprintf(line + o, sizeof(line) - (size_t)o, " (%d,%d)=%02x%02x%02x%02x/%02x%02x%02x%02x", pts[i][0],
 			      pts[i][1], a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
 	}
 	unsigned nonblack = 0;
 	for (int y = 0; y < 32; y++)
 		for (int x = 0; x < 32; x++) {
-			const uint8_t *p = va + (size_t)(y * 2436 / 32 + 38) * 4544 + (size_t)(x * 1125 / 32 + 17) * 4;
+			const uint8_t *p = va + (size_t)(y * 2436 / 32 + 38) * bpr + (size_t)(x * 1125 / 32 + 17) * 4;
 			nonblack += (p[0] | p[1] | p[2]) != 0;
 		}
 	LOG("%s; non-black %u of 1024 grid points\n", line, nonblack);
@@ -1155,12 +1157,21 @@ static int load_gl(void)
 /* ---- IOSurfaces as EGLImages (drgwin.c; TWRP-measured path) ---- */
 struct simg {
 	uint32_t surface;
+	uint32_t bpr;	/* plane 0 bytes per row (the pixel check reads with it) */
 	EGLImage img;
 	int32_t handle[DRGWIN_HANDLE_INTS];
 	struct drgwin_anwb anwb;
 };
 #define NIMG 96
 static struct simg *imgs[NIMG];
+
+static uint32_t surface_bpr(uint32_t surface)
+{
+	for (int i = 0; i < NIMG; i++)
+		if (imgs[i] && imgs[i]->surface == surface)
+			return imgs[i]->bpr;
+	return 0;
+}
 static unsigned unsupported_logged;
 
 static EGLImage surface_image(IOSurfaceRef s)
@@ -1189,6 +1200,11 @@ static EGLImage surface_image(IOSurfaceRef s)
 			    fourcc >> 16 & 0xff, fourcc >> 8 & 0xff, fourcc & 0xff, bpr, IOSurfaceGetPlaneCount(s));
 		return 0;
 	}
+	/* TWRP 2026-11-26: Nokia's Adreno renders nothing into a 1136 px pitch, every texel at 1152 (patch 0923) */
+	static unsigned pitch_logged;
+	if ((bpr / 4) % 64 && pitch_logged++ < 8)
+		LOG("IOSurface %u: pitch %u px is not a multiple of 64: the GPU may not render into it (kernel without 0923?)\n",
+		    id, bpr / 4);
 	int slot = -1;
 	for (int i = 0; i < NIMG && slot < 0; i++)
 		if (!imgs[i])
@@ -1201,6 +1217,7 @@ static EGLImage surface_image(IOSurfaceRef s)
 		return 0;
 	}
 	m->surface = id;
+	m->bpr = bpr;
 	drgwin_handle(m->handle, fd, w, h, bpr / 4, h, fmt, size);
 	drgwin_anwb(&m->anwb, m->handle, w, h, bpr / 4, fmt, DRGWIN_USAGE_GPU_RENDER | DRGWIN_USAGE_GPU_TEXTURE);
 	b_gralloc_register(m->handle, 0, w, h, bpr / 4, fmt, DRGWIN_USAGE_GPU_TEXTURE);

@@ -659,6 +659,7 @@ static void anwb_ref(void *p)
  */
 static int gbuf_own, gbuf_fmt = 1, gbuf_keepmeta;	/* -gbufmeta: keep Nokia's metadata fd */
 static int gbuf_frames;	/* -gbufframes N: the iOS self-test's render-target frames into the buffer */
+static uint32_t gbuf_stride;	/* -gbufstride N: describe the buffer to EGL with N px per row (boot #64: 1136) */
 static int gbuf_craft;	/* -gbufcraft: the handle built by drgwin_handle as on iOS (rows = h), not a copy */
 static uint64_t gbuf_usage = 1ULL << 8;	/* -gbufusage N: what our GetConsumerUsage answers */
 
@@ -732,7 +733,7 @@ static int gbuf_test(EGLDisplay d)
 		if (!gbuf_keepmeta)
 			own_handle[3 + 1] = -1;	/* no metadata buffer */
 		if (gbuf_craft)
-			drgwin_handle(own_handle, nh[3], (uint32_t)w, (uint32_t)h, st, (uint32_t)h, gbuf_fmt, (uint32_t)blen);
+			drgwin_handle(own_handle, nh[3], (uint32_t)w, (uint32_t)h, gbuf_stride ? gbuf_stride : st, (uint32_t)h, gbuf_fmt, (uint32_t)blen);
 		ehnd = own_handle;
 		b_gralloc_trace = 1;
 		/*
@@ -740,7 +741,7 @@ static int gbuf_test(EGLDisplay d)
 		 * (TWRP 2026-11-02: out 0, base not mapped here). With a real address
 		 * the driver never rendered into the buffer.
 		 */
-		r = b_gralloc_register(ehnd, 0, (uint32_t)w, (uint32_t)h, st, gbuf_fmt, gbuf_usage);
+		r = b_gralloc_register(ehnd, 0, (uint32_t)w, (uint32_t)h, gbuf_stride ? gbuf_stride : st, gbuf_fmt, gbuf_usage);
 		host_log("gbuf: own module: handle %p (fd %d, metadata fd %d) registered rc %d, format %d, usage %#llx\n",
 			 ehnd, own_handle[3], own_handle[4], r, gbuf_fmt, (unsigned long long)gbuf_usage);
 	}
@@ -749,7 +750,7 @@ static int gbuf_test(EGLDisplay d)
 	b.magic = 0x5f626672;	/* '_bfr' */
 	b.version = sizeof(b);
 	b.inc = b.dec = anwb_ref;
-	b.width = w, b.height = h, b.stride = (int32_t)st, b.format = gbuf_fmt;
+	b.width = w, b.height = h, b.stride = (int32_t)(gbuf_stride ? gbuf_stride : st), b.format = gbuf_fmt;
 	b.usage_deprecated = (int32_t)(GR_PROD_GPU_RENDER | GR_CONS_GPU_TEXTURE);
 	b.layer_count = 1;
 	b.handle = ehnd;
@@ -810,12 +811,35 @@ static int gbuf_test(EGLDisplay d)
 	 * gl_FragCoord is unchanged), so that row must show the clear colour:
 	 * proof that the clear ran and went through the same buffer.
 	 */
+	if (gbuf_stride && pad)	/* the whole buffer marked: every word the GPU writes is seen */
+		for (size_t k = 0; k < blen / 4; k++)
+			pad[k] = marker;
 	glClearColor(0.2f, 0.2f, 0.2f, 0.2f);
 	glClear(GL_COLOR_BUFFER_BIT);
 	glViewport(0, 0, w, h - 1);
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 	glFinish();
 	host_log("gbuf: fbo status %x, GL error %x\n", fs, glGetError());
+	if (gbuf_stride && pad) {
+		/* where the pattern landed: each texel holds its own (x, y); decode samples under both pitches */
+		long written = 0;
+		for (size_t k = 0; k < blen / 4; k++)
+			written += pad[k] != marker;
+		host_log("gbuf: stride test: described %u px, gralloc %u px; %ld of %zu words written (%dx%d = %d)\n",
+			 gbuf_stride, st, written, blen / 4, w, h, w * h);
+		static const int sp[6][2] = { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 500, 1000 }, { 1124, 2434 }, { 0, 2434 } };
+		for (int i = 0; i < 6; i++)
+			for (int q = 0; q < 2; q++) {
+				uint32_t pitch = q ? st : gbuf_stride;
+				size_t off = (size_t)sp[i][1] * pitch + (size_t)sp[i][0];
+				if (off >= blen / 4)
+					continue;
+				uint32_t v = pad[off];
+				const unsigned char *t = (const unsigned char *)&v;
+				host_log("gbuf: stride test: pitch %u at (%d,%d) word %08x = %s(x %d, y %d)\n", pitch, sp[i][0],
+					 sp[i][1], v, v == marker ? "MARKER " : "", t[0] + 256 * t[1], t[2] + 256 * t[3]);
+			}
+	}
 
 	/* what the draw did to the padding: kept marker, a pattern texel, or something else */
 	long row_kept = 0, row_pat = 0, row_other = 0, col_kept = 0, col_pat = 0, col_other = 0;
@@ -1769,6 +1793,12 @@ static int main_(int argc, char **argv, char **envp)
 			gbuf_frames = 0;
 			for (const char *p = argv[++i]; *p >= '0' && *p <= '9'; p++)
 				gbuf_frames = gbuf_frames * 10 + (*p - '0');
+			continue;
+		}
+		if (!strcmp(argv[i], "-gbufstride") && i + 1 < argc) {
+			gbuf_stride = 0;
+			for (const char *p = argv[++i]; *p >= '0' && *p <= '9'; p++)
+				gbuf_stride = gbuf_stride * 10 + (uint32_t)(*p - '0');
 			continue;
 		}
 		if (!strcmp(argv[i], "-gbufcraft")) {
