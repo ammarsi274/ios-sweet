@@ -6,6 +6,17 @@
   (gralloc1 Lock was NULL); touch fingers 2+ were read one byte late (stuck corner touch). Both fixed in source,
   plus empty-frame skip and per-surface CPU sync in libdrgeagl (BOOTLOG 2026-11-26); not built into an image.
   Next: kernel CI with patch 0922 + root r31 with the new libdrgeagl and bench, then one boot.
+- **Boot #61 GPU log (logs/boot61/drgeagl.log) had 2 more failures, fixed 2026-11-26 in eagl.c:** CoreAnimation's
+  colour-lookup filter shader uses `sampler2DRect`/`texture2DRect` (Adreno: "Reserved word", program 13 did not
+  link) -> rewritten to sampler2D + `texture2D(S, (c) * drg_rinv_S)`, drg_rinv_S set per draw from the bound
+  texture's size (rect_rewrite/rect_link/rect_update); target GL_TEXTURE_RECTANGLE 0x84F5 mapped to 2D in every
+  texture call, attachImage and texImageIOSurface (RT()). attachImage error 500 on the first display surface:
+  pending GL errors are now drained and logged before the bind (target now in the log). Rewrite tested on the PC
+  with the real boot #61 shader. libdrgeagl -DDRG_EAGL_GPU = **52bf966b** (/root/eagl-check, -Werror, ARMv8.0 OK;
+  previous 5a2ef2f0 kept as libdrgeagl.prev-5a2ef2f0.dylib). Not on the phone yet.
+- **Off-mode charging screen WORKS (2026-11-26, boot #61 entry):** phone off with cable OUT, then cable in ->
+  ABL passes androidboot.mode=charger -> shim drg_charger_mode. `reboot -p` with the cable IN is a hard reset
+  (PON_REASON1 0x03), not the charger path, and boots iOS.
   /root/ipsw/phone55.img = the phone after boot #60 (logs/pull60/phone.txt is its chunk hash list).
 - Live log: boot-arg drgusb=2; PC: keep a WSL session running (`wsl -u root -- sleep 86400`), then
   `tools/drg-livelog.sh logs/live-bootNN.txt` (usbipd attaches 1209:0001 to WSL). drgeagl and the self-test log

@@ -121,6 +121,15 @@ typedef void *EGLDisplay, *EGLConfig, *EGLSurface, *EGLContext, *EGLImage;
 #define GL_TEXTURE_EXTERNAL_OES 0x8D65
 #define GL_TEXTURE_BINDING_2D 0x8069
 #define GL_TEXTURE_BINDING_EXTERNAL_OES 0x8D67
+#define GL_TEXTURE_RECTANGLE 0x84F5		/* Apple's ES has it; Adreno's does not (boot #61) */
+#define GL_TEXTURE_BINDING_RECTANGLE 0x84F6
+#define GL_ACTIVE_TEXTURE 0x84E0
+#define GL_TEXTURE0 0x84C0
+#define GL_TEXTURE_WIDTH 0x1000
+#define GL_TEXTURE_HEIGHT 0x1001
+#define GL_ACTIVE_UNIFORMS 0x8B86
+/* a rectangle texture is a 2D texture here; the shaders get normalized coordinates (rect_*) */
+#define RT(t) ((GLenum)(t) == GL_TEXTURE_RECTANGLE ? GL_TEXTURE_2D : (GLenum)(t))
 #define EGL_NONE 0x3038
 #define EGL_ALPHA_SIZE 0x3021
 #define EGL_BLUE_SIZE 0x3022
@@ -478,36 +487,37 @@ static void mc_end(struct mc_guard *g)
 		give_back(g->c, g->prev);
 }
 #define MC struct mc_guard mc_g __attribute__((cleanup(mc_end))) = { c, cur }; make_current(c)
-static void t_glBindTexture(C, GLenum a, GLuint b) { MC; n_glBindTexture(a, b); }
+static void t_glBindTexture(C, GLenum a, GLuint b) { MC; n_glBindTexture(RT(a), b); }
 static void t_glBlendFunc(C, GLenum a, GLenum b) { MC; n_glBlendFunc(a, b); }
 static void t_glClear(C, GLbitfield a) { MC; drew(); n_glClear(a); }
 static void t_glClearColor(C, GLfloat r, GLfloat g, GLfloat b, GLfloat a) { MC; n_glClearColor(r, g, b, a); }
 static void t_glCopyTexSubImage2D(C, GLenum t, GLint l, GLint xo, GLint yo, GLint x, GLint y, GLsizei w, GLsizei h)
-{ MC; tex_written(t); n_glCopyTexSubImage2D(t, l, xo, yo, x, y, w, h); }
+{ MC; t = RT(t); tex_written(t); n_glCopyTexSubImage2D(t, l, xo, yo, x, y, w, h); }
 static void t_glDeleteTextures(C, GLsizei n, const GLuint *t) { MC; for (GLsizei i = 0; i < n; i++) tex_forget(t[i]); n_glDeleteTextures(n, t); }
-static void t_glDisable(C, GLenum a) { MC; n_glDisable(a); }
-static void t_glDrawArrays(C, GLenum m, GLint f, GLsizei n) { MC; drew(); n_glDrawArrays(m, f, n); }
-static void t_glDrawElements(C, GLenum m, GLsizei n, GLenum t, const void *p) { MC; drew(); n_glDrawElements(m, n, t, p); }
-static void t_glEnable(C, GLenum a) { MC; n_glEnable(a); }
+static void t_glDisable(C, GLenum a) { MC; if (a != GL_TEXTURE_RECTANGLE) n_glDisable(a); }
+static void rect_update(void);
+static void t_glDrawArrays(C, GLenum m, GLint f, GLsizei n) { MC; drew(); rect_update(); n_glDrawArrays(m, f, n); }
+static void t_glDrawElements(C, GLenum m, GLsizei n, GLenum t, const void *p) { MC; drew(); rect_update(); n_glDrawElements(m, n, t, p); }
+static void t_glEnable(C, GLenum a) { MC; if (a != GL_TEXTURE_RECTANGLE) n_glEnable(a); }
 static void t_glFinish(C) { MC; frame_end(); }
 static void t_glFlush(C) { MC; frame_end(); }
 static void t_glGenTextures(C, GLsizei n, GLuint *t) { MC; n_glGenTextures(n, t); }
 static GLenum t_glGetError(C) { MC; return n_glGetError(); }
-static void t_glGetIntegerv(C, GLenum p, GLint *v) { MC; n_glGetIntegerv(p, v); }
+static void t_glGetIntegerv(C, GLenum p, GLint *v) { MC; n_glGetIntegerv(p == GL_TEXTURE_BINDING_RECTANGLE ? GL_TEXTURE_BINDING_2D : p, v); }
 static void t_glPixelStorei(C, GLenum p, GLint v) { MC; n_glPixelStorei(p, v); }
 static void t_glScissor(C, GLint x, GLint y, GLsizei w, GLsizei h) { MC; n_glScissor(x, y, w, h); }
 static void t_glTexImage2D(C, GLenum t, GLint l, GLint i, GLsizei w, GLsizei h, GLint b, GLenum f, GLenum ty,
-			   const void *p) { MC; tex_replaced(t); n_glTexImage2D(t, l, i, w, h, b, f, ty, p); }
-static void t_glTexParameterf(C, GLenum t, GLenum p, GLfloat v) { MC; n_glTexParameterf(t, p, v); }
-static void t_glTexParameteri(C, GLenum t, GLenum p, GLint v) { MC; n_glTexParameteri(t, p, v); }
+			   const void *p) { MC; t = RT(t); tex_replaced(t); n_glTexImage2D(t, l, i, w, h, b, f, ty, p); }
+static void t_glTexParameterf(C, GLenum t, GLenum p, GLfloat v) { MC; n_glTexParameterf(RT(t), p, v); }
+static void t_glTexParameteri(C, GLenum t, GLenum p, GLint v) { MC; n_glTexParameteri(RT(t), p, v); }
 static void t_glTexSubImage2D(C, GLenum t, GLint l, GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLenum ty,
-			      const void *p) { MC; tex_written(t); n_glTexSubImage2D(t, l, x, y, w, h, f, ty, p); }
+			      const void *p) { MC; t = RT(t); tex_written(t); n_glTexSubImage2D(t, l, x, y, w, h, f, ty, p); }
 static void t_glViewport(C, GLint x, GLint y, GLsizei w, GLsizei h) { MC; n_glViewport(x, y, w, h); }
 static void t_glBlendFuncSeparate(C, GLenum a, GLenum b, GLenum d, GLenum e) { MC; n_glBlendFuncSeparate(a, b, d, e); }
 static void t_glBlendEquation(C, GLenum a) { MC; n_glBlendEquation(a); }
 static void t_glActiveTexture(C, GLenum a) { MC; n_glActiveTexture(a); }
 static void t_glCompressedTexImage2D(C, GLenum t, GLint l, GLenum i, GLsizei w, GLsizei h, GLint b, GLsizei n,
-				     const void *p) { MC; n_glCompressedTexImage2D(t, l, i, w, h, b, n, p); }
+				     const void *p) { MC; t = RT(t); tex_replaced(t); n_glCompressedTexImage2D(t, l, i, w, h, b, n, p); }
 static void t_glFinishObjectAPPLE(C, GLenum o, GLint n) { MC; n_glFinish(); }
 static void t_glVertexAttribPointer(C, GLuint i, GLint s, GLenum t, GLboolean n, GLsizei st, const void *p)
 { MC; n_glVertexAttribPointer(i, s, t, n, st, p); }
@@ -528,7 +538,8 @@ static void t_glShaderSource(C, GLuint s, GLsizei n, const GLchar *const *src, c
 static GLuint t_glCreateProgram(C) { MC; return n_glCreateProgram(); }
 static void t_glAttachShader(C, GLuint p, GLuint s) { MC; n_glAttachShader(p, s); }
 static void t_glLinkProgram(C, GLuint p);
-static void t_glUseProgram(C, GLuint p) { MC; n_glUseProgram(p); }
+static GLuint cur_prog;
+static void t_glUseProgram(C, GLuint p) { MC; cur_prog = p; n_glUseProgram(p); }
 static void t_glUniform1f(C, GLint l, GLfloat a) { MC; n_glUniform1f(l, a); }
 static void t_glUniform4f(C, GLint l, GLfloat a, GLfloat b, GLfloat d, GLfloat e) { MC; n_glUniform4f(l, a, b, d, e); }
 static void t_glUniform1i(C, GLint l, GLint a) { MC; n_glUniform1i(l, a); }
@@ -544,8 +555,8 @@ static void t_glBindFramebuffer(C, GLenum t, GLuint f) { MC; if (t == GL_FRAMEBU
 static void t_glDeleteFramebuffers(C, GLsizei n, const GLuint *f) { MC; for (GLsizei i = 0; i < n; i++) fbo_forget(f[i]); n_glDeleteFramebuffers(n, f); }
 static void t_glGenFramebuffers(C, GLsizei n, GLuint *f) { MC; n_glGenFramebuffers(n, f); }
 static void t_glFramebufferTexture2D(C, GLenum t, GLenum a, GLenum tt, GLuint tex, GLint l)
-{ MC; if (a == GL_COLOR_ATTACHMENT0) fbo_attach(cur_fbo, tex); n_glFramebufferTexture2D(t, a, tt, tex, l); }
-static void t_glGenerateMipmap(C, GLenum t) { MC; tex_written(t); n_glGenerateMipmap(t); }
+{ MC; if (a == GL_COLOR_ATTACHMENT0) fbo_attach(cur_fbo, tex); n_glFramebufferTexture2D(t, a, RT(tt), tex, l); }
+static void t_glGenerateMipmap(C, GLenum t) { MC; t = RT(t); tex_written(t); n_glGenerateMipmap(t); }
 /* GL_APPLE_sync = ES3 sync objects (same semantics); not advertised, so CoreAnimation should not call them */
 static GLsync t_glFenceSync(C, GLenum cond, GLbitfield f) { MC; return n_glFenceSync(cond, f); }
 static void t_glDeleteSync(C, GLsync s) { MC; n_glDeleteSync(s); }
@@ -607,6 +618,204 @@ static void make_extensions(void)
  * logged with the source (first 8), the only way to see them.
  */
 static unsigned shader_fails;
+
+/*
+ * Rectangle textures (boot #61: CoreAnimation's colour lookup filter, "uniform lowp sampler2DRect
+ * texture0; ... texture2DRect(texture0, texcoord0_0)", did not compile on Adreno: "Reserved word").
+ * The texture is an ordinary 2D texture here (RT()); the shader gets sampler2D and
+ * texture2D(S, (coord) * drg_rinv_S), where drg_rinv_S = 1 / the size of the texture bound to S's unit,
+ * set before each draw with that program (rect_update).
+ */
+#define RECT_NAMES 4
+#define RECT_PROGS 16
+static struct { GLuint prog; int n; GLint samp[RECT_NAMES], rinv[RECT_NAMES]; } rprog[RECT_PROGS];
+
+static int ident_char(char ch)
+{
+	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_';
+}
+
+static size_t count_of(const char *s, const char *w)
+{
+	size_t n = 0, l = strlen(w);
+	for (const char *p = strstr(s, w); p; p = strstr(p + l, w))
+		n++;
+	return n;
+}
+
+/* a new source with the rectangle samplers rewritten (host_free it), or 0 if there are none or it fails */
+static char *rect_rewrite(const char *all)
+{
+	static const char T[] = "sampler2DRect", F[] = "texture2DRect";
+	if (!strstr(all, T))
+		return 0;
+	char names[RECT_NAMES][32];
+	int nn = 0;
+	for (const char *p = strstr(all, T); p; p = strstr(p + sizeof(T) - 1, T)) {
+		const char *q = p + sizeof(T) - 1;
+		while (*q == ' ' || *q == '\t')
+			q++;
+		size_t l = 0;
+		while (ident_char(q[l]))
+			l++;
+		if (!l || l >= sizeof(names[0]) || nn >= RECT_NAMES) {
+			LOG("rect: sampler declaration not understood (or more than %d)\n", RECT_NAMES);
+			return 0;
+		}
+		memcpy(names[nn], q, l);
+		names[nn++][l] = 0;
+	}
+	if (strstr(all, "texture2DRectProj")) {
+		LOG("rect: texture2DRectProj not supported\n");
+		return 0;
+	}
+	size_t total = strlen(all), calls = count_of(all, F);
+	size_t cap = total + (size_t)nn * 64 + calls * 64 + 1;
+	char *out = host_alloc(cap);
+	if (!out)
+		return 0;
+	size_t o = 0;
+	int declared = 0;
+	for (const char *p = all; *p;) {
+		if (!declared && !strncmp(p, T, sizeof(T) - 1)) {
+			/* the uniforms go right before the line of the first rectangle sampler (global scope) */
+			size_t ls = o;
+			while (ls && out[ls - 1] != '\n')
+				ls--;
+			char decl[RECT_NAMES * 64];
+			size_t dl = 0;
+			for (int i = 0; i < nn; i++)
+				dl += (size_t)snprintf(decl + dl, sizeof(decl) - dl, "uniform highp vec2 drg_rinv_%s;\n", names[i]);
+			memmove(out + ls + dl, out + ls, o - ls);
+			memcpy(out + ls, decl, dl);
+			o += dl;
+			declared = 1;
+		}
+		if (!strncmp(p, T, sizeof(T) - 1) && (p == all || !ident_char(p[-1]))) {
+			memcpy(out + o, "sampler2D", 9);
+			o += 9;
+			p += sizeof(T) - 1;
+			continue;
+		}
+		if (!strncmp(p, F, sizeof(F) - 1) && (p == all || !ident_char(p[-1]))) {
+			const char *q = p + sizeof(F) - 1;
+			while (*q == ' ' || *q == '\t')
+				q++;
+			if (*q != '(')
+				goto fail;
+			q++;
+			while (*q == ' ' || *q == '\t')
+				q++;
+			size_t l = 0;
+			while (ident_char(q[l]))
+				l++;
+			const char *a = q + l;
+			while (*a == ' ' || *a == '\t')
+				a++;
+			if (!l || l >= 32 || *a != ',')
+				goto fail;
+			/* the coordinate: up to the matching ')' */
+			const char *b = a + 1;
+			int depth = 0;
+			for (; *b && !(depth == 0 && *b == ')'); b++)
+				depth += *b == '(' ? 1 : *b == ')' ? -1 : 0;
+			if (*b != ')')
+				goto fail;
+			o += (size_t)snprintf(out + o, cap - o, "texture2D(%.*s, (%.*s) * drg_rinv_%.*s)", (int)l, q,
+					     (int)(b - a - 1), a + 1, (int)l, q);
+			p = b + 1;
+			continue;
+		}
+		out[o++] = *p++;
+	}
+	out[o] = 0;
+	return out;
+fail:
+	LOG("rect: texture2DRect call not understood\n");
+	host_free(out);
+	return 0;
+}
+
+/* after a link: the program's drg_rinv_S uniforms and their samplers */
+static void rect_link(GLuint p)
+{
+	static void (*active)(GLuint, GLuint, GLsizei, GLsizei *, GLint *, GLenum *, GLchar *);
+	if (!active)
+		*(void **)&active = drg_elf_sym(0, "glGetActiveUniform");
+	for (int i = 0; i < RECT_PROGS; i++)
+		if (rprog[i].prog == p)
+			rprog[i].prog = 0;	/* relinked: its old entry goes */
+	GLint nu = 0;
+	n_glGetProgramiv(p, GL_ACTIVE_UNIFORMS, &nu);
+	int n = 0;
+	GLint samp[RECT_NAMES], rinv[RECT_NAMES];
+	for (GLint i = 0; active && i < nu && n < RECT_NAMES; i++) {
+		char name[64];
+		GLsizei l = 0;
+		GLint size = 0;
+		GLenum type = 0;
+		active(p, (GLuint)i, sizeof(name), &l, &size, &type, name);
+		if (l <= 9 || strncmp(name, "drg_rinv_", 9))
+			continue;
+		rinv[n] = n_glGetUniformLocation(p, name);
+		samp[n] = n_glGetUniformLocation(p, name + 9);
+		if (rinv[n] >= 0 && samp[n] >= 0)
+			n++;
+	}
+	if (!n)
+		return;
+	int slot = -1;
+	for (int i = 0; i < RECT_PROGS && slot < 0; i++)
+		if (!rprog[i].prog)
+			slot = i;
+	if (slot < 0) {
+		LOG("rect: more than %d programs with rectangle textures: program %u not tracked\n", RECT_PROGS, p);
+		return;
+	}
+	rprog[slot].prog = p;
+	rprog[slot].n = n;
+	memcpy(rprog[slot].samp, samp, sizeof(samp));
+	memcpy(rprog[slot].rinv, rinv, sizeof(rinv));
+	LOG("rect: program %u: %d rectangle sampler(s)\n", p, n);
+}
+
+/* before a draw: 1 / size of the texture on each rectangle sampler's unit */
+static void rect_update(void)
+{
+	static void (*getu)(GLuint, GLint, GLint *);
+	static void (*level)(GLenum, GLint, GLenum, GLint *);
+	static unsigned sizeless;
+	if (!cur_prog)
+		return;
+	for (int i = 0; i < RECT_PROGS; i++) {
+		if (rprog[i].prog != cur_prog)
+			continue;
+		if (!getu)
+			*(void **)&getu = drg_elf_sym(0, "glGetUniformiv");
+		if (!level)
+			*(void **)&level = drg_elf_sym(0, "glGetTexLevelParameteriv");
+		if (!getu || !level)
+			return;
+		GLint act = GL_TEXTURE0;
+		n_glGetIntegerv(GL_ACTIVE_TEXTURE, &act);
+		for (int k = 0; k < rprog[i].n; k++) {
+			GLint unit = 0, w = 0, h = 0;
+			getu(cur_prog, rprog[i].samp[k], &unit);
+			n_glActiveTexture((GLenum)(GL_TEXTURE0 + unit));
+			level(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+			level(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+			if (w > 0 && h > 0) {
+				GLfloat v[2] = { 1.0f / (GLfloat)w, 1.0f / (GLfloat)h };
+				n_glUniform2fv(rprog[i].rinv[k], 1, v);
+			} else if (sizeless++ < 8) {
+				LOG("rect: program %u unit %d: texture without a size (%dx%d)\n", cur_prog, unit, w, h);
+			}
+		}
+		n_glActiveTexture((GLenum)act);
+		return;
+	}
+}
+
 static void t_glShaderSource(C, GLuint s, GLsizei n, const GLchar *const *src, const GLint *len)
 {
 	MC;
@@ -632,6 +841,12 @@ static void t_glShaderSource(C, GLuint s, GLsizei n, const GLchar *const *src, c
 		at += l;
 	}
 	all[at] = 0;
+	char *rect = rect_rewrite(all);
+	if (rect) {
+		host_free(all);
+		all = rect;
+		at = total = strlen(all);
+	}
 	size_t ins = 0;
 	for (const char *p = all; *p;) {
 		const char *e = strchr(p, '\n');
@@ -703,6 +918,8 @@ static void t_glLinkProgram(C, GLuint p)
 		n_glGetProgramInfoLog(p, sizeof(log), 0, log);
 		LOG("program %u does not link: %s\n", p, log);
 	}
+	if (ok)
+		rect_link(p);
 }
 #undef C
 #undef MC
@@ -1147,7 +1364,7 @@ static int m_attachImage(id self, SEL cmd, uint64_t target, IOSurfaceRef s, _Boo
 	struct ectx *c = ectx_of(self);
 	if (c && s)	/* the display's surfaces: the GPU draws them, the display reads them (kgsl_ios_cpu_sync) */
 		kgsl_ios_surface_gpu_written(IOSurfaceGetID(s));
-	return c ? bind_surface(c, (GLenum)target, s, inverted, "attachImage") : 0;
+	return c ? bind_surface(c, RT(target), s, inverted, "attachImage") : 0;
 }
 
 /*
@@ -1163,7 +1380,7 @@ static int m_texImageIOSurface(id self, SEL cmd, IOSurfaceRef s, uint64_t target
 	struct ectx *c = ectx_of(self);
 	if (!c || plane != 0)
 		return 0;
-	return bind_surface(c, (GLenum)target, s, invert, "texImageIOSurface");
+	return bind_surface(c, RT(target), s, invert, "texImageIOSurface");
 }
 
 static void m_dealloc(id self, SEL cmd)
