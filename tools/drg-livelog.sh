@@ -11,7 +11,7 @@ U="/c/Program Files/usbipd-win/usbipd.exe"
 echo "waiting for the phone's iOS USB device (1209:0001)..."
 until "$U" list 2>/dev/null | grep -qi '1209:0001'; do sleep 1; done
 "$U" attach --wsl --hardware-id 1209:0001 || { echo "usbipd attach failed"; exit 1; }
-WLOG=$(echo "$LOG" | sed 's#^/\([a-z]\)/#/mnt//#')	# /f/... -> /mnt/f/...
+WLOG=$(echo "$LOG" | sed 's#^/\([a-z]\)/#/mnt/\1/#')	# /f/... -> /mnt/f/...
 MSYS_NO_PATHCONV=1 wsl -u root -- modprobe -a usbip-core vhci-hcd cdc_ether 2>/dev/null
 MSYS_NO_PATHCONV=1 wsl -u root -- bash -s "$WLOG" <<'W'
 for i in $(seq 1 30); do
