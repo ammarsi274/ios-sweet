@@ -11,7 +11,9 @@ U="/c/Program Files/usbipd-win/usbipd.exe"
 echo "waiting for the phone's iOS USB device (1209:0001)..."
 until "$U" list 2>/dev/null | grep -qi '1209:0001'; do sleep 1; done
 "$U" attach --wsl --hardware-id 1209:0001 || { echo "usbipd attach failed"; exit 1; }
-MSYS_NO_PATHCONV=1 wsl -u root -- bash -s "$(wslpath -a "$LOG" 2>/dev/null || echo /mnt/f/Nokia-HackiOs/logs/live.txt)" <<'W'
+WLOG=$(echo "$LOG" | sed 's#^/\([a-z]\)/#/mnt//#')	# /f/... -> /mnt/f/...
+MSYS_NO_PATHCONV=1 wsl -u root -- modprobe -a usbip-core vhci-hcd cdc_ether 2>/dev/null
+MSYS_NO_PATHCONV=1 wsl -u root -- bash -s "$WLOG" <<'W'
 for i in $(seq 1 30); do
 	IF=$(for d in /sys/class/net/*; do [ "$(basename "$(readlink -f $d/device/driver 2>/dev/null)")" = cdc_ether ] && basename $d; done | head -1)
 	[ -n "$IF" ] && break; sleep 1
