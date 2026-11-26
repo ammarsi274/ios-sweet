@@ -14,6 +14,14 @@
   pending GL errors are now drained and logged before the bind (target now in the log). Rewrite tested on the PC
   with the real boot #61 shader. libdrgeagl -DDRG_EAGL_GPU = **52bf966b** (/root/eagl-check, -Werror, ARMv8.0 OK;
   previous 5a2ef2f0 kept as libdrgeagl.prev-5a2ef2f0.dylib). Not on the phone yet.
+  **TWRP check PASS (2026-11-26, gpu/twrp-probe/rect-probe.c + build-rect.sh, rewrite code extracted from eagl.c):**
+  on Nokia's Adreno driver (ES3 context) the rewritten boot #61 shader compiles and links (drg_rinv_texture0 active);
+  a 50x30 texture drawn back through the rewritten rect sample = 0 of 6000 bytes differ, plain and EGLImage-backed;
+  glGetTexLevelParameteriv gives 50x30 for both. Adreno answers glBindTexture(GL_TEXTURE_RECTANGLE) with 0x500 =
+  the attachImage error code. TWRP run notes: `export MSYS_NO_PATHCONV=1` for adb push (else /tmp/... becomes a
+  Windows path); TWRP's ro.board.platform is empty, so copy gralloc.sdm660.so to /vendor/lib64/hw/gralloc.qcom.so.
+- **User rule (2026-11-26): no CI build / root build / boot until Wi-Fi, Bluetooth and camera fixes are applied,
+  the GPU is completely fixed and the touch fix is in.** Everything is batched into ONE build + boot.
 - **Off-mode charging screen WORKS (2026-11-26, boot #61 entry):** phone off with cable OUT, then cable in ->
   ABL passes androidboot.mode=charger -> shim drg_charger_mode. `reboot -p` with the cable IN is a hard reset
   (PON_REASON1 0x03), not the charger path, and boots iOS.
