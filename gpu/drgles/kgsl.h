@@ -54,6 +54,14 @@ void kgsl_ios_surface_gpu_written(uint32_t surface);
  * number of surfaces invalidated, or a negative errno if a wait failed (they are invalidated anyway).
  */
 int kgsl_ios_cpu_sync(void);
+/*
+ * kgsl_ios.c only (libdrgeagl, boot #60: 10.8 ms per frame invalidating both 13.9 MB display surfaces
+ * every frame): with tracking on, kgsl_ios_cpu_sync invalidates only marked surfaces made dirty since
+ * the last sync (kgsl_ios_surface_dirty; id 0 = all marked surfaces), then clears the dirty set. Off
+ * (the bench's self-test): every marked surface, as before.
+ */
+void kgsl_ios_dirty_tracking(int on);
+void kgsl_ios_surface_dirty(uint32_t surface);
 /* totals since start: cpu_sync calls, bytes invalidated by them, ns spent in their dc civac loops */
 void kgsl_ios_sync_stats(uint64_t *calls, uint64_t *bytes, uint64_t *ns);
 /* kgsl_ios.c only: the task address of a live import of `surface` (the GPU's address too), or 0 */

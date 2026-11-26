@@ -678,6 +678,43 @@ static int marked(uint32_t surface)
 	return 0;
 }
 
+/* dirty set for kgsl_ios_dirty_tracking (kgsl.h) */
+static int dirty_tracking, dirty_all;
+static uint32_t dirty[NSURF];
+static unsigned ndirty;
+
+void kgsl_ios_dirty_tracking(int on)
+{
+	dirty_tracking = on;
+}
+
+void kgsl_ios_surface_dirty(uint32_t surface)
+{
+	if (!surface) {
+		dirty_all = 1;
+		return;
+	}
+	for (unsigned i = 0; i < ndirty; i++)
+		if (dirty[i] == surface)
+			return;
+	if (ndirty < NSURF)
+		dirty[ndirty++] = surface;
+	else
+		dirty_all = 1;
+}
+
+static int needs_sync(uint32_t surface)
+{
+	if (!marked(surface))
+		return 0;
+	if (!dirty_tracking || dirty_all)
+		return 1;
+	for (unsigned i = 0; i < ndirty; i++)
+		if (dirty[i] == surface)
+			return 1;
+	return 0;
+}
+
 static int64_t now_ns(void)
 {
 	struct host_ts t;
@@ -711,7 +748,7 @@ int kgsl_ios_cpu_sync(void)
 			continue;
 		for (uint32_t i = 0; i < d->nobjs; i++) {
 			struct kobj *o = &d->objs[i];
-			if (o->live && o->imports && marked(o->surface)) {
+			if (o->live && o->imports && needs_sync(o->surface)) {
 				flush_range(o->va, o->size);
 				bytes += o->size;
 				n++;
@@ -719,6 +756,8 @@ int kgsl_ios_cpu_sync(void)
 		}
 	}
 	dsb_sy();
+	ndirty = 0;
+	dirty_all = 0;
 	cs_calls++;
 	cs_bytes += bytes;
 	cs_ns += now_ns() - t0;

@@ -1,0 +1,9 @@
+drg: touch fingers 2+ at 0x8157 (patch 0922)
+
+Boot #60: after the first tap, a second contact streamed at 1079,2279
+(the clamp), ids cycling 2-9: drg_ts.c read finger i >= 1 from
+0x8158 + 8 (i - 1), one byte late, so its id came from x lo and its
+x and y from the next bytes. HMD's gt9xx.c reads 12 bytes from 0x814E
+and the rest from 0x814E + 10 into point_data[12]: finger i is at
+0x814F + 8 i. Also drops reports with more than 10 fingers, as
+gt9xx.c ("Invalid touch state").

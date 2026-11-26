@@ -117,6 +117,10 @@ typedef void *EGLDisplay, *EGLConfig, *EGLSurface, *EGLContext, *EGLImage;
 #define GL_FRAMEBUFFER 0x8D40
 #define GL_COLOR_ATTACHMENT0 0x8CE0
 #define GL_FRAMEBUFFER_COMPLETE 0x8CD5
+#define GL_DRAW_FRAMEBUFFER 0x8CA9
+#define GL_TEXTURE_EXTERNAL_OES 0x8D65
+#define GL_TEXTURE_BINDING_2D 0x8069
+#define GL_TEXTURE_BINDING_EXTERNAL_OES 0x8D67
 #define EGL_NONE 0x3038
 #define EGL_ALPHA_SIZE 0x3021
 #define EGL_BLUE_SIZE 0x3022
@@ -270,6 +274,7 @@ static void make_current(struct ectx *c)
 
 /* ---- frames: flush = finish (the panel copy must see a whole frame), fault check, timing ---- */
 static double flush_ms, sync_ms, last_flush;
+static unsigned frame_work, win_draws, win_empty;	/* GL work since the last frame end; per 120-frame window */
 static unsigned frames, sync_errs;
 
 /* the next boot's self-test reruns, and until then this library stays off (verdict.h) */
@@ -288,29 +293,170 @@ static volatile uint64_t frame_thread;	/* the thread that ends frames: it keeps 
 static void frame_end(void)
 {
 	frame_thread = host_thread_self();	/* this thread draws: it keeps the context (MC) */
-	double t0 = now_ms();
-	n_glFinish();
-	double t1 = now_ms();
-	if (kgsl_ios_faulted()) {
-		LOG("GPU fault seen at a flush after %u frames: aborting backboardd (launchd restarts it on SWContext)\n",
-		    frames);
-		mark_fault("GPU fault in backboardd\n");
-		abort();
+	/*
+	 * Nothing drawn or uploaded since the last frame end: the GPU has nothing new for the display, so
+	 * no finish and no CPU sync (boot #60: 24 frame ends a second while idle, 10.8 ms of sync each).
+	 */
+	int empty = !frame_work;
+	frame_work = 0;
+	if (empty) {
+		win_empty++;
+	} else {
+		double t0 = now_ms();
+		n_glFinish();
+		double t1 = now_ms();
+		if (kgsl_ios_faulted()) {
+			LOG("GPU fault seen at a flush after %u frames: aborting backboardd (launchd restarts it on SWContext)\n",
+			    frames);
+			mark_fault("GPU fault in backboardd\n");
+			abort();
+		}
+		/* the render targets this frame wrote (attachImage surfaces), before the display reads them */
+		int sr = kgsl_ios_cpu_sync();
+		double t2 = now_ms();
+		if (sr < 0 && sync_errs++ < 8)
+			LOG("CPU sync after frame %u: wait error %d\n", frames, sr);
+		flush_ms += t1 - t0;
+		sync_ms += t2 - t1;
 	}
-	/* the render targets (attachImage surfaces) as the GPU wrote them, before the display reads them */
-	int sr = kgsl_ios_cpu_sync();
-	double t2 = now_ms();
-	if (sr < 0 && sync_errs++ < 8)
-		LOG("CPU sync after frame %u: wait error %d\n", frames, sr);
 	frames++;
-	flush_ms += t1 - t0;
-	sync_ms += t2 - t1;
 	if (frames % 120 == 0) {
-		LOG("%u frames; last 120: %.1f ms between flushes, %.2f ms waiting for the GPU and %.2f ms CPU sync each\n",
-		    frames, (t2 - last_flush) / 120, flush_ms / 120, sync_ms / 120);
+		double t3 = now_ms();
+		uint64_t calls, bytes, ns;
+		static uint64_t last_bytes;
+		kgsl_ios_sync_stats(&calls, &bytes, &ns);
+		LOG("%u frames; last 120: %.1f ms between frame ends, %u empty, %u draws; per frame %.2f ms waiting "
+		    "for the GPU, %.2f ms CPU sync; %llu MiB invalidated\n", frames, (t3 - last_flush) / 120, win_empty,
+		    win_draws, flush_ms / 120, sync_ms / 120, (unsigned long long)((bytes - last_bytes) >> 20));
+		last_bytes = bytes;
 		flush_ms = sync_ms = 0;
-		last_flush = t2;
+		win_empty = win_draws = 0;
+		last_flush = t3;
 	}
+}
+
+/*
+ * What each frame wrote (boot #60: frame_end invalidated both 13.9 MB display surfaces every frame,
+ * 10.8 ms, also for frames that drew nothing). Textures backed by an attachImage surface, the colour
+ * texture of each framebuffer, the bound draw framebuffer: a draw marks only its target's surface
+ * dirty (kgsl_ios_surface_dirty), anything not known marks all of them (id 0). One EGL context draws
+ * (boot #60's log), so plain statics.
+ */
+#define NTRACK 32
+static struct { GLuint tex; uint32_t surface; } tex_surf[NTRACK];
+static struct { GLuint fbo, tex; } fbo_tex[NTRACK];
+static GLuint cur_fbo;
+
+static uint32_t surface_of_tex(GLuint t)
+{
+	for (int i = 0; i < NTRACK; i++)
+		if (t && tex_surf[i].tex == t)
+			return tex_surf[i].surface;
+	return 0;
+}
+
+static void tex_set(GLuint t, uint32_t surface)
+{
+	int slot = -1;
+	for (int i = 0; i < NTRACK; i++) {
+		if (tex_surf[i].tex == t) {
+			slot = i;
+			break;
+		}
+		if (!tex_surf[i].tex && slot < 0)
+			slot = i;
+	}
+	if (slot < 0) {
+		LOG("more than %d surface textures: texture %u not tracked\n", NTRACK, t);
+		return;
+	}
+	tex_surf[slot].tex = t;
+	tex_surf[slot].surface = surface;
+}
+
+static void tex_forget(GLuint t)
+{
+	for (int i = 0; i < NTRACK; i++)
+		if (t && tex_surf[i].tex == t)
+			tex_surf[i].tex = 0;
+	for (int i = 0; i < NTRACK; i++)
+		if (t && fbo_tex[i].tex == t)
+			fbo_tex[i].tex = 0;
+}
+
+static void fbo_forget(GLuint f)
+{
+	for (int i = 0; i < NTRACK; i++)
+		if (f && fbo_tex[i].fbo == f)
+			fbo_tex[i].fbo = fbo_tex[i].tex = 0;
+	if (cur_fbo == f)
+		cur_fbo = 0;
+}
+
+static void fbo_attach(GLuint f, GLuint t)
+{
+	int slot = -1;
+	for (int i = 0; i < NTRACK; i++) {
+		if (fbo_tex[i].fbo == f) {
+			slot = i;
+			break;
+		}
+		if (!fbo_tex[i].fbo && slot < 0)
+			slot = i;
+	}
+	if (!f)
+		return;	/* framebuffer 0 is the 1x1 pbuffer */
+	if (slot < 0) {
+		LOG("more than %d framebuffers: framebuffer %u not tracked\n", NTRACK, f);
+		return;
+	}
+	fbo_tex[slot].fbo = f;
+	fbo_tex[slot].tex = t;
+}
+
+static GLuint bound_tex(GLenum target)
+{
+	GLint t = 0;
+	n_glGetIntegerv(target == GL_TEXTURE_EXTERNAL_OES ? GL_TEXTURE_BINDING_EXTERNAL_OES : GL_TEXTURE_BINDING_2D, &t);
+	return (GLuint)t;
+}
+
+/* a draw (clear, draw arrays/elements) into the bound framebuffer */
+static void drew(void)
+{
+	frame_work++;
+	win_draws++;
+	if (!cur_fbo)
+		return;	/* the pbuffer: no surface */
+	for (int i = 0; i < NTRACK; i++)
+		if (fbo_tex[i].fbo == cur_fbo) {
+			uint32_t s = surface_of_tex(fbo_tex[i].tex);
+			if (s)
+				kgsl_ios_surface_dirty(s);
+			return;
+		}
+	kgsl_ios_surface_dirty(0);	/* a framebuffer not seen attached: sync every surface */
+}
+
+/* the bound texture of `target` gets new contents (upload, copy, mipmaps) */
+static void tex_written(GLenum target)
+{
+	frame_work++;
+	if (target != GL_TEXTURE_2D && target != GL_TEXTURE_EXTERNAL_OES) {
+		kgsl_ios_surface_dirty(0);
+		return;
+	}
+	uint32_t s = surface_of_tex(bound_tex(target));
+	if (s)
+		kgsl_ios_surface_dirty(s);
+}
+
+/* glTexImage2D gives the bound texture new storage: no longer the surface */
+static void tex_replaced(GLenum target)
+{
+	frame_work++;
+	if (target == GL_TEXTURE_2D)
+		tex_forget(bound_tex(target));
 }
 
 /*
@@ -334,14 +480,14 @@ static void mc_end(struct mc_guard *g)
 #define MC struct mc_guard mc_g __attribute__((cleanup(mc_end))) = { c, cur }; make_current(c)
 static void t_glBindTexture(C, GLenum a, GLuint b) { MC; n_glBindTexture(a, b); }
 static void t_glBlendFunc(C, GLenum a, GLenum b) { MC; n_glBlendFunc(a, b); }
-static void t_glClear(C, GLbitfield a) { MC; n_glClear(a); }
+static void t_glClear(C, GLbitfield a) { MC; drew(); n_glClear(a); }
 static void t_glClearColor(C, GLfloat r, GLfloat g, GLfloat b, GLfloat a) { MC; n_glClearColor(r, g, b, a); }
 static void t_glCopyTexSubImage2D(C, GLenum t, GLint l, GLint xo, GLint yo, GLint x, GLint y, GLsizei w, GLsizei h)
-{ MC; n_glCopyTexSubImage2D(t, l, xo, yo, x, y, w, h); }
-static void t_glDeleteTextures(C, GLsizei n, const GLuint *t) { MC; n_glDeleteTextures(n, t); }
+{ MC; tex_written(t); n_glCopyTexSubImage2D(t, l, xo, yo, x, y, w, h); }
+static void t_glDeleteTextures(C, GLsizei n, const GLuint *t) { MC; for (GLsizei i = 0; i < n; i++) tex_forget(t[i]); n_glDeleteTextures(n, t); }
 static void t_glDisable(C, GLenum a) { MC; n_glDisable(a); }
-static void t_glDrawArrays(C, GLenum m, GLint f, GLsizei n) { MC; n_glDrawArrays(m, f, n); }
-static void t_glDrawElements(C, GLenum m, GLsizei n, GLenum t, const void *p) { MC; n_glDrawElements(m, n, t, p); }
+static void t_glDrawArrays(C, GLenum m, GLint f, GLsizei n) { MC; drew(); n_glDrawArrays(m, f, n); }
+static void t_glDrawElements(C, GLenum m, GLsizei n, GLenum t, const void *p) { MC; drew(); n_glDrawElements(m, n, t, p); }
 static void t_glEnable(C, GLenum a) { MC; n_glEnable(a); }
 static void t_glFinish(C) { MC; frame_end(); }
 static void t_glFlush(C) { MC; frame_end(); }
@@ -351,11 +497,11 @@ static void t_glGetIntegerv(C, GLenum p, GLint *v) { MC; n_glGetIntegerv(p, v); 
 static void t_glPixelStorei(C, GLenum p, GLint v) { MC; n_glPixelStorei(p, v); }
 static void t_glScissor(C, GLint x, GLint y, GLsizei w, GLsizei h) { MC; n_glScissor(x, y, w, h); }
 static void t_glTexImage2D(C, GLenum t, GLint l, GLint i, GLsizei w, GLsizei h, GLint b, GLenum f, GLenum ty,
-			   const void *p) { MC; n_glTexImage2D(t, l, i, w, h, b, f, ty, p); }
+			   const void *p) { MC; tex_replaced(t); n_glTexImage2D(t, l, i, w, h, b, f, ty, p); }
 static void t_glTexParameterf(C, GLenum t, GLenum p, GLfloat v) { MC; n_glTexParameterf(t, p, v); }
 static void t_glTexParameteri(C, GLenum t, GLenum p, GLint v) { MC; n_glTexParameteri(t, p, v); }
 static void t_glTexSubImage2D(C, GLenum t, GLint l, GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLenum ty,
-			      const void *p) { MC; n_glTexSubImage2D(t, l, x, y, w, h, f, ty, p); }
+			      const void *p) { MC; tex_written(t); n_glTexSubImage2D(t, l, x, y, w, h, f, ty, p); }
 static void t_glViewport(C, GLint x, GLint y, GLsizei w, GLsizei h) { MC; n_glViewport(x, y, w, h); }
 static void t_glBlendFuncSeparate(C, GLenum a, GLenum b, GLenum d, GLenum e) { MC; n_glBlendFuncSeparate(a, b, d, e); }
 static void t_glBlendEquation(C, GLenum a) { MC; n_glBlendEquation(a); }
@@ -394,12 +540,12 @@ static void t_glUniformMatrix3fv(C, GLint l, GLsizei n, GLboolean t, const GLflo
 static void t_glUniformMatrix4fv(C, GLint l, GLsizei n, GLboolean t, const GLfloat *v) { MC; n_glUniformMatrix4fv(l, n, t, v); }
 static GLint t_glGetUniformLocation(C, GLuint p, const GLchar *n) { MC; return n_glGetUniformLocation(p, n); }
 static void t_glBindAttribLocation(C, GLuint p, GLuint i, const GLchar *n) { MC; n_glBindAttribLocation(p, i, n); }
-static void t_glBindFramebuffer(C, GLenum t, GLuint f) { MC; n_glBindFramebuffer(t, f); }
-static void t_glDeleteFramebuffers(C, GLsizei n, const GLuint *f) { MC; n_glDeleteFramebuffers(n, f); }
+static void t_glBindFramebuffer(C, GLenum t, GLuint f) { MC; if (t == GL_FRAMEBUFFER || t == GL_DRAW_FRAMEBUFFER) cur_fbo = f; n_glBindFramebuffer(t, f); }
+static void t_glDeleteFramebuffers(C, GLsizei n, const GLuint *f) { MC; for (GLsizei i = 0; i < n; i++) fbo_forget(f[i]); n_glDeleteFramebuffers(n, f); }
 static void t_glGenFramebuffers(C, GLsizei n, GLuint *f) { MC; n_glGenFramebuffers(n, f); }
 static void t_glFramebufferTexture2D(C, GLenum t, GLenum a, GLenum tt, GLuint tex, GLint l)
-{ MC; n_glFramebufferTexture2D(t, a, tt, tex, l); }
-static void t_glGenerateMipmap(C, GLenum t) { MC; n_glGenerateMipmap(t); }
+{ MC; if (a == GL_COLOR_ATTACHMENT0) fbo_attach(cur_fbo, tex); n_glFramebufferTexture2D(t, a, tt, tex, l); }
+static void t_glGenerateMipmap(C, GLenum t) { MC; tex_written(t); n_glGenerateMipmap(t); }
 /* GL_APPLE_sync = ES3 sync objects (same semantics); not advertised, so CoreAnimation should not call them */
 static GLsync t_glFenceSync(C, GLenum cond, GLbitfield f) { MC; return n_glFenceSync(cond, f); }
 static void t_glDeleteSync(C, GLsync s) { MC; n_glDeleteSync(s); }
@@ -847,6 +993,7 @@ static int gpu_up(void)
 		return 0;
 	/* mode: framing bits 0-1, CPU read-back bits 2-3, flushall bit 4, delay bit 5 (bench -selftest) */
 	kgsl_ios_mode(gpu_mode);
+	kgsl_ios_dirty_tracking(1);	/* CPU sync: only the surfaces a frame wrote (frame_end) */
 	if (load_gl() || build_stubs())
 		return 0;
 	gpu_state = 1;
@@ -962,12 +1109,26 @@ static int bind_surface_current(GLenum target, IOSurfaceRef s, int invert, const
 	EGLImage img = s ? surface_image(s) : 0;
 	if (!img)
 		return 0;
+	/*
+	 * glGetError returns the oldest pending error: boot #60's "attachImage: error 500" for the first
+	 * display surface (the second, identical one worked) may have been an earlier call's. Drain first.
+	 */
+	static unsigned stale_logged;
+	for (int i = 0; i < 8; i++) {
+		GLenum old = n_glGetError();
+		if (!old)
+			break;
+		if (stale_logged++ < 16)
+			LOG("%s: GL error %x pending from an earlier call (cleared)\n", what, old);
+	}
 	n_glEGLImageTargetTexture2DOES(target, img);
 	GLenum e = n_glGetError();
 	if (e) {
-		LOG("%s: glEGLImageTargetTexture2DOES error %x\n", what, e);
+		LOG("%s: glEGLImageTargetTexture2DOES(target %x, surface %u) error %x\n", what, target, IOSurfaceGetID(s), e);
 		return 0;
 	}
+	if (target == GL_TEXTURE_2D || target == GL_TEXTURE_EXTERNAL_OES)
+		tex_set(bound_tex(target), IOSurfaceGetID(s));
 	return 1;
 }
 

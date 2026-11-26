@@ -15,6 +15,7 @@
  * (LP64): hw_module_t, hw_module_methods_t, hw_device_t, gralloc1_device_t.
  */
 #include "bionic.h"
+#include "../kgsl.h"
 
 struct hw_module;
 struct hw_methods {
@@ -212,6 +213,64 @@ static int32_t gr_perform(void *d, int32_t op, uint64_t a, uint64_t b, uint64_t 
 	}
 }
 
+/*
+ * Lock/Unlock (gralloc1.h GRALLOC1_PFN_LOCK / _UNLOCK): boot #60, backboardd on the GPU for ~15 min,
+ * then EGL asked for function 18 (Lock), got NULL and called it (CRASH pc 0x0). Our buffers are
+ * always mapped for the CPU (IOSurface), so Lock is that address once the acquire fence (which
+ * Lock owns, gralloc1.h) has signalled; Unlock gives no release fence (-1).
+ */
+#define SYNC_IOC_WAIT 0x40043e00UL	/* sync_file wait, int timeout ms (kgsl_ios.c emulates it) */
+int b_close(int fd);		/* sys.c: our fence fds and host fds alike */
+static void fence_consume(int32_t fence)
+{
+	if (fence < 0)
+		return;
+	if (kgsl_fence_is_fd(fence)) {
+		int ms = 3000;
+		long rc = kgsl_fence_ioctl(fence, SYNC_IOC_WAIT, &ms);
+		if (rc < 0)
+			b_log("drgles: gralloc Lock: acquire fence %d wait -> %ld\n", fence, rc);
+	} else {
+		b_log("drgles: gralloc Lock: acquire fence %d is not ours: not waited\n", fence);
+	}
+	b_close(fence);
+}
+
+static int32_t gr_lock(void *d, const void *h, uint64_t pu, uint64_t cu, const void *rect, void **out, int32_t fence)
+{
+	struct gbuf *b = buf_of(h);
+	TRACE("drgles: gralloc Lock(%p, %#llx, %#llx, fence %d) cpu %p\n", h, (unsigned long long)pu,
+	      (unsigned long long)cu, fence, b ? b->cpu : 0);
+	fence_consume(fence);
+	if (!b || !b->cpu)
+		return GR1_ERROR_BAD_HANDLE;
+	*out = b->cpu;
+	return 0;
+}
+
+static int32_t gr_unlock(void *d, const void *h, int32_t *release_fence)
+{
+	TRACE("drgles: gralloc Unlock(%p)\n", h);
+	if (release_fence)
+		*release_fence = -1;
+	return buf_of(h) ? 0 : GR1_ERROR_BAD_HANDLE;
+}
+
+/* GetNumFlexPlanes 17 / LockFlex 19: YUV only; ours are RGB, so "unsupported" (never NULL) */
+static int32_t gr_num_flex_planes(void *d, const void *h, uint32_t *out)
+{
+	b_log("drgles: gralloc GetNumFlexPlanes(%p): unsupported\n", h);
+	return GR1_ERROR_UNSUPPORTED;
+}
+
+static int32_t gr_lock_flex(void *d, const void *h, uint64_t pu, uint64_t cu, const void *rect, void *layout,
+			    int32_t fence)
+{
+	b_log("drgles: gralloc LockFlex(%p): unsupported\n", h);
+	fence_consume(fence);
+	return GR1_ERROR_UNSUPPORTED;
+}
+
 static void *dev_get(void *d, int32_t desc)
 {
 	TRACE("drgles: gralloc getFunction(%d)\n", desc);
@@ -224,6 +283,10 @@ static void *dev_get(void *d, int32_t desc)
 	case 13: return (void *)gr_stride;
 	case 15: return (void *)gr_retain;
 	case 16: return (void *)gr_release;
+	case 17: return (void *)gr_num_flex_planes;
+	case 18: return (void *)gr_lock;
+	case 19: return (void *)gr_lock_flex;
+	case 20: return (void *)gr_unlock;
 	case 22: return (void *)gr_layer_count;
 	case 0x1000: return (void *)gr_perform;
 	}

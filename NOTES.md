@@ -1,6 +1,16 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> DRG (Nokia 6.1 Plus) handoff, 2026-11-24 (read first; full log: F:\Nokia-HackiOs\drg\BOOTLOG.md, newest first) <<<
+## >>> DRG (Nokia 6.1 Plus) handoff, 2026-11-26 (read first; full log: F:\Nokia-HackiOs\drg\BOOTLOG.md, newest first) <<<
+- **Now (2026-11-26):** on the phone boot_a = #60 (kernel CI 45762997330: 0920 IOSurface wrap refused, 0921 live
+  log), root **r30** (libdrgeagl -DDRG_EAGL_GPU). Boot #60: backboardd drew with the GPU ~15 min, then crashed
+  (gralloc1 Lock was NULL); touch fingers 2+ were read one byte late (stuck corner touch). Both fixed in source,
+  plus empty-frame skip and per-surface CPU sync in libdrgeagl (BOOTLOG 2026-11-26); not built into an image.
+  Next: kernel CI with patch 0922 + root r31 with the new libdrgeagl and bench, then one boot.
+  /root/ipsw/phone55.img = the phone after boot #60 (logs/pull60/phone.txt is its chunk hash list).
+- Live log: boot-arg drgusb=2; PC: keep a WSL session running (`wsl -u root -- sleep 86400`), then
+  `tools/drg-livelog.sh logs/live-bootNN.txt` (usbipd attaches 1209:0001 to WSL). drgeagl and the self-test log
+  to files only (/private/var/tmp/drgeagl.log, /private/var/log/drgles-selftest.log): a TWRP pull reads them.
+- (Older, 2026-11-24:)
 - Branch drg-port, fork `ammarsi274/ios-sweet` (`git -c credential.helper= -c "credential.helper=!gh auth git-credential"
   push nokia drg-port`: the Windows credential manager holds another account, plain push gets 403).
 - On the phone: boot_a = #58 (kernel CI 42447376310 + shim with hw tests off), root **r27** (backboardd GPU switch:

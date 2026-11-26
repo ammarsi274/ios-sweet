@@ -8,7 +8,7 @@
  * the clock is still on and then polls the chip:
  *   - every 10 ms read 10 bytes at 0x814E: status (bit 7 new data, bits 3:0
  *     fingers), first finger {id, x lo, x hi, y lo, y hi, w lo, w hi, -},
- *     key byte; more fingers 8 bytes each from 0x8158; then write 0 to
+ *     key byte; more fingers 8 bytes each from 0x8157; then write 0 to
  *     0x814E (HMD's DRG kernel, drivers/input/touchscreen/gt9xx/gt9xx.c)
  *   - coordinates are panel pixels, 1080 x 2280 (touchscreen-size-x/y in this
  *     phone's device tree, no axis swap), handed to DrgHID as they are
@@ -228,14 +228,25 @@ ts_thread(__unused void *arg, __unused wait_result_t result)
 			continue;
 		}
 		uint32_t n = d[0] & 0x0f;
+		if (n > TS_FINGERS) {
+			/* HMD gt9xx.c: "Invalid touch state", the report is dropped */
+			(void)ts_write1(0x814e, 0);
+			continue;
+		}
 		bool seen[TS_FINGERS] = {false};
-		for (uint32_t i = 0; i < n && i < TS_FINGERS; i++) {
+		for (uint32_t i = 0; i < n; i++) {
 			uint8_t p[8];
 			if (i == 0) {
 				for (int b = 0; b < 8; b++) {
 					p[b] = d[1 + b];
 				}
-			} else if (ts_read((uint16_t)(0x8158 + 8 * (i - 1)), p, 8)) {
+			} else if (ts_read((uint16_t)(0x8157 + 8 * (i - 1)), p, 8)) {
+				/*
+				 * Finger i is at 0x814F + 8 i (HMD gt9xx.c: 12 bytes from 0x814E, then the
+				 * rest from 0x814E + 10 into point_data[12]). Boot #60 read 0x8158: one byte
+				 * late, so a second finger became x lo|y lo garbage clamped to 1079,2279
+				 * (a stuck corner touch).
+				 */
 				break;
 			}
 			uint32_t id = p[0] & 0x0f;
