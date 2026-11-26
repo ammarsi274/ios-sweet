@@ -1505,6 +1505,10 @@ static int write_file(const char *path, const char *text)
 static int selftest_boot(const char *self, const char *cache, int delay_s, char **envp)
 {
 	int missing = 0, mode = -1;
+	/* this process's lines also on the console: the USB live log (patch 0921); the children's stay in the file */
+	int con = open("/dev/console", 1 /* O_WRONLY */);
+	if (con >= 0)
+		host_log_tee(con);
 	uint64_t key = drg_verdict_key_now(&missing);
 	char text[256] = "";
 	size_t n = 0;

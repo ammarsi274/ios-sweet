@@ -1205,7 +1205,8 @@ __attribute__((constructor)) static void drgeagl_init(void)
 		char m[96];
 		int n = snprintf(m, sizeof(m), "drgeagl: loaded into backboardd (pid %d), log fd %d\n", getpid(), fd);
 		write(con, m, (size_t)n);
-		close(con);
+		/* every later line too: boot #60's drgeagl.log was readable only after a TWRP pull (live log, 0921) */
+		host_log_tee(con);
 	}
 	LOG("loaded into backboardd (pid %d)\n", getpid());
 	if (!decide())

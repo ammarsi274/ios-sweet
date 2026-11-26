@@ -28,6 +28,7 @@ void host_sync_icache(void *addr, size_t len);
 
 void host_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void host_log_to(int fd);	/* iOS host: host_log and host_die write to fd (default stdout, stderr) */
+void host_log_tee(int fd);	/* iOS host: every line also to fd (the console: the USB live log, patch 0921) */
 __attribute__((noreturn)) void host_die(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 uint64_t host_random64(void);
 

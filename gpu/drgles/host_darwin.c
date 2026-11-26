@@ -299,11 +299,16 @@ void host_sync_icache(void *addr, size_t len)
 }
 
 /* where host_log goes: stdout for the bench; a log file inside another process (libdrgeagl) */
-static int log_fd = 1, die_fd = 2;
+static int log_fd = 1, die_fd = 2, tee_fd = -1;
 
 void host_log_to(int fd)
 {
 	log_fd = die_fd = fd;
+}
+
+void host_log_tee(int fd)
+{
+	tee_fd = fd;
 }
 
 static void out(int fd, const char *fmt, va_list ap)
@@ -312,8 +317,11 @@ static void out(int fd, const char *fmt, va_list ap)
 	int n = vsnprintf(b, sizeof(b), fmt, ap);
 	if (n > (int)sizeof(b) - 1)
 		n = sizeof(b) - 1;
-	if (n > 0)
+	if (n > 0) {
 		write(fd, b, (size_t)n);
+		if (tee_fd >= 0 && tee_fd != fd)
+			write(tee_fd, b, (size_t)n);
+	}
 }
 
 void host_log(const char *fmt, ...)
