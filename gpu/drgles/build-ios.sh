@@ -13,7 +13,7 @@ OUT=$1
 OBJ=$OUT/obj
 rm -rf "$OBJ"
 mkdir -p "$OBJ"
-CC="clang-21 --target=arm64-apple-ios16.0 -O2 -g -ffreestanding -fno-stack-protector -Wall -Wextra -Werror -Wno-unused-parameter"
+CC="clang-21 --target=arm64-apple-ios16.0 -O2 -g -ffreestanding -fno-stack-protector -Wall -Wextra -Werror -Wno-unused-parameter ${DRG_EXTRA_CFLAGS:-}"	# DRG_EXTRA_CFLAGS=-DDRG_EAGL_GPU: the self-test restarts backboardd onto the GPU
 for f in bench.c rt_map.c drgwin.c elf.c host_darwin.c kgsl_ios.c kgsl_cap.c verdict.c bionic/*.c bionic/vararg.S; do
 	$CC -c "$SRC/$f" -o "$OBJ/$(echo "$f" | tr / _).o"
 done

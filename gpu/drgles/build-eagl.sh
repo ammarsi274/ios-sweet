@@ -10,7 +10,7 @@ OUT=$1
 OBJ=$OUT/obj-eagl
 rm -rf "$OBJ"
 mkdir -p "$OBJ"
-CC="clang-21 --target=arm64-apple-ios16.0 -O2 -g -ffreestanding -fno-stack-protector -fvisibility=hidden -Wall -Wextra -Werror -Wno-unused-parameter"
+CC="clang-21 --target=arm64-apple-ios16.0 -O2 -g -ffreestanding -fno-stack-protector -fvisibility=hidden -Wall -Wextra -Werror -Wno-unused-parameter ${DRG_EXTRA_CFLAGS:-}"	# DRG_EXTRA_CFLAGS=-DDRG_EAGL_GPU: backboardd draws with the GPU
 cd "$SRC"
 for f in eagl.c drgwin.c elf.c host_darwin.c kgsl_ios.c kgsl_cap.c verdict.c bionic/*.c bionic/vararg.S; do
 	$CC -c "$SRC/$f" -o "$OBJ/$(echo "$f" | tr / _).o"
