@@ -1,0 +1,112 @@
+drg: console log ring for the live log over USB (patch 0921)
+
+The user cannot see what a boot does until a TWRP visit afterwards. Every
+console write now goes into a 1 MiB ring (bsd/dev/drg_log.c, fed from
+_cnputs before the GUI mute) and drg_usb.c's live-log thread (patch 0918,
+no longer stubbed) streams it as UDP to 192.168.7.1:5140 every 100 ms
+with boot-arg drgusb=2. PC: usbipd-win attaches VID 1209 PID 0001 to
+WSL (cdc_ether), 192.168.7.1/24 on it, `nc -ukl 5140`.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 5fa4ca1..3911fff 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,7 @@ bsd/dev/random/randomdev.c		standard
+ bsd/dev/memdev.c			standard
+ bsd/dev/drg_emmc.c			standard
+ bsd/dev/drg_usb.c			standard
++bsd/dev/drg_log.c			standard
+ bsd/dev/drg_ts.c			standard
+ bsd/kern/drg_perf.c			standard
+ bsd/dev/drg_keys.c			standard
+diff --git a/bsd/dev/drg_log.c b/bsd/dev/drg_log.c
+new file mode 100644
+index 0000000..075d02d
+--- /dev/null
++++ b/bsd/dev/drg_log.c
+@@ -0,0 +1,64 @@
++/*
++ * DRG console log ring for the live log over USB (patch 0921).
++ *
++ * Every console write (osfmk/console/serial_console.c _cnputs, before the
++ * GUI mute) is appended to a 1 MiB ring; drg_usb.c's live-log thread copies
++ * new bytes out and sends them as UDP to 192.168.7.1:5140 every 100 ms
++ * (boot-arg drgusb=2, drgusblog=1 by default). Ported from the other phone's
++ * drg_ufs.c ring, without its flush to storage (DRG keeps its kernel.log
++ * through userland).
++ */
++#if defined(ARM64_BOARD_CONFIG_DRG)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <os/atomic_private.h>
++
++#define DRG_LOG_SIZE    (1u << 20)
++
++static char drg_log_ring[DRG_LOG_SIZE];
++static uint64_t _Atomic drg_log_total;
++
++/* Called for all console output, any context: never blocks. */
++void drg_log_append(const char *c, int size);
++
++void
++drg_log_append(const char *c, int size)
++{
++	if (size <= 0) {
++		return;
++	}
++	uint64_t at = os_atomic_add_orig(&drg_log_total, (uint64_t)size, relaxed);
++	for (int i = 0; i < size; i++) {
++		drg_log_ring[(at + (uint64_t)i) % DRG_LOG_SIZE] = c[i];
++	}
++}
++
++/*
++ * Copy console bytes [*pos, total) (at most max). A reader that fell more
++ * than the ring behind skips ahead. Returns the byte count; *pos advances.
++ */
++uint32_t drg_log_copy(uint64_t *pos, char *out, uint32_t max);
++
++uint32_t
++drg_log_copy(uint64_t *pos, char *out, uint32_t max)
++{
++	uint64_t total = os_atomic_load(&drg_log_total, relaxed);
++	if (total - *pos > DRG_LOG_SIZE) {
++		*pos = total - DRG_LOG_SIZE;
++	}
++	uint32_t n = (uint32_t)MIN((uint64_t)max, total - *pos);
++	for (uint32_t i = 0; i < n; i++) {
++		out[i] = drg_log_ring[(*pos + i) % DRG_LOG_SIZE];
++	}
++	*pos += n;
++	return n;
++}
++
++uint64_t drg_log_position(void);
++
++uint64_t
++drg_log_position(void)
++{
++	return os_atomic_load(&drg_log_total, relaxed);
++}
++#endif /* ARM64_BOARD_CONFIG_DRG */
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index 85863e5..0c885b9 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -272,6 +272,7 @@ _cnputc(char c, bool poll)
+  * console text is not drawn over the GUI. A panic draws again.
+  */
+ int drg_console_muted;
++void drg_log_append(const char *c, int size);    /* bsd/dev/drg_log.c (patch 0921) */
+ #endif
+ 
+ static inline void
+@@ -280,6 +281,8 @@ _cnputs(char *c, int size, bool poll)
+ 	extern int disableConsoleOutput;
+ 
+ #if defined(ARM64_BOARD_CONFIG_DRG)
++	/* every console write, also while the GUI mutes it: the live log over USB reads this ring */
++	drg_log_append(c, size);
+ 	if (drg_console_muted && !panic_active()) {
+ 		return;
+ 	}

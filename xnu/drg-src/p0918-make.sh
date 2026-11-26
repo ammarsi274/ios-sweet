@@ -20,8 +20,6 @@ edit('bsd/dev/drg_usb.c', [
  ('clocks come from GCC (offsets from Linux gcc-sdmmagpie.c)', 'clocks come from GCC (offsets from HMD gcc-sdm660.c)'),
  ('	{ "master", 0x0f010 },\n	{ "sleep", 0x0f014 },\n	{ "utmi", 0x0f018 },\n	{ "cfg-noc-axi", 0x0502c },\n	{ "aggre-axi", 0x8201c },\n	{ "ahb2phy", 0x6a004 },\n	{ "clkref", 0x8c010 },',
   '	{ "master", 0x0f008 },\n	{ "sleep", 0x0f00c },\n	{ "utmi", 0x0f010 },\n	{ "cfg-noc-axi", 0x05018 },\n	{ "aggre-axi", 0x0f03c },\n	{ "ahb2phy", 0x6a004 },\n	{ "clkref", 0x8800c },'),
- ('extern uint32_t drg_log_copy(uint64_t *pos, char *out, uint32_t max);\nextern uint64_t drg_log_position(void);',
-  '/* the live log ring lives in the other phone\'s drg_ufs.c, not built here: an empty log (no live log yet) */\nstatic uint32_t drg_log_copy(uint64_t *pos __unused, char *out __unused, uint32_t max __unused) { return 0; }\nstatic uint64_t drg_log_position(void) { return 0; }'),
  ('#define DWC3_PA                 0x0a600000', '#define DWC3_PA                 0x0a800000'),
  ('#define QUSB2_PA                0x088e2000', '#define QUSB2_PA                0x0c012000'),
  ('#define QSCRATCH_PA             0x0a6f8800', '#define QSCRATCH_PA             0x0a8f8800'),

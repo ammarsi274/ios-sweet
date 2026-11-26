@@ -1,0 +1,8 @@
+drg: console log ring for the live log over USB (patch 0921)
+
+The user cannot see what a boot does until a TWRP visit afterwards. Every
+console write now goes into a 1 MiB ring (bsd/dev/drg_log.c, fed from
+_cnputs before the GUI mute) and drg_usb.c's live-log thread (patch 0918,
+no longer stubbed) streams it as UDP to 192.168.7.1:5140 every 100 ms
+with boot-arg drgusb=2. PC: usbipd-win attaches VID 1209 PID 0001 to
+WSL (cdc_ether), 192.168.7.1/24 on it, `nc -ukl 5140`.
