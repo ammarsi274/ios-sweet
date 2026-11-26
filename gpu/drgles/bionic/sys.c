@@ -48,7 +48,7 @@ int b___open_2(const char *path, int flags)
 
 int b_close(int fd)
 {
-	if (kgsl_close(fd))
+	if (kgsl_close(fd) || kgsl_fence_close(fd))
 		return 0;
 	if (fd == ion_fd)
 		ion_fd = -1;
@@ -105,11 +105,14 @@ int b_access(const char *path, int mode)
 
 int b_poll(void *fds, unsigned n, int timeout)
 {
+	kgsl_fence_poll(fds, n, timeout);	/* fences: wait first, then /dev/null is readable */
 	return (int)b_ret(host_poll(fds, n, timeout));
 }
 
 int b_dup(int fd)
 {
+	if (kgsl_fence_is_fd(fd))
+		return (int)b_ret(kgsl_fence_dup(fd));
 	return (int)b_ret(host_dup(fd));
 }
 
@@ -123,6 +126,8 @@ long b_ioctl_fixed(int fd, unsigned req, void *arg)
 {
 	if (kgsl_is_fd(fd))
 		return b_ret(kgsl_ioctl(fd, req, arg));
+	if (kgsl_fence_is_fd(fd))
+		return b_ret(kgsl_fence_ioctl(fd, req, arg));
 	if (fd == ion_fd && ion_fd >= 0) {
 		int i;
 		for (i = 0; i < 16 && ion_req[i] && ion_req[i] != req; i++)

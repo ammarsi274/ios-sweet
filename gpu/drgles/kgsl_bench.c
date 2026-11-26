@@ -83,6 +83,13 @@ int kgsl_close(int fd)
 	return 0;
 }
 
+/* Linux: TIMESTAMP_EVENT gives real sync_file fds, so none of them is ours (kgsl.h) */
+int kgsl_fence_is_fd(int fd) { (void)fd; return 0; }
+long kgsl_fence_ioctl(int fd, unsigned long req, void *arg) { (void)fd, (void)req, (void)arg; return -22; }
+void kgsl_fence_poll(void *fds, unsigned n, int timeout_ms) { (void)fds, (void)n, (void)timeout_ms; }
+int kgsl_fence_dup(int fd) { (void)fd; return -22; }
+int kgsl_fence_close(int fd) { (void)fd; return 0; }
+
 struct waitts { uint32_t context_id, timestamp, timeout; };
 #define IOC_WAITTS_CTXTID	0x400c0907UL	/* _IOW(0x09, 0x7, 12 bytes) */
 

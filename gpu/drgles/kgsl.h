@@ -20,6 +20,12 @@ long kgsl_ioctl(int fd, unsigned long req, void *arg);	/* result or -errno */
 void *kgsl_mmap(void *addr, size_t len, int prot, int flags, int fd, long off, int *err);
 int kgsl_munmap(void *addr, size_t len);	/* 1 if it was ours */
 int kgsl_close(int fd);			/* 1 if it was ours */
+/* fence fds from TIMESTAMP_EVENT (kgsl_ios.c): libsync ioctls, poll, dup, close */
+int kgsl_fence_is_fd(int fd);
+long kgsl_fence_ioctl(int fd, unsigned long req, void *arg);	/* result or -errno */
+void kgsl_fence_poll(void *linux_pollfds, unsigned n, int timeout_ms);
+int kgsl_fence_dup(int fd);					/* new fd or -errno */
+int kgsl_fence_close(int fd);					/* 1 if it was ours */
 void kgsl_report(void);
 int kgsl_capture_start(const char *path);	/* bench: record GPU work for replay (0 or -errno) */
 void kgsl_capture_nowait(void);

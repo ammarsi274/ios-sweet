@@ -845,6 +845,150 @@ static long gpu_command(struct kdev *d, struct gpu_command *c)
 	return 0;
 }
 
+/*
+ * Fences (HMD msm_kgsl.h KGSL_TIMESTAMP_EVENT_FENCE, drivers/staging/android/uapi/sync.h). On Linux the
+ * kernel returns a sync_file fd that signals when (context, timestamp) retires; libsync's sync_wait and
+ * sync_merge are SYNC_IOC_WAIT/MERGE ioctls on it. Here a fence is an fd of ours (/dev/null, so dup/poll/
+ * close work on a real descriptor) plus the timestamps it stands for; bionic/sys.c routes its ioctl,
+ * poll, dup and close here. A merge keeps up to 4 (context, timestamp) pairs, the later timestamp per
+ * context (KGSL's wrapping compare).
+ */
+#define NFENCE 128
+#define FENCE_TS 4
+struct kfence {
+	int fd, n;
+	struct kdev *d;
+	uint32_t ctx[FENCE_TS], ts[FENCE_TS];
+};
+static struct kfence fences[NFENCE];
+
+static struct kfence *fence_of(int fd)
+{
+	for (int i = 0; i < NFENCE; i++)
+		if (fences[i].d && fences[i].fd == fd)
+			return &fences[i];
+	return 0;
+}
+
+static int fence_new(struct kdev *d, const uint32_t *ctx, const uint32_t *ts, int n)
+{
+	struct kfence *f = 0;
+	for (int i = 0; i < NFENCE && !f; i++)
+		if (!fences[i].d)
+			f = &fences[i];
+	if (!f)
+		return -E_NOSPC;
+	int fd = host_open("/dev/null", 0, 0);
+	if (fd < 0)
+		return fd;
+	f->fd = fd;
+	f->d = d;
+	f->n = n;
+	for (int k = 0; k < n; k++) {
+		f->ctx[k] = ctx[k];
+		f->ts[k] = ts[k];
+	}
+	return fd;
+}
+
+static long fence_wait(struct kfence *f, int timeout_ms)
+{
+	for (int k = 0; k < f->n; k++) {
+		uint64_t in[3] = { f->ctx[k], f->ts[k], timeout_ms < 0 ? 10000u : (uint32_t)timeout_ms };
+		int rc = call(f->d, DRGPU_UC_WAIT, in, 3, 0, 0, 0, 0, 0, 0);
+		if (rc)
+			return rc == -E_TIMEDOUT || rc == -E_BUSY ? -62 /* ETIME, as sync_file */ : rc;
+	}
+	return 0;
+}
+
+static long timestamp_event(struct kdev *d, void *arg)
+{
+	struct { int type; uint32_t timestamp, context_id; void *priv; size_t len; } *e = arg;
+	if (e->type != 2 /* KGSL_TIMESTAMP_EVENT_FENCE */ || !e->priv || e->len < sizeof(int)) {
+		host_log("drgles: TIMESTAMP_EVENT type %d len %zu not supported\n", e->type, e->len);
+		return -E_INVAL;
+	}
+	int fd = fence_new(d, &e->context_id, &e->timestamp, 1);
+	if (fd < 0)
+		return fd;
+	*(int *)e->priv = fd;
+	return 0;
+}
+
+int kgsl_fence_is_fd(int fd)
+{
+	return fence_of(fd) != 0;
+}
+
+long kgsl_fence_ioctl(int fd, unsigned long req, void *arg)
+{
+	struct kfence *f = fence_of(fd);
+	if (!f || !arg)
+		return -E_INVAL;
+	if (req == 0x40043e00) /* SYNC_IOC_WAIT: int timeout (ms, -1 = forever) */
+		return fence_wait(f, *(int *)arg);
+	if (req == 0xc0283e01) { /* SYNC_IOC_MERGE: { int fd2; char name[32]; int fence; } */
+		struct { int fd2; char name[32]; int fence; } *m = arg;
+		struct kfence *g = fence_of(m->fd2);
+		if (!g)
+			return -E_INVAL;
+		uint32_t ctx[FENCE_TS], ts[FENCE_TS];
+		int n = 0;
+		for (int pass = 0; pass < 2; pass++) {
+			struct kfence *s = pass ? g : f;
+			for (int k = 0; k < s->n; k++) {
+				int j = 0;
+				while (j < n && ctx[j] != s->ctx[k])
+					j++;
+				if (j < n) {
+					if ((int32_t)(s->ts[k] - ts[j]) > 0)
+						ts[j] = s->ts[k];
+				} else if (n < FENCE_TS) {
+					ctx[n] = s->ctx[k];
+					ts[n++] = s->ts[k];
+				} else {
+					return -E_NOSPC;
+				}
+			}
+		}
+		int nfd = fence_new(f->d, ctx, ts, n);
+		if (nfd < 0)
+			return nfd;
+		m->fence = nfd;
+		return 0;
+	}
+	host_log("drgles: fence ioctl %08lx not supported\n", req);
+	return -E_INVAL;
+}
+
+/* poll on fences: wait for them (up to timeout), then the /dev/null descriptor reports POLLIN */
+void kgsl_fence_poll(void *fds, unsigned n, int timeout_ms)
+{
+	struct { int fd; short events, revents; } *p = fds;
+	for (unsigned i = 0; i < n; i++) {
+		struct kfence *f = fence_of(p[i].fd);
+		if (f)
+			(void)fence_wait(f, timeout_ms);
+	}
+}
+
+int kgsl_fence_dup(int fd)
+{
+	struct kfence *f = fence_of(fd);
+	return f ? fence_new(f->d, f->ctx, f->ts, f->n) : -E_INVAL;
+}
+
+int kgsl_fence_close(int fd)
+{
+	struct kfence *f = fence_of(fd);
+	if (!f)
+		return 0;
+	f->d = 0;
+	host_close(fd);
+	return 1;
+}
+
 static long ioctl_(int fd, unsigned long req, void *arg)
 {
 	struct kdev *d = dev_of(fd);
@@ -887,6 +1031,8 @@ static long ioctl_(int fd, unsigned long req, void *arg)
 			((struct syncsource *)arg)->id = (uint32_t)out[0];
 		return rc;
 	}
+	case 0x33:	/* TIMESTAMP_EVENT: a fence fd (boot #59: refused, so every GL sync object failed) */
+		return timestamp_event(d, arg);
 	case 0x41: {	/* SYNCSOURCE_DESTROY */
 		uint64_t in[1] = { ((struct syncsource *)arg)->id };
 		return call(d, DRGPU_UC_SYNCSRC_DESTROY, in, 1, 0, 0, 0, 0, 0, 0);
